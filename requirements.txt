@@ -1,0 +1,49 @@
+# 依赖清单
+#
+# ★ 安装顺序很重要：
+#   先装 CUDA 版的 PyTorch（必须指定 cu128 索引源），再装这些。
+#
+#   第 1 步（RTX 50 系显卡必须用 cu128 及以上）：
+#       pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#
+#   第 2 步：
+#       pip install -r requirements.txt
+#
+# ---------------------------------------------------------------------------
+
+# 注意：torch 和 torchvision 故意不写在这里，
+#       因为它们必须从 PyTorch 官方的 CUDA 索引源安装，
+#       写在 requirements 里会从 PyPI 装成 CPU 版本（用不了显卡）。
+#       正确的版本由第 1 步的 --index-url 参数决定。
+
+# 数据读取 / 图像处理
+numpy>=1.26
+
+# 画训练曲线图（可选，但不装就看不到过拟合的可视化）
+matplotlib>=3.8
+
+# 画图时的中文字体支持（Windows 一般自带 msyh.ttc，不用额外装）
+
+# YAML 配置文件读写（换成 YOLOv8 做检测时会用到）
+pyyaml>=6.0
+
+# 进度条（可选）
+tqdm>=4.66
+
+# ---------------------------------------------------------------------------
+# 以下是"想好课题之后"才需要的，现在可以不装
+# ---------------------------------------------------------------------------
+
+# 目标检测（YOLOv8）—— 你架构图里的那一步
+# 注意：ultralytics 会自动把 torch 升级成 CPU 版本，
+#       所以要在装完 CUDA 版 torch 之后再装它，
+#       装完记得用 python common.py 检查 GPU 还在不在
+# ultralytics>=8.3.0
+
+# OpenCV：摄像头 / 视频流读取、更丰富的图像处理
+# opencv-python>=4.9.0
+
+# Web 后端（架构图里的 FastAPI）
+# fastapi>=0.115.0
+# uvicorn[standard]>=0.32.0
+# python-multipart>=0.0.9

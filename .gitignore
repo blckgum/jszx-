@@ -1,0 +1,31 @@
+# 虚拟环境（体积大，不入库）
+.venv/
+venv/
+env/
+
+# 数据集（CIFAR-10 有 170MB，不要提交）
+data/
+
+# 训练产物（可以重新训练得到）
+checkpoints/
+runs/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 编辑器
+# ★ 注意：.vscode/settings.json 和 launch.json 要保留！
+#   它们固定了虚拟环境路径和调试配置，换电脑后能直接用。
+#   只忽略那些纯个人的、不影响项目的文件。
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+.idea/
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
