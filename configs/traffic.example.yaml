@@ -1,9 +1,24 @@
 # 复制本文件后，修改 path。相对路径相对于本 YAML 所在目录。
 # 也可使用绝对路径。当前入口仅支持本地目录，不自动下载数据。
+#
+# 这个 YAML 描述“数据在哪里、各类别 ID 是什么”，不描述神经网络结构。
+# 本文件位于 configs/，因此 ../data/traffic 指向仓库根目录下的 data/traffic。
 path: ../data/traffic
+
+# train：学习模型参数；val：在训练期间评价效果、选择模型；test：最终独立评估。
+# 同一视频的相邻帧应放在同一个集合，避免模型在验证/测试时遇到近乎相同的训练画面。
+# 每个图片目录都需要对应的标签目录，例如：
+# images/train/a.jpg <-> labels/train/a.txt。标签中的坐标按原图宽高归一化到 0～1。
 train: images/train
 val: images/val
 test: images/test
+
+# names 的键对应标签 txt 第一列，必须从 0 连续编号，并与模型权重的类别语义一致。
+# 例如标签 2 0.5 0.5 0.2 0.3 表示 car，框中心在图像中央，宽占 20%、高占 30%。
+#
+# 此处是本项目自定义的六类 ID：bus=4、truck=5；COCO 原始 ID 则是 bus=5、truck=7。
+# 转换 COCO 数据时需要重映射 ID，不能仅筛选几类后原样保留它们的类别编号。
+# 若改成 person/vehicle 二分类，标签文件也必须同步改为相同的两类定义。
 names:
   0: person
   1: bicycle

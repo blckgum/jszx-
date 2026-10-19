@@ -1,5 +1,10 @@
 # 先按 README 安装适合机器的 torch/torchvision，再安装本文件。
 # CPU 云环境已验证：torch 2.11.0+cpu / torchvision 0.26.0+cpu。
+# torch 执行神经网络张量运算；torchvision 提供视觉算子。GPU 机器需要匹配的 CUDA 构建。
+# 这里沿用原依赖文件中的 NumPy、PyYAML、Matplotlib 等公共依赖。
 -r requirements.txt
+# Ultralytics 提供 YOLOv8 的网络、预训练权重接口、训练和检测后处理。
+# 8.4.182 是库版本；实际模型仍由 yolov8n.pt 等权重指定。
 ultralytics==8.4.182
+# OpenCV 负责图片读写、视频解码/编码和画框；当前尚未在此接入标定、测速或 TTC。
 opencv-python==5.0.0.93
