@@ -1,0 +1,1 @@
+面向校园固定路侧摄像头的行人冲突感知与车速预警研究。已实现 YOLOv8 + PyTorch 车辆与行人检测基线；规划接入 ByteTrack、Kalman Filter、道路平面标定、实际测速与 TTC 风险分级，独立判断 30 km/h 超速提醒。
