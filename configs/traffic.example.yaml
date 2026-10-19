@@ -1,0 +1,13 @@
+# 复制本文件后，修改 path。相对路径相对于本 YAML 所在目录。
+# 也可使用绝对路径。当前入口仅支持本地目录，不自动下载数据。
+path: ../data/traffic
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: person
+  1: bicycle
+  2: car
+  3: motorcycle
+  4: bus
+  5: truck

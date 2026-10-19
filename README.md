@@ -1,3 +1,26 @@
+# 车辆与行人目标检测：YOLOv8 + PyTorch
+
+当前主线：先完成车辆与行人检测，再接 ByteTrack，最后进行运动状态和 TTC 分析。
+
+已新增独立的检测模块，支持图片、图片目录、视频检测、逐帧 JSONL 导出，以及 YOLO 标注数据的训练和评估。
+
+```bash
+# 云环境
+source /workspace/venvs/jszx/bin/activate
+python -m detection detect --source data/demo/bus.jpg --device cpu
+python -m detection detect --source data/your_video.mp4 --device cpu
+```
+
+新环境安装依赖：先安装匹配硬件的 PyTorch，再执行 `python -m pip install -r requirements-yolo.txt`。
+默认使用官方 YOLOv8n COCO 预训练权重；面向课题场景的微调与准确率评估仍需要标注数据。
+`data/demo/` 是本次云环境验证数据，不随 Git 提交；自行部署时请传入自己的图片或视频。
+
+详细步骤、数据集格式、训练与后续方案见 [车辆行人检测方案](docs/车辆行人检测方案.md)。
+
+---
+
+以下保留原有的图像分类教学说明。
+
 # PyTorch 图像识别框架（学习 + 项目骨架）
 
 一个**带详细中文注释**的 PyTorch 项目骨架。每个文件都在解释"为什么这么写"，

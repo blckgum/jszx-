@@ -1,0 +1,5 @@
+# 先按 README 安装适合机器的 torch/torchvision，再安装本文件。
+# CPU 云环境已验证：torch 2.11.0+cpu / torchvision 0.26.0+cpu。
+-r requirements.txt
+ultralytics==8.4.182
+opencv-python==5.0.0.93
