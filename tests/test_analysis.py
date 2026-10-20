@@ -81,6 +81,36 @@ class TestRoadCalibrator(unittest.TestCase):
             self.assertAlmostEqual(gx1, gx2, places=4)
             self.assertAlmostEqual(gy1, gy2, places=4)
 
+    def test_synthetic_field_must_be_real_bool(self):
+        # 字符串 "false"/数值 0 不得经 bool() 被静默吞并：非真布尔直接拒绝
+        for bad_value in ('"false"', "0", '"yes"'):
+            with self.subTest(bad_value=bad_value):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    yaml_path = Path(tmpdir) / "calib.yaml"
+                    yaml_path.write_text(
+                        "name: t\n"
+                        f"synthetic: {bad_value}\n"
+                        "width_m: 6.0\nlength_m: 15.0\n"
+                        "image_points: [[0,0],[1,0],[1,1],[0,1]]\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ValueError):
+                        RoadCalibrator.from_yaml(yaml_path)
+
+    def test_missing_synthetic_field_warns_and_loads_as_real(self):
+        # 旧版文件无溯源字段：无法区分实测/占位，按实测加载但警告重新标定
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yaml_path = Path(tmpdir) / "calib.yaml"
+            yaml_path.write_text(
+                "name: old\n"
+                "width_m: 6.0\nlength_m: 15.0\n"
+                "image_points: [[0,0],[200,0],[200,100],[0,100]]\n",
+                encoding="utf-8",
+            )
+            with self.assertWarns(UserWarning):
+                loaded = RoadCalibrator.from_yaml(yaml_path)
+            self.assertFalse(loaded.synthetic)
+
 
 class TestSpeedEstimator(unittest.TestCase):
     def test_warmup_requires_sufficient_points(self):
@@ -242,6 +272,49 @@ class TestSpeedEstimator(unittest.TestCase):
             SpeedEstimator(speed_limit_kmh=-1.0)
         with self.assertRaises(ValueError):
             SpeedEstimator(category_confirm_frames=0)
+
+    def test_reliable_requires_min_time_span(self):
+        # 时间门：40fps 下 4 样本仅覆盖 0.12s，不足 0.2s 跨度仍不可信；
+        # 6 样本覆盖 0.2s 才收敛，避免高帧率下过早置位
+        est = SpeedEstimator(reliable_min_span_s=0.2)
+        readings = [
+            est.update(1, "vehicle", i * 0.04, 3.0, i * 0.2) for i in range(6)
+        ]
+        self.assertFalse(readings[3].is_reliable)   # span=0.12 < 0.2
+        self.assertTrue(readings[5].is_reliable)    # span=0.20 >= 0.2
+
+    def test_zero_min_span_disables_time_gate(self):
+        est = SpeedEstimator(reliable_min_span_s=0.0)
+        final = None
+        for i in range(4):
+            final = est.update(1, "vehicle", i * 0.04, 3.0, i * 0.2)
+        self.assertTrue(final.is_reliable)
+
+    def test_invalid_reliable_span_rejected(self):
+        with self.assertRaises(ValueError):
+            SpeedEstimator(reliable_min_span_s=-0.1)
+        with self.assertRaises(ValueError):
+            SpeedEstimator(reliable_min_span_s=float("nan"))
+        with self.assertRaises(ValueError):
+            TrackMotionTracker(1, "vehicle", reliable_min_span_s=float("inf"))
+
+    def test_vehicle_restarting_after_parking_recovers(self):
+        # 泊车确认后重新起步：静止标记必须即时解除，
+        # 恢复参与碰撞研判（停车 -> 起步 -> 与行人冲突 的常见序列）
+        est = SpeedEstimator(stationary_min_frames=5)
+        parked = [
+            est.update(1, "vehicle", i * 0.1, 3.0, 5.0) for i in range(10)
+        ]
+        self.assertTrue(parked[-1].is_stationary)
+        self.assertTrue(parked[-1].is_reliable)
+
+        moving = [
+            est.update(1, "vehicle", (10 + i) * 0.1, 3.0, 5.0 + (i + 1) * 0.5)
+            for i in range(6)
+        ]
+        # 起步首帧平滑速度即越过静止阈值，标记立刻解除
+        self.assertFalse(moving[0].is_stationary)
+        self.assertGreater(moving[-1].speed_ms, 1.0)
 
     def test_reclassified_vehicle_can_be_flagged_speeding(self):
         # ByteTrack ID 首次观测被误检为 person，纠正为 vehicle 后应能判超速
@@ -537,6 +610,39 @@ class TestConflictAnalyzer(unittest.TestCase):
         )
         self.assertIsNotNone(self.analyzer.evaluate_pair(warming, ped))
 
+    def test_stationary_but_unreliable_not_exempt(self):
+        # --parked-frames 1 或低 FPS 下，静止标记可能在收敛前置位：
+        # is_stationary=True 且 is_reliable=False 的车辆不得豁免，
+        # 仍按收敛前保守策略参与碰撞研判
+        early_parked = SpeedReading(
+            track_id=1,
+            category="vehicle",
+            x_m=3.0,
+            y_m=5.0,
+            vx_ms=0.0,
+            vy_ms=0.0,
+            speed_ms=0.0,
+            speed_kmh=0.0,
+            is_speeding=False,
+            heading_deg=0.0,
+            is_reliable=False,
+            is_stationary=True,
+        )
+        ped = SpeedReading(
+            track_id=2,
+            category="pedestrian",
+            x_m=7.0,
+            y_m=5.0,
+            vx_ms=-2.0,
+            vy_ms=0.0,
+            speed_ms=2.0,
+            speed_kmh=7.2,
+            is_speeding=False,
+            heading_deg=180.0,
+            is_reliable=True,
+        )
+        self.assertIsNotNone(self.analyzer.evaluate_pair(early_parked, ped))
+
     def test_analyze_frame_isolated_safe(self):
         # 仅有车辆正常行驶，无行人
         veh = SpeedReading(
@@ -831,6 +937,11 @@ class TestPipelineIO(unittest.TestCase):
             ["--alert-cooldown", "-1"],
             ["--alert-cooldown-s", "-0.5"],
             ["--alert-cooldown-s", "nan"],
+            ["--fps", "0"],
+            ["--fps", "-25"],
+            ["--fps", "nan"],
+            ["--reliable-span-s", "-1"],
+            ["--reliable-span-s", "nan"],
             ["--speed-limit", "nan"],
         ):
             with self.assertRaises(SystemExit, msg=bad_args):
@@ -1001,6 +1112,50 @@ class TestPipelineIO(unittest.TestCase):
             self.assertGreaterEqual(len(confirmed), 1)
             # 每帧一行原始评估仍在，确认前帧 event_id 为空
             self.assertTrue(any(l.get("event_id") is None for l in lines))
+
+    def test_missing_fps_rejected_without_override(self):
+        # 与 tracking 模块同策略：源 FPS 缺失且未显式 --fps 时拒绝运行，
+        # 避免把测速/TTC 建立在错误的 25fps 兜底时间基准上
+        import cv2
+        from unittest import mock
+
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        with tempfile.TemporaryDirectory() as d:
+            calib = RoadCalibrator(
+                [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+            )
+            fake_cap = mock.Mock()
+            fake_cap.isOpened.return_value = True
+            fake_cap.get.side_effect = lambda prop: {
+                cv2.CAP_PROP_FPS: 0.0,
+                cv2.CAP_PROP_FRAME_WIDTH: 64.0,
+                cv2.CAP_PROP_FRAME_HEIGHT: 64.0,
+            }.get(prop, 0.0)
+            fake_cap.read.return_value = (False, None)
+
+            with mock.patch("analysis.pipeline.cv2.VideoCapture", return_value=fake_cap):
+                with mock.patch("analysis.pipeline.TrackingSession"):
+                    with self.assertRaises(RuntimeError):
+                        ConflictPerceptionPipeline(calibrator=calib).process_video(
+                            "v.mp4", Path(d) / "out1"
+                        )
+
+                    # 显式指定 fps 后允许运行（0 帧也产出 summary）
+                    pipe = ConflictPerceptionPipeline(calibrator=calib, fps=25.0)
+                    summary = pipe.process_video("v.mp4", Path(d) / "out2")
+                    self.assertEqual(summary["frames_processed"], 0)
+
+    def test_invalid_fps_param_rejected(self):
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        calib = RoadCalibrator(
+            [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+        )
+        with self.assertRaises(ValueError):
+            ConflictPerceptionPipeline(calibrator=calib, fps=-1.0)
+        with self.assertRaises(ValueError):
+            ConflictPerceptionPipeline(calibrator=calib, fps=float("nan"))
 
 
 if __name__ == "__main__":

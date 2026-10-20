@@ -44,6 +44,7 @@ class TrackMotionTracker:
         speed_limit_kmh: float = 30.0,
         stationary_speed_ms: float = 0.1,
         stationary_min_frames: int = 8,
+        reliable_min_span_s: float = 0.2,
     ):
         if type(window_size) is not int or window_size < 3:
             raise ValueError("window_size 必须是 >= 3 的整数帧数")
@@ -55,6 +56,8 @@ class TrackMotionTracker:
             raise ValueError("stationary_speed_ms 必须为有限正数")
         if type(stationary_min_frames) is not int or stationary_min_frames < 1:
             raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
+        if not math.isfinite(reliable_min_span_s) or reliable_min_span_s < 0:
+            raise ValueError("reliable_min_span_s 必须为有限非负数")
 
         self.track_id = track_id
         self.category = category
@@ -63,6 +66,7 @@ class TrackMotionTracker:
         self.speed_limit_kmh = speed_limit_kmh
         self.stationary_speed_ms = stationary_speed_ms
         self.stationary_min_frames = stationary_min_frames
+        self.reliable_min_span_s = reliable_min_span_s
 
         # 历史物理轨迹窗口: deque of (timestamp_s, x_m, y_m)
         self.history: deque[Tuple[float, float, float]] = deque(maxlen=window_size)
@@ -188,6 +192,14 @@ class TrackMotionTracker:
         # 超速研判：车辆且车速超过 30 km/h (可设容差如 1.0 km/h)
         is_speeding = (self.category == "vehicle") and (speed_kmh > self.speed_limit_kmh)
 
+        # 可信判定需同时满足样本数与时间跨度下限：
+        # 仅按样本数判定会让高 FPS 视频的 4 帧（仅 0.12s）过早收敛、
+        # 低 FPS 的稀疏观测却长期不可信；跨度下限使跨帧率语义一致
+        min_samples = min(4, self.window_size)
+        is_reliable = (
+            len(self.history) >= min_samples and dt >= self.reliable_min_span_s
+        )
+
         return SpeedReading(
             track_id=self.track_id,
             category=self.category,
@@ -199,7 +211,7 @@ class TrackMotionTracker:
             speed_kmh=speed_kmh,
             is_speeding=is_speeding,
             heading_deg=heading,
-            is_reliable=len(self.history) >= 4,
+            is_reliable=is_reliable,
             is_stationary=is_stationary,
         )
 
@@ -215,6 +227,7 @@ class SpeedEstimator:
         stationary_speed_ms: float = 0.1,
         stationary_min_frames: int = 8,
         category_confirm_frames: int = 3,
+        reliable_min_span_s: float = 0.2,
     ):
         if not math.isfinite(ema_alpha) or not (0 < ema_alpha <= 1):
             raise ValueError("ema_alpha 必须在 (0, 1] 区间")
@@ -228,12 +241,15 @@ class SpeedEstimator:
             raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
         if type(category_confirm_frames) is not int or category_confirm_frames < 1:
             raise ValueError("category_confirm_frames 必须是 >= 1 的整数帧数")
+        if not math.isfinite(reliable_min_span_s) or reliable_min_span_s < 0:
+            raise ValueError("reliable_min_span_s 必须为有限非负数")
         self.speed_limit_kmh = speed_limit_kmh
         self.window_size = window_size
         self.ema_alpha = ema_alpha
         self.stationary_speed_ms = stationary_speed_ms
         self.stationary_min_frames = stationary_min_frames
         self.category_confirm_frames = category_confirm_frames
+        self.reliable_min_span_s = reliable_min_span_s
         self.tracks: Dict[int, TrackMotionTracker] = {}
 
     def update(
@@ -249,6 +265,7 @@ class SpeedEstimator:
                 speed_limit_kmh=self.speed_limit_kmh,
                 stationary_speed_ms=self.stationary_speed_ms,
                 stationary_min_frames=self.stationary_min_frames,
+                reliable_min_span_s=self.reliable_min_span_s,
             )
         else:
             # 跟踪 ID 沿用期间检测类别可能被纠正（如 person -> car），

@@ -142,6 +142,18 @@ def main(argv: list[str] | None = None):
         help="按秒指定告警冷却窗，按视频 FPS 换算帧数；设置后覆盖 --alert-cooldown",
     )
     parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="强制指定视频帧率；源视频缺少有效 FPS 时必须显式指定",
+    )
+    parser.add_argument(
+        "--reliable-span-s",
+        type=float,
+        default=0.2,
+        help="速度读数判定为可信所需的最小观测时间跨度 (秒)，默认 0.2",
+    )
+    parser.add_argument(
         "--demo",
         action="store_true",
         help="标定文件缺失时允许使用合成占位标定（仅演示，测速结果不可信）",
@@ -177,6 +189,10 @@ def main(argv: list[str] | None = None):
         not math.isfinite(args.alert_cooldown_s) or args.alert_cooldown_s < 0
     ):
         parser.error("--alert-cooldown-s 必须为非负数")
+    if args.fps is not None and (not math.isfinite(args.fps) or args.fps <= 0):
+        parser.error("--fps 必须为有限正数")
+    if not math.isfinite(args.reliable_span_s) or args.reliable_span_s < 0:
+        parser.error("--reliable-span-s 必须为非负数")
     if not math.isfinite(args.speed_limit) or args.speed_limit <= 0:
         parser.error("--speed-limit 必须为正数")
 
@@ -239,6 +255,8 @@ def main(argv: list[str] | None = None):
         alert_confirm_frames=args.alert_confirm,
         alert_cooldown_frames=args.alert_cooldown,
         alert_cooldown_seconds=args.alert_cooldown_s,
+        reliable_min_span_s=args.reliable_span_s,
+        fps=args.fps,
     )
 
     summary = pipeline.process_video(

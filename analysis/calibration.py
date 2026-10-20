@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -93,12 +94,32 @@ class RoadCalibrator:
             data = yaml.safe_load(f)
 
         img_pts = [tuple(p) for p in data["image_points"]]
+
+        # synthetic 是布尔溯源字段而非可选字符串：
+        # bool("false") == True 会把误写字符串的文件错判为占位标定；
+        # 旧版文件缺失该字段时无法区分实测/合成，按实测加载但提示重新标定
+        if "synthetic" in data:
+            if type(data["synthetic"]) is not bool:
+                raise ValueError(
+                    f"标定文件 {path} 的 synthetic 字段必须是 true/false 布尔值；"
+                    "请修正字段或重新标定"
+                )
+            synthetic = data["synthetic"]
+        else:
+            warnings.warn(
+                f"标定文件 {path} 缺少 synthetic 溯源字段（旧版格式），"
+                "已按实测标定加载；建议用 interactive_calibrator 重新标定以写入完整字段",
+                UserWarning,
+                stacklevel=2,
+            )
+            synthetic = False
+
         return cls(
             image_points=img_pts,
             width_m=float(data["width_m"]),
             length_m=float(data["length_m"]),
             name=data.get("name", "campus_road"),
-            synthetic=bool(data.get("synthetic", False)),
+            synthetic=synthetic,
         )
 
     def to_yaml(self, save_path: str | Path) -> Path:

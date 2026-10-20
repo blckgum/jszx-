@@ -57,12 +57,16 @@ class ConflictPerceptionPipeline:
         stationary_min_frames: int = 8,
         stationary_seconds: Optional[float] = None,
         category_confirm_frames: int = 3,
+        reliable_min_span_s: float = 0.2,
         alert_confirm_frames: int = 3,
         alert_cooldown_frames: int = 12,
         alert_cooldown_seconds: Optional[float] = None,
+        fps: Optional[float] = None,
     ):
         if not math.isfinite(iou) or not (0 < iou <= 1):
             raise ValueError("iou 必须在 (0, 1] 区间")
+        if fps is not None and (not math.isfinite(fps) or fps <= 0):
+            raise ValueError("fps 必须是有限正数")
         if type(imgsz) is not int or imgsz <= 0:
             raise ValueError("imgsz 必须是正整数")
         if not math.isfinite(zone_margin_m) or zone_margin_m < 0:
@@ -94,6 +98,7 @@ class ConflictPerceptionPipeline:
         self.alert_confirm_frames = alert_confirm_frames
         self.alert_cooldown_frames = alert_cooldown_frames
         self.alert_cooldown_seconds = alert_cooldown_seconds
+        self.fps = fps
 
         # 每次 process_video 按实际 FPS 重建 estimator，跨视频不串状态
         self._estimator_kwargs = dict(
@@ -103,6 +108,7 @@ class ConflictPerceptionPipeline:
             stationary_speed_ms=stationary_speed_ms,
             stationary_min_frames=stationary_min_frames,
             category_confirm_frames=category_confirm_frames,
+            reliable_min_span_s=reliable_min_span_s,
         )
         self.speed_estimator = SpeedEstimator(**self._estimator_kwargs)
         self.event_tracker = ConflictEventTracker(
@@ -155,11 +161,18 @@ class ConflictPerceptionPipeline:
         if not cap.isOpened():
             raise RuntimeError(f"无法打开视频输入文件: {src}")
 
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        # 与 tracking 模块同策略：源 FPS 缺失/无效时必须显式 --fps，
+        # 静默兜底 25fps 会让测速窗口与 TTC 建立在错误时间基准上
+        raw_fps = cap.get(cv2.CAP_PROP_FPS)
+        source_fps = raw_fps if math.isfinite(raw_fps) and raw_fps > 0 else None
+        fps = self.fps if self.fps is not None else source_fps
+        if fps is None:
+            cap.release()
+            raise RuntimeError("视频缺少有效 FPS；确认帧率后通过 --fps 指定")
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        video_clock = VideoClock(fps=fps)
+        video_clock = VideoClock(fps=fps, force_fps=self.fps is not None)
         self._configure_speed_estimator(fps)
         self._configure_event_tracker(fps)
         session = TrackingSession(
@@ -278,7 +291,7 @@ class ConflictPerceptionPipeline:
                     # 也不静默降级为"按本帧可见 ID 剪枝"而恢复遮挡闪断问题
                     raise RuntimeError(
                         "无法读取跟踪器存活池 (tracked/lost stracks)，"
-                        "当前 Ultralytics 版本接口不兼容；请固定 ultralytics==8.4.142 或更新适配"
+                        "当前 Ultralytics 版本接口不兼容；请固定 ultralytics==8.4.182 或更新适配"
                     ) from exc
                 live_ids -= out_of_zone_ids
                 self.speed_estimator.prune_stale_tracks(live_ids)

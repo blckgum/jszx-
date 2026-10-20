@@ -100,10 +100,12 @@ class ConflictAnalyzer:
         if current_dist > 35.0:
             return None
 
-        # 持续静止的车辆（泊车/停靠，由速度滤波器多帧确认）不参与碰撞研判：
+        # 持续静止且速度估计已收敛的车辆（泊车/停靠）不参与碰撞研判：
         # 行人走近停靠车辆不构成交通冲突，否则 CVM 外推会对路边停靠目标
-        # 持续误报；缓慢蠕行或速度未收敛的车辆不满足该条件，仍正常评估
-        if veh.is_stationary:
+        # 持续误报；缓慢蠕行或速度未收敛的车辆不满足该条件，仍正常评估。
+        # is_reliable 兜底：--parked-frames 1 或低 FPS 时静止标记可能在
+        # 收敛前置位，未收敛目标一律保守参与研判，不做豁免
+        if veh.is_stationary and veh.is_reliable:
             return None
 
         # 相对速度矢量：v_rel = v_ped - v_veh
