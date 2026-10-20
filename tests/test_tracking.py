@@ -43,10 +43,11 @@ class TrackingContractTests(unittest.TestCase):
         self.assertEqual(target.observation, "detected")
 
     def test_conf_does_not_discard_low_score_association_candidates(self):
-        with patch("tracking.core.load_model") as load:
-            with self.assertRaisesRegex(ValueError, "不高于"):
-                TrackingSession("unused.mp4", "unused.pt", DEFAULT_TRACKER, conf=0.25)
-            load.assert_not_called()
+        for conf in (0.25, float("nan"), float("inf"), 0, -1, True):
+            with self.subTest(conf=conf), patch("tracking.core.load_model") as load:
+                with self.assertRaisesRegex(ValueError, "不高于"):
+                    TrackingSession("unused.mp4", "unused.pt", DEFAULT_TRACKER, conf=conf)
+                load.assert_not_called()
 
     def test_video_clock_marks_estimated_time_and_rejects_regression(self):
         clock = VideoClock(10)
@@ -93,6 +94,16 @@ class ByteTrackMechanismTests(unittest.TestCase):
 
     def make_tracker(self):
         return BYTETracker(SimpleNamespace(**read_tracker_config(DEFAULT_TRACKER)))
+
+    def test_low_score_alone_does_not_start_track_and_late_entry_needs_confirmation(self):
+        tracker = self.make_tracker()
+        low = self.detections([[10, 10, 40, 90, 0.15, 0]])
+        self.assertEqual(len(tracker.update(low)), 0)
+        self.assertFalse(tracker.tracked_stracks)
+        high = self.detections([[10, 10, 40, 90, 0.9, 0]])
+        self.assertEqual(len(tracker.update(high)), 0)
+        confirmed = tracker.update(high)
+        self.assertEqual([int(row[4]) for row in confirmed], [1])
 
     def test_two_objects_keep_ids_with_low_score_and_short_miss(self):
         tracker = self.make_tracker()

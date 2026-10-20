@@ -86,9 +86,11 @@ $$
 - 本地 YOLO 标注数据检查：类别映射、标签格式、缺少标签及训练/验证文件路径重叠。
 - 自定义数据训练、验证与测试入口，导出整体及有标注类别的检测指标。
 - ByteTrack 连续视频跟踪，显示类别、置信度、ID、分组颜色、轨迹、源 FPS、处理 FPS、帧号和当前各类数量。
-- 跟踪结果导出 `tracks.jsonl`；可选桌面 `--show` 模式支持 Space/P 暂停继续、Q/Esc 退出，默认无窗口保存视频。
+- 跟踪结果流式导出 JSONL、CSV、丢失/恢复事件及逐轨迹汇总；可选桌面 `--show` 模式支持 Space/P 暂停继续、Q/Esc 退出，默认无窗口保存视频。
+- 目录顺序批量跟踪，每段新建会话；单个文件失败继续处理，其错误写入批次清单。
+- 推理异常或 Ctrl+C 时尝试保存已完成视频与错误汇总；提供不需要数据集的构造样例生成器。
 
-当前输入入口为本地文件，摄像头、网络流和网页预警端尚未接入。检测入口的 `track_id` 仍为 `null`；跟踪入口输出有效 ID，未获得 ID 的返回框保留 null。当前云机器没有桌面，按键控制已通过模拟事件测试，实际窗口仍需本地验证。
+当前输入入口为本地文件和目录，摄像头、网络流和网页预警端尚未接入。检测入口的 `track_id` 仍为 `null`；跟踪入口输出有效 ID，未获得 ID 的返回框保留 null。当前云机器没有桌面，按键控制已通过模拟事件测试，实际窗口仍需本地验证。
 
 ## 5. 安装与快速使用
 
@@ -123,8 +125,12 @@ python -m detection detect --source path/to/video.mp4 --classes person car bus t
 # 跟踪：默认无窗口保存视频和逐帧数据
 python -m tracking --source path/to/video.mp4 --tracker configs/bytetrack.yaml --device cpu
 
-# 有桌面的本机可追加 --show，GPU 机器可改为 --device 0
-python -m tracking --source path/to/video.mp4 --device cpu --show
+# 目录批量跟踪：每段独立输出，目录只读取一层
+python -m tracking --source path/to/videos --device cpu
+
+# 尚无实拍视频时：生成非实拍功能样例，再运行真实模型和跟踪器
+python -m tracking.demo --output runs/tracking-fixtures/sample_01
+python -m tracking --source runs/tracking-fixtures/sample_01 --device cpu --output runs/yolo/track-batch/sample_01
 ```
 
 | 参数 | 用途 | 默认值 |
@@ -136,6 +142,8 @@ python -m tracking --source path/to/video.mp4 --device cpu --show
 | `--device` | `cpu` 或 GPU 编号，如 `0` | 自动选择 |
 | `--output` | 指定一个尚不存在的输出目录 | 自动创建独立目录 |
 | `--fps` | 显式覆盖视频 FPS 及固定间隔时间戳 | 优先使用视频元数据 |
+
+上述参数表描述检测入口。跟踪入口的 `--conf` 默认取 `configs/bytetrack.yaml` 中的 `track_low_thresh=0.1`，并拒绝更高值，保留低分关联候选。跟踪可追加 `--show` 启用桌面窗口，当前默认无界面。
 
 ## 6. 数据集与训练评估
 
@@ -176,7 +184,7 @@ python -m detection val --data configs/traffic.example.yaml --weights runs/yolo/
 
 独立图片没有时间戳；视频在源时间戳不可用时使用 FPS 估计，并记录 `fps_estimate`。标注 MP4 使用固定帧率，后续运动计算以逐帧数据中的源时间信息为准。检测框累计数量不能直接作为独立目标数量。
 
-跟踪输出位于 `runs/yolo/track/run-*`，包含 `annotated.mp4`、`tracks.jsonl`、`summary.json`、`tracker.resolved.yaml`。逐帧目标还提供 ID、框底边中心像素点和观测标记，使用 `(session_id, track_id)` 区分不同视频；当前不输出实际速度或 TTC。
+跟踪输出位于 `runs/yolo/track/run-*`，包含 `annotated.mp4`、`tracks.jsonl`、`observations.csv`、`events.jsonl`、`tracklets.jsonl`、`summary.json` 和 `tracker.resolved.yaml`。目录输入默认输出到 `runs/yolo/track-batch/run-*`，根目录另有 `batch_summary.json`，每段视频放在独立子目录。逐帧目标还提供 ID、框底边中心像素点和观测标记，使用 `(session_id, track_id)` 区分不同视频；当前不输出实际速度或 TTC。
 
 | 评价对象 | 指标与验证方法 | 状态 |
 |---|---|---|
@@ -187,7 +195,7 @@ python -m detection val --data configs/traffic.example.yaml --weights runs/yolo/
 
 已完成的功能验证：官方样例检出行人、公交车、汽车、自行车和卡车；3 帧拼接视频验证空帧保留、时间戳和输出解码；COCO128 重映射小样本按 4/4/2 张划分，完成单轮训练及 val/test 入口验证；6 项回归测试通过。小样本单轮微调后的指标较低，仅用于检查流程，不能代表校园检测效果。GPU 性能、真实道路动态视频及完整预警效果尚未验证。
 
-跟踪新增验证：3 帧视频中的公交车在空白帧前后保持 ID；两段各 18 帧的构造视频中，多车多人同时关联，公交车在两个空白帧后恢复原 ID；同进程处理第二段视频时正确新建会话并重新分配 ID。当前总测试数为 **17 项，全部通过、无跳过**，包含真实网络集成及模拟按键测试。构造视频不是校园实拍基准，未据此报告 IDF1/HOTA 或承诺实时性能。
+跟踪新增验证：3 帧视频中的公交车在空白帧前后保持 ID；两段各 18 帧的构造视频中，多车多人同时关联，公交车在两个空白帧后恢复原 ID；同进程处理第二段视频时正确新建会话并重新分配 ID。当前总测试数为 **30 项，全部通过、无跳过**，包含真实网络集成、长时间丢失与临界恢复、生命周期和 CSV、坏视频批量处理、异常/中断保存及模拟按键测试。命令行已实际完成两段各 18 帧构造样例的 CPU 批量处理与输出核对。构造视频不是校园实拍基准，未据此报告 IDF1/HOTA 或承诺实时性能。
 
 ```bash
 python -m unittest discover -s tests -v
@@ -203,7 +211,7 @@ jszx-/
 │   └── dataset.py                 # 数据集与标签检查
 ├── configs/traffic.example.yaml   # YOLO 数据配置模板
 ├── configs/bytetrack.yaml         # 独立 ByteTrack 参数
-├── tracking/                      # 跟踪会话、结构化观测及可视化
+├── tracking/                      # 独立会话、轨迹记录、批处理、构造样例及可视化
 ├── tests/                         # 检测、跟踪机制与真实网络集成测试
 ├── requirements-yolo.txt          # 检测模块依赖
 ├── docs/                         # 课题需求、技术路线及检测模块说明

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import sys
@@ -12,12 +11,21 @@ from pathlib import Path
 from uuid import uuid4
 
 import yaml
+import numpy as np
 
 from detection.core import DEFAULT_WEIGHTS, ROOT, VIDEO_SUFFIXES, load_model, new_run, prepare_runtime, select_classes, write_json
 from .records import FrameRecord, extract_tracks
 from .visualization import PlaybackController, TrailHistory, annotate
+from .export import RunExports
 
 DEFAULT_TRACKER = ROOT / "configs" / "bytetrack.yaml"
+
+
+def resolve_conf(config, conf):
+    value = config["track_low_thresh"] if conf is None else conf
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= config["track_low_thresh"]:
+        raise ValueError("检测 conf 必须大于 0 且不高于 track_low_thresh，保留第二阶段关联候选")
+    return value
 
 
 def read_tracker_config(path):
@@ -47,6 +55,8 @@ def read_tracker_config(path):
 
 class VideoClock:
     def __init__(self, fps: float, force_fps: bool = False):
+        if not math.isfinite(fps) or fps <= 0:
+            raise ValueError("fps 必须是有限正数")
         self.fps = fps
         self.force_fps = force_fps
         self.previous = -1.0
@@ -67,9 +77,7 @@ class TrackingSession:
     def __init__(self, source, weights, tracker_path, classes=None, conf=None, imgsz=640,
                  iou=0.7, device=None):
         config = read_tracker_config(tracker_path)
-        self.conf = config["track_low_thresh"] if conf is None else conf
-        if not math.isfinite(self.conf) or not 0 < self.conf <= config["track_low_thresh"]:
-            raise ValueError("检测 conf 必须大于 0 且不高于 track_low_thresh，保留第二阶段关联候选")
+        self.conf = resolve_conf(config, conf)
         # 每个视频创建新的 YOLO 包装实例，避免继承上一段视频的 predictor/trackers。
         # 权重只读取，不训练或修改；该实例在本视频的所有帧之间持续使用。
         self.model = load_model(weights)
@@ -80,8 +88,20 @@ class TrackingSession:
         self.frame_index = 0
         self.tracker_path = str(Path(tracker_path).resolve())
         self.imgsz, self.iou, self.device = imgsz, iou, device
+        self.previous_time = -1.0
+        self.frame_shape = None
 
     def process(self, frame, timestamp, timestamp_source):
+        # OpenCV 图像为 H×W×3、uint8、BGR。错误输入先拒绝，避免破坏 Kalman 时间步。
+        if (not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or frame.ndim != 3
+                or frame.shape[2] != 3 or min(frame.shape[:2]) <= 0):
+            raise ValueError("帧必须是非空 H×W×3 uint8 BGR 图像")
+        if self.frame_shape is not None and frame.shape != self.frame_shape:
+            raise ValueError("同一视频内分辨率发生变化，请预处理为固定尺寸后重新跟踪")
+        if not math.isfinite(timestamp) or timestamp < 0 or timestamp <= self.previous_time:
+            raise ValueError("同一会话的时间戳必须非负且严格递增")
+        if timestamp_source not in {"video_pts", "fps_estimate"}:
+            raise ValueError("timestamp_source 必须为 video_pts 或 fps_estimate")
         # persist=True 仅用于同一视频会话；每个输入帧恰好调用一次，包含没有目标的帧。
         # YOLO 检测、Kalman 预测和 LAPJV 关联均由 Ultralytics 内部完成。
         result = self.model.track(
@@ -93,7 +113,15 @@ class TrackingSession:
         record = FrameRecord(self.session_id, self.source, self.frame_index, timestamp,
                              timestamp_source, width, height, extract_tracks(result))
         self.frame_index += 1
+        self.previous_time, self.frame_shape = timestamp, frame.shape
         return record
+
+    def retained_ids(self):
+        # 只读取已固定版本的 Ultralytics 状态池，不调用 update，不改变跟踪结果。
+        # 8.4.182 的 lost 池在移除边界可能短暂保留 Removed 对象，下一帧仍会参与关联。
+        # 因此按池成员判断是否仍可被关联，不提前按枚举关闭同一个 ID 的统计。
+        tracker = self.model.predictor.trackers[0]
+        return {int(track.track_id) for track in (*tracker.tracked_stracks, *tracker.lost_stracks)}
 
 
 def check_display():
@@ -128,6 +156,7 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
     if fps is not None and (not math.isfinite(fps) or fps <= 0):
         raise ValueError("fps 必须是有限正数")
     config = read_tracker_config(tracker)
+    conf = resolve_conf(config, conf)
     if show:
         check_display()
 
@@ -141,6 +170,9 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
     recent_times = deque(maxlen=30)
     observations = Counter()
     track_ids = set()
+    session = exports = output_path = None
+    source_fps = effective_fps = total_frames = None
+    failure = None
     wall_start = time.perf_counter()
     try:
         if not capture.isOpened():
@@ -153,10 +185,11 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
         reported = capture.get(cv2.CAP_PROP_FRAME_COUNT)
         total_frames = int(reported) if math.isfinite(reported) and reported > 0 else None
         clock = VideoClock(effective_fps, force_fps=fps is not None)
-        output = new_run(output, "track")
+        output_path = new_run(output, "track")
         # 保存本次实际使用的配置，后续调参不会改变旧实验的参数记录。
-        frozen_tracker = output / "tracker.resolved.yaml"
+        frozen_tracker = output_path / "tracker.resolved.yaml"
         frozen_tracker.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        exports = RunExports(output_path)
         session = TrackingSession(source, weights, frozen_tracker, classes, conf, imgsz, iou, device)
         history = TrailHistory(trail_length, config["track_buffer"])
         playback = PlaybackController()
@@ -164,76 +197,96 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             window_open = True
         try:
-            with (output / "tracks.jsonl").open("w", encoding="utf-8") as stream:
-                while not playback.quit_requested:
-                    if max_frames is not None and processed >= max_frames:
-                        stop_reason = "max_frames"
-                        break
-                    # 计时覆盖解码、推理、绘制及写入，不包括按键等待、暂停和模型初始加载。
-                    frame_start = time.perf_counter()
-                    ok, frame = capture.read()
-                    if not ok:
-                        break
-                    timestamp, timestamp_source = clock.timestamp(processed, capture.get(cv2.CAP_PROP_POS_MSEC))
-                    record = session.process(frame, timestamp, timestamp_source)
-                    history.update(record)
-                    measured_fps = len(recent_times) / sum(recent_times) if recent_times else None
-                    annotated = annotate(frame, record, history, source_fps, measured_fps,
-                                         total_frames, session.class_names, interactive=show)
-                    if writer is None:
-                        writer = cv2.VideoWriter(str(output / "annotated.mp4"),
-                                                 cv2.VideoWriter_fourcc(*"mp4v"), effective_fps,
-                                                 (record.width, record.height))
-                        if not writer.isOpened():
-                            raise RuntimeError("无法创建标注 MP4，请检查 OpenCV 编码器与输出路径")
-                    writer.write(annotated)
-                    stream.write(json.dumps(record.to_dict(), ensure_ascii=False, allow_nan=False) + "\n")
-                    processed += 1
-                    observations.update(target.class_name for target in record.tracks)
-                    track_ids.update(target.track_id for target in record.tracks if target.track_id is not None)
-                    duration = time.perf_counter() - frame_start
-                    processing_seconds += duration
-                    recent_times.append(duration)
+            while not playback.quit_requested:
+                if max_frames is not None and processed >= max_frames:
+                    stop_reason = "max_frames"
+                    break
+                # 计时覆盖解码、推理、绘制及写入，不包括按键等待、暂停和模型初始加载。
+                frame_start = time.perf_counter()
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                timestamp, timestamp_source = clock.timestamp(processed, capture.get(cv2.CAP_PROP_POS_MSEC))
+                record = session.process(frame, timestamp, timestamp_source)
+                history.update(record)
+                measured_fps = len(recent_times) / sum(recent_times) if recent_times else None
+                annotated = annotate(frame, record, history, source_fps, measured_fps,
+                                     total_frames, session.class_names, interactive=show)
+                if writer is None:
+                    writer = cv2.VideoWriter(str(output_path / "annotated.mp4"),
+                                             cv2.VideoWriter_fourcc(*"mp4v"), effective_fps,
+                                             (record.width, record.height))
+                    if not writer.isOpened():
+                        raise RuntimeError("无法创建标注 MP4，请检查 OpenCV 编码器与输出路径")
+                writer.write(annotated)
+                exports.write(record, session.retained_ids())
+                processed += 1
+                observations.update(target.class_name for target in record.tracks)
+                track_ids.update(target.track_id for target in record.tracks if target.track_id is not None)
+                duration = time.perf_counter() - frame_start
+                processing_seconds += duration
+                recent_times.append(duration)
 
-                    if show:
-                        cv2.imshow(window_name, annotated)
-                        playback.handle_key(cv2.waitKey(1))
-                        # 暂停期间只刷新最后一帧，不读取、推理或写出新帧。
-                        while playback.paused and not playback.quit_requested:
-                            paused_frame = annotate(frame, record, history, source_fps, measured_fps,
-                                                    total_frames, session.class_names, interactive=True, paused=True)
-                            cv2.imshow(window_name, paused_frame)
-                            playback.handle_key(cv2.waitKey(30))
-                            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                                playback.quit_requested = True
+                if show:
+                    cv2.imshow(window_name, annotated)
+                    playback.handle_key(cv2.waitKey(1))
+                    # 暂停期间只刷新最后一帧，不读取、推理或写出新帧。
+                    while playback.paused and not playback.quit_requested:
+                        paused_frame = annotate(frame, record, history, source_fps, measured_fps,
+                                                total_frames, session.class_names, interactive=True, paused=True)
+                        cv2.imshow(window_name, paused_frame)
+                        playback.handle_key(cv2.waitKey(30))
                         if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                             playback.quit_requested = True
-                if playback.quit_requested:
-                    stop_reason = "user_quit"
+                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        playback.quit_requested = True
+            if playback.quit_requested:
+                stop_reason = "user_quit"
         except KeyboardInterrupt:
             stop_reason = "interrupted"
+        if processed == 0 and stop_reason != "interrupted":
+            raise ValueError("没有成功解码的视频帧")
+    except KeyboardInterrupt:
+        stop_reason = "interrupted"
+    except Exception as exc:
+        # 推理、编码或时间轴出错仍封装已完成的视频，并留下失败原因，调用方继续收到异常。
+        stop_reason, failure = "error", exc
     finally:
         capture.release()
         if writer is not None:
             writer.release()
         if window_open:
             cv2.destroyWindow(window_name)
+        if exports is not None:
+            try:
+                exports.finish(stop_reason)
+            finally:
+                exports.close()
 
-    if processed == 0 and stop_reason != "interrupted":
-        raise ValueError("没有成功解码的视频帧")
-    write_json(output / "summary.json", {
-        "schema_version": 1, "session_id": session.session_id, "source": str(source),
+    if output_path is None:
+        if failure is not None:
+            raise failure
+        raise KeyboardInterrupt
+    write_json(output_path / "summary.json", {
+        "schema_version": 2, "session_id": session.session_id if session else None, "source": str(source),
         "weights": str(Path(weights).expanduser().resolve()),
-        "tracker": config, "classes": {str(index): session.model.names[index] for index in session.class_ids},
+        "tracker": config, "classes": {str(index): session.model.names[index] for index in session.class_ids} if session else {},
         "source_fps": source_fps, "effective_output_fps": effective_fps,
         "timestamp_fps_override": fps is not None, "source_frame_count_reported": total_frames,
         "reported_frame_count_mismatch": stop_reason == "eof" and total_frames is not None and processed != total_frames,
         "frames_processed": processed, "stop_reason": stop_reason,
+        "status": "failed" if failure is not None else "interrupted" if stop_reason == "interrupted" else "completed",
+        "error": {"type": type(failure).__name__, "message": str(failure)} if failure is not None else None,
         "processing_seconds": processing_seconds,
         "processing_fps": processed / processing_seconds if processing_seconds > 0 else None,
         "wall_seconds_including_model_load_and_pause": time.perf_counter() - wall_start,
         "observations_per_class": dict(observations), "confirmed_track_ids": sorted(track_ids),
-        "conf": session.conf, "iou": iou, "imgsz": imgsz, "trail_length": trail_length,
+        "conf": session.conf if session else conf, "iou": iou, "imgsz": imgsz, "trail_length": trail_length,
+        "closed_tracklets": exports.closed_tracks if exports else 0,
+        "track_events": dict(exports.event_counts) if exports else {},
         "note": "仅导出检测观测；ID 不是物理速度或 TTC。MP4 使用固定 FPS，源时间以 JSONL 为准。",
     })
-    return output
+    if failure is not None:
+        failure.add_note(f"本次运行汇总与已完成结果：{output_path}")
+        raise failure
+    return output_path

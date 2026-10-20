@@ -2,9 +2,11 @@
 
 import argparse
 import json
+from pathlib import Path
 
 from detection.core import DEFAULT_WEIGHTS
 from .core import DEFAULT_TRACKER, track_video
+from .batch import track_directory
 
 
 def positive_int(text):
@@ -16,7 +18,7 @@ def positive_int(text):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="YOLOv8 + ByteTrack 车辆行人视频跟踪")
-    parser.add_argument("--source", required=True, help="本地视频文件")
+    parser.add_argument("--source", required=True, help="本地视频文件或视频目录（不递归）")
     parser.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     parser.add_argument("--tracker", default=str(DEFAULT_TRACKER), help="独立 ByteTrack YAML")
     parser.add_argument("--output", help="尚不存在的输出目录；默认自动创建")
@@ -31,9 +33,22 @@ def main(argv=None):
     parser.add_argument("--show", action="store_true", help="本地桌面显示，支持 Space/P 暂停、Q/Esc 退出")
     args = parser.parse_args(argv)
     try:
-        output = track_video(**vars(args))
+        is_batch = Path(args.source).expanduser().is_dir()
+        output = (track_directory if is_batch else track_video)(**vars(args))
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
-        parser.exit(1, f"跟踪失败：{exc}\n")
+        notes = "".join(f"{note}\n" for note in getattr(exc, "__notes__", []))
+        parser.exit(1, f"跟踪失败：{exc}\n{notes}")
+    if is_batch:
+        summary = json.loads((output / "batch_summary.json").read_text(encoding="utf-8"))
+        print(f"已处理 {len(summary['results'])}/{summary['videos_discovered']} 段视频，状态：{summary['status']}")
+        print(f"结果已保存：{output}")
+        if any(r.get("reported_frame_count_mismatch") for r in summary["results"]):
+            print("注意：部分视频的解码帧数与元数据不一致，请核对批次清单及源视频。")
+        if summary["status"] == "interrupted":
+            raise SystemExit(130)
+        if summary["status"] == "completed_with_errors" or any(r["status"] == "failed" for r in summary["results"]):
+            raise SystemExit(1)
+        return
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     print(f"已处理 {summary['frames_processed']} 帧，结束原因：{summary['stop_reason']}")
     print(f"结果已保存：{output}")
