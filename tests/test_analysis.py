@@ -290,6 +290,18 @@ class TestSpeedEstimator(unittest.TestCase):
             final = est.update(1, "vehicle", i * 0.04, 3.0, i * 0.2)
         self.assertTrue(final.is_reliable)
 
+    def test_timestamp_regression_rejected(self):
+        # 时间戳回退/重复会让窗口差分 dt<=0：写入历史即污染，直接拒绝
+        est = SpeedEstimator()
+        est.update(1, "vehicle", 1.0, 3.0, 0.0)
+        with self.assertRaises(ValueError):
+            est.update(1, "vehicle", 0.5, 3.0, 0.5)
+        with self.assertRaises(ValueError):
+            est.update(1, "vehicle", 1.0, 3.0, 1.0)
+        # 被拒绝的观测未写历史，正常递增不受影响
+        est.update(1, "vehicle", 1.1, 3.0, 1.5)
+        self.assertEqual(len(est.tracks[1].history), 2)
+
     def test_invalid_reliable_span_rejected(self):
         with self.assertRaises(ValueError):
             SpeedEstimator(reliable_min_span_s=-0.1)
@@ -835,6 +847,17 @@ class TestConflictEventTracker(unittest.TestCase):
         with self.assertRaises(ValueError):
             tr.update([], 2, 0.5)
 
+    def test_update_rejects_non_monotonic_timestamp(self):
+        # 时间戳不递增会产生负的事件时长
+        tr = ConflictEventTracker()
+        tr.update([], 0, 1.0)
+        with self.assertRaises(ValueError):
+            tr.update([], 1, 0.5)
+        with self.assertRaises(ValueError):
+            tr.update([], 1, 1.0)
+        # 校验先于状态赋值：修正时间戳后可继续
+        tr.update([], 1, 1.1)
+
     def test_event_to_dict_is_json_serializable(self):
         import json
 
@@ -1143,6 +1166,16 @@ class TestPipelineIO(unittest.TestCase):
             # 每帧一行原始评估仍在，确认前帧 event_id 为空
             self.assertTrue(any(l.get("event_id") is None for l in lines))
 
+            # speeds.csv 携带事件与可靠度列：可按 event_id 关联生命周期事件
+            import csv as csvlib
+
+            with open(out_dir / "speeds.csv", newline="", encoding="utf-8") as f:
+                rows = list(csvlib.DictReader(f))
+            self.assertIn("event_id", rows[0])
+            self.assertIn("is_reliable", rows[0])
+            self.assertIn("is_stationary", rows[0])
+            self.assertTrue(any(r["event_id"] == "1" for r in rows))
+
     def test_missing_fps_rejected_without_override(self):
         # 与 tracking 模块同策略：源 FPS 缺失且未显式 --fps 时拒绝运行，
         # 避免把测速/TTC 建立在错误的 25fps 兜底时间基准上
@@ -1222,7 +1255,8 @@ class TestPipelineIO(unittest.TestCase):
         fake_session.retained_ids.return_value = {1}
         return fake_session
 
-    def _run_mocked_pipeline(self, out_dir, video_path, fail_at=None, exc=None):
+    def _run_mocked_pipeline(self, out_dir, video_path, fail_at=None, exc=None,
+                             max_frames=None, show_window=False):
         import json as jsonlib
         from unittest import mock
 
@@ -1238,7 +1272,9 @@ class TestPipelineIO(unittest.TestCase):
             fail_at=fail_at, exc=exc or RuntimeError("boom")
         )
         with mock.patch("analysis.pipeline.TrackingSession", return_value=session):
-            summary = pipe.process_video(video_path, out_dir)
+            summary = pipe.process_video(
+                video_path, out_dir, show_window=show_window, max_frames=max_frames
+            )
         events = [
             jsonlib.loads(l)
             for l in (out_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
@@ -1285,6 +1321,122 @@ class TestPipelineIO(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["end_reason"], "interrupt")
 
+    def test_max_frames_cutoff_reason(self):
+        # 人为截断不得标成 eof：事件结束原因记 max_frames
+        with tempfile.TemporaryDirectory() as d:
+            vpath = Path(d) / "v.mp4"
+            self._write_video(vpath, 15)
+            summary, events = self._run_mocked_pipeline(
+                Path(d) / "out", vpath, max_frames=6
+            )
+            self.assertEqual(summary["frames_processed"], 6)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["end_reason"], "max_frames")
+
+    def test_max_frames_zero_processes_nothing(self):
+        # 0 帧语义显式支持：立即截断，不读任何帧
+        with tempfile.TemporaryDirectory() as d:
+            vpath = Path(d) / "v.mp4"
+            self._write_video(vpath, 15)
+            summary, events = self._run_mocked_pipeline(
+                Path(d) / "out", vpath, max_frames=0
+            )
+            self.assertEqual(summary["frames_processed"], 0)
+            self.assertEqual(events, [])
+
+    def test_max_frames_negative_rejected(self):
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        calib = RoadCalibrator(
+            [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+        )
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                ConflictPerceptionPipeline(calibrator=calib).process_video(
+                    "v.mp4", Path(d) / "out", max_frames=-1
+                )
+
+    def test_user_quit_reason(self):
+        # q 键退出归档为 user_quit 而非 eof
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as d:
+            vpath = Path(d) / "v.mp4"
+            self._write_video(vpath, 15)
+            with mock.patch("analysis.pipeline.cv2.imshow"), \
+                 mock.patch("analysis.pipeline.cv2.waitKey",
+                            side_effect=[0] * 9 + [ord("q")]), \
+                 mock.patch("analysis.pipeline.cv2.destroyAllWindows"):
+                summary, events = self._run_mocked_pipeline(
+                    Path(d) / "out", vpath, show_window=True
+                )
+            self.assertEqual(summary["frames_processed"], 10)
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["end_reason"], "user_quit")
+
+    def test_session_init_failure_releases_capture(self):
+        # TrackingSession 初始化失败不得泄漏已打开的输入视频
+        import cv2
+        from unittest import mock
+
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        with tempfile.TemporaryDirectory() as d:
+            fake_cap = mock.Mock()
+            fake_cap.isOpened.return_value = True
+            fake_cap.get.side_effect = lambda prop: {
+                cv2.CAP_PROP_FPS: 25.0,
+                cv2.CAP_PROP_FRAME_WIDTH: 64.0,
+                cv2.CAP_PROP_FRAME_HEIGHT: 64.0,
+            }.get(prop, 0.0)
+            calib = RoadCalibrator(
+                [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+            )
+            pipe = ConflictPerceptionPipeline(calibrator=calib)
+            with mock.patch("analysis.pipeline.cv2.VideoCapture", return_value=fake_cap), \
+                 mock.patch("analysis.pipeline.TrackingSession",
+                            side_effect=RuntimeError("模型加载失败")), \
+                 self.assertRaises(RuntimeError):
+                pipe.process_video("v.mp4", Path(d) / "out")
+            fake_cap.release.assert_called_once()
+
+    def test_output_file_failure_releases_resources(self):
+        # 第三个输出文件打开失败：cap/writer/已开文件全部释放
+        import cv2
+        from unittest import mock
+
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        with tempfile.TemporaryDirectory() as d:
+            fake_cap = mock.Mock()
+            fake_cap.isOpened.return_value = True
+            fake_cap.get.side_effect = lambda prop: {
+                cv2.CAP_PROP_FPS: 25.0,
+                cv2.CAP_PROP_FRAME_WIDTH: 64.0,
+                cv2.CAP_PROP_FRAME_HEIGHT: 64.0,
+            }.get(prop, 0.0)
+            fake_writer = mock.Mock()
+            fake_writer.isOpened.return_value = True
+            real_open = open
+
+            def selective_open(path, *a, **k):
+                if str(path).endswith("speeds.csv"):
+                    raise IOError("磁盘已满")
+                return real_open(path, *a, **k)
+
+            calib = RoadCalibrator(
+                [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+            )
+            pipe = ConflictPerceptionPipeline(calibrator=calib)
+            with mock.patch("analysis.pipeline.cv2.VideoCapture", return_value=fake_cap), \
+                 mock.patch("analysis.pipeline.cv2.VideoWriter", return_value=fake_writer), \
+                 mock.patch("analysis.pipeline.TrackingSession"), \
+                 mock.patch("builtins.open", side_effect=selective_open), \
+                 self.assertRaises(IOError):
+                pipe.process_video("v.mp4", Path(d) / "out")
+            fake_cap.release.assert_called_once()
+            fake_writer.release.assert_called_once()
+
     def test_parked_defaults_resolve_to_seconds(self):
         # 默认静止确认 = 3.0s 秒级（8 帧 @25fps 仅 0.32s 会把临时停车误豁免）；
         # 显式 --parked-frames 优先于秒级默认
@@ -1306,6 +1458,24 @@ class TestPipelineIO(unittest.TestCase):
             kw = m_pipe.call_args.kwargs
             self.assertEqual(kw["stationary_min_frames"], 20)
             self.assertIsNone(kw["stationary_seconds"])
+
+            # 同时给定两个参数：与 --window-s 同语义，显式秒级覆盖帧级
+            with mock.patch("analysis.__main__.ConflictPerceptionPipeline") as m_pipe:
+                main([
+                    "--source", "x.mp4", "--demo",
+                    "--parked-frames", "10", "--parked-seconds", "1.0",
+                    "--output", str(Path(d) / "o3"),
+                ])
+            kw = m_pipe.call_args.kwargs
+            self.assertEqual(kw["stationary_min_frames"], 10)
+            self.assertEqual(kw["stationary_seconds"], 1.0)
+
+    def test_max_frames_negative_cli_rejected(self):
+        # 负数截断上限在参数校验阶段即拒绝
+        from analysis.__main__ import main
+
+        with self.assertRaises(SystemExit):
+            main(["--source", "x.mp4", "--demo", "--max-frames", "-1"])
 
     def test_legacy_calib_rejected_without_flag(self):
         # 无 synthetic 溯源字段的旧版文件无法区分实测/占位：默认拒绝

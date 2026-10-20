@@ -13,6 +13,7 @@ import csv
 import json
 import math
 import time
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -163,6 +164,9 @@ class ConflictPerceptionPipeline:
         max_frames: Optional[int] = None,
     ) -> dict:
         """端到端处理整段视频，输出渲染视频与结构化告警日志"""
+        if max_frames is not None and (type(max_frames) is not int or max_frames < 0):
+            raise ValueError("max_frames 必须是 >= 0 的整数")
+
         src = Path(video_path).expanduser().resolve()
         out_dir = Path(output_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -171,48 +175,57 @@ class ConflictPerceptionPipeline:
         if not cap.isOpened():
             raise RuntimeError(f"无法打开视频输入文件: {src}")
 
-        # 与 tracking 模块同策略：源 FPS 缺失/无效时必须显式 --fps，
-        # 静默兜底 25fps 会让测速窗口与 TTC 建立在错误时间基准上
-        raw_fps = cap.get(cv2.CAP_PROP_FPS)
-        source_fps = raw_fps if math.isfinite(raw_fps) and raw_fps > 0 else None
-        fps = self.fps if self.fps is not None else source_fps
-        if fps is None:
-            cap.release()
-            raise RuntimeError("视频缺少有效 FPS；确认帧率后通过 --fps 指定")
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # ExitStack 统一登记资源生命周期：初始化阶段（模型加载、编码器、
+        # 文件打开）与主循环异常都保证释放，不存在半初始化泄漏路径
+        resources = ExitStack()
+        resources.callback(cap.release)
+        try:
+            # 与 tracking 模块同策略：源 FPS 缺失/无效时必须显式 --fps，
+            # 静默兜底 25fps 会让测速窗口与 TTC 建立在错误时间基准上
+            raw_fps = cap.get(cv2.CAP_PROP_FPS)
+            source_fps = raw_fps if math.isfinite(raw_fps) and raw_fps > 0 else None
+            fps = self.fps if self.fps is not None else source_fps
+            if fps is None:
+                raise RuntimeError("视频缺少有效 FPS；确认帧率后通过 --fps 指定")
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        video_clock = VideoClock(fps=fps, force_fps=self.fps is not None)
-        self._configure_speed_estimator(fps)
-        self._configure_event_tracker(fps)
-        session = TrackingSession(
-            source=str(src),
-            weights=self.weights,
-            tracker_path=self.tracker_config,
-            conf=self.conf,
-            iou=self.iou,
-            imgsz=self.imgsz,
-            device=self.device,
-        )
+            video_clock = VideoClock(fps=fps, force_fps=self.fps is not None)
+            self._configure_speed_estimator(fps)
+            self._configure_event_tracker(fps)
+            session = TrackingSession(
+                source=str(src),
+                weights=self.weights,
+                tracker_path=self.tracker_config,
+                conf=self.conf,
+                iou=self.iou,
+                imgsz=self.imgsz,
+                device=self.device,
+            )
 
-        out_video_path = out_dir / "annotated_conflict.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_video_path), fourcc, fps, (width, height))
-        if not writer.isOpened():
-            cap.release()
-            raise RuntimeError(f"无法创建渲染输出视频，请检查编码器与路径: {out_video_path}")
+            out_video_path = out_dir / "annotated_conflict.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(out_video_path), fourcc, fps, (width, height))
+            resources.callback(writer.release)
+            if not writer.isOpened():
+                raise RuntimeError(f"无法创建渲染输出视频，请检查编码器与路径: {out_video_path}")
 
-        jsonl_path = out_dir / "conflicts.jsonl"
-        events_path = out_dir / "events.jsonl"
-        csv_path = out_dir / "speeds.csv"
+            jsonl_path = out_dir / "conflicts.jsonl"
+            events_path = out_dir / "events.jsonl"
+            csv_path = out_dir / "speeds.csv"
 
-        jsonl_file = open(jsonl_path, "w", encoding="utf-8")
-        events_file = open(events_path, "w", encoding="utf-8")
-        csv_file = open(csv_path, "w", encoding="utf-8", newline="")
+            jsonl_file = resources.enter_context(open(jsonl_path, "w", encoding="utf-8"))
+            events_file = resources.enter_context(open(events_path, "w", encoding="utf-8"))
+            csv_file = resources.enter_context(open(csv_path, "w", encoding="utf-8", newline=""))
+        except BaseException:
+            # 初始化任何一步失败：释放已登记的 cap/writer/已开文件
+            resources.close()
+            raise
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
             "frame_idx", "timestamp_s", "track_id", "category",
-            "x_m", "y_m", "speed_kmh", "is_speeding", "risk_level", "ttc_s"
+            "x_m", "y_m", "speed_kmh", "is_speeding", "risk_level", "ttc_s",
+            "event_id", "is_reliable", "is_stationary"
         ])
 
         total_critical_events = 0
@@ -245,7 +258,9 @@ class ConflictPerceptionPipeline:
         loop_state = "eof"
         try:
             while True:
-                if max_frames and frame_idx >= max_frames:
+                if max_frames is not None and frame_idx >= max_frames:
+                    # 人为截断与自然结束区分归档，事件日志不混淆结束原因
+                    loop_state = "max_frames"
                     break
 
                 ok, frame = cap.read()
@@ -330,10 +345,16 @@ class ConflictPerceptionPipeline:
                     c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
                     risk_lvl = c.risk_level.name if c else "LEVEL_0_SAFE"
                     ttc_val = round(c.ttc_seconds, 2) if (c and c.ttc_seconds) else ""
+                    csv_event_id = (
+                        event_ids.get((c.veh_track_id, c.ped_track_id))
+                        if c is not None else None
+                    )
                     csv_writer.writerow([
                         frame_idx, round(timestamp_s, 3), r.track_id, r.category,
                         round(r.x_m, 2), round(r.y_m, 2), round(r.speed_kmh, 1),
-                        int(r.is_speeding), risk_lvl, ttc_val
+                        int(r.is_speeding), risk_lvl, ttc_val,
+                        csv_event_id if csv_event_id is not None else "",
+                        int(r.is_reliable), int(r.is_stationary)
                     ])
 
                 # 5. 增强可视化渲染
@@ -368,12 +389,16 @@ class ConflictPerceptionPipeline:
 
                 writer.write(render_frame)
 
+                # 帧处理到此已完整（日志/视频均已落盘），立即计数——
+                # 放在 q 退出与异常路径之前，否则截断时最后一帧漏计
+                frame_idx += 1
+
                 if show_window:
                     cv2.imshow("Campus Vehicle-Pedestrian Conflict System", render_frame)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
+                        loop_state = "user_quit"
                         break
 
-                frame_idx += 1
                 if frame_idx % 30 == 0:
                     fps_proc = frame_idx / (time.time() - t_start)
                     print(f"[*] 已处理 {frame_idx} 帧 | 处理速率: {fps_proc:.1f} FPS | 最高时速: {max_observed_speed_kmh:.1f} km/h")
@@ -392,11 +417,8 @@ class ConflictPerceptionPipeline:
                 _drain_alert_events()
             except Exception:
                 pass
-            cap.release()
-            writer.release()
-            jsonl_file.close()
-            events_file.close()
-            csv_file.close()
+            # 统一释放 ExitStack 登记的 cap/writer/三个输出文件
+            resources.close()
             if show_window:
                 cv2.destroyAllWindows()
 

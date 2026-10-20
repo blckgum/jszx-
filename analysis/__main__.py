@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None):
         "--max-frames",
         type=int,
         default=None,
-        help="最大处理帧数限制 (测试用)",
+        help="最大处理帧数限制 (测试用)，0 表示零帧",
     )
     parser.add_argument(
         "--ema-alpha",
@@ -115,13 +115,13 @@ def main(argv: list[str] | None = None):
         "--parked-frames",
         type=int,
         default=None,
-        help="连续多少帧低于 --parked-speed 判定为静止车辆；不指定时按 --parked-seconds 秒级默认值",
+        help="连续多少帧低于 --parked-speed 判定为静止车辆；不指定时按 --parked-seconds 生效",
     )
     parser.add_argument(
         "--parked-seconds",
         type=float,
         default=None,
-        help="按秒指定静止确认时长，默认 3.0；显式指定 --parked-frames 后此项不生效",
+        help="按秒指定静止确认时长，默认 3.0；设置后覆盖 --parked-frames",
     )
     parser.add_argument(
         "--alert-confirm",
@@ -208,6 +208,8 @@ def main(argv: list[str] | None = None):
         parser.error("--fps 必须为有限正数")
     if not math.isfinite(args.reliable_span_s) or args.reliable_span_s < 0:
         parser.error("--reliable-span-s 必须为非负数")
+    if args.max_frames is not None and args.max_frames < 0:
+        parser.error("--max-frames 必须是 >= 0 的整数")
     if not math.isfinite(args.speed_limit) or args.speed_limit <= 0:
         parser.error("--speed-limit 必须为正数")
 
@@ -259,15 +261,18 @@ def main(argv: list[str] | None = None):
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         synthetic_calib.to_yaml(Path(out_dir) / "calibration.synthetic.yaml")
 
-    # 静止确认默认按 3.0s 秒级换算：8 帧（25fps 下仅 0.32s）会把礼让/排队
-    # 中的临时停车误豁免为"泊车"；显式 --parked-frames 优先于秒级值，
-    # 同时给定两个参数时与 --window-s 同语义（秒覆盖帧）
-    if args.parked_frames is not None and args.parked_seconds is None:
+    # 静止确认时长解析（与 --window-s 同语义：秒级参数设置后覆盖帧级）：
+    # 默认按 3.0s 秒级换算——原 8 帧（25fps 下仅 0.32s）会把礼让/排队
+    # 中的临时停车误豁免为"泊车"
+    if args.parked_seconds is not None:
+        stationary_min_frames = args.parked_frames if args.parked_frames is not None else 8
+        stationary_seconds = args.parked_seconds
+    elif args.parked_frames is not None:
         stationary_min_frames = args.parked_frames
         stationary_seconds = None
     else:
-        stationary_min_frames = args.parked_frames if args.parked_frames is not None else 8
-        stationary_seconds = args.parked_seconds if args.parked_seconds is not None else 3.0
+        stationary_min_frames = 8
+        stationary_seconds = 3.0
 
     pipeline = ConflictPerceptionPipeline(
         calibrator=calibrator,

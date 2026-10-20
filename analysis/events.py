@@ -45,7 +45,7 @@ class AlertEvent:
     max_veh_speed_kmh: float
     alarm_frames: int              # 告警条件实际满足的帧数
     gap_frames: int = 0            # 事件存续期间被冷却窗吸收的静默帧总数
-    end_reason: str = ""           # "cooldown" | "eof" | "interrupt" | "exception"
+    end_reason: str = ""           # "cooldown" | "eof" | "max_frames" | "user_quit" | "interrupt" | "exception"
 
     @property
     def kind(self) -> str:
@@ -120,6 +120,7 @@ class ConflictEventTracker:
         self._finalized: List[AlertEvent] = []
         self._next_event_id = 1
         self._last_frame_idx: Optional[int] = None
+        self._last_timestamp_s: Optional[float] = None
 
     @staticmethod
     def _key_of(c: ConflictAssessment) -> EventKey:
@@ -141,7 +142,11 @@ class ConflictEventTracker:
         if self._last_frame_idx is not None and frame_idx <= self._last_frame_idx:
             # 每帧只允许一次 update：重复或回退帧序会让 alarm/gap 计数失真
             raise ValueError("frame_idx 必须逐帧严格递增")
+        if self._last_timestamp_s is not None and timestamp_s <= self._last_timestamp_s:
+            # 时间戳不递增会产生负的 start/end 跨度与事件时长
+            raise ValueError("timestamp_s 必须逐帧严格递增")
         self._last_frame_idx = frame_idx
+        self._last_timestamp_s = timestamp_s
 
         alarmed: Dict[EventKey, ConflictAssessment] = {}
         for c in conflicts:

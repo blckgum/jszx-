@@ -31,6 +31,9 @@ class CalibrationConfig:
     ground_points: List[Tuple[float, float]]
     homography_matrix: List[List[float]]
     inv_homography_matrix: List[List[float]]
+    # 与 RoadCalibrator 对齐的溯源字段：合成占位标记与旧版缺字段标记
+    synthetic: bool = False
+    synthetic_field_missing: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)

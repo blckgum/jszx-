@@ -76,8 +76,9 @@ class TrackMotionTracker:
         self.smoothed_vy = 0.0
         self.has_valid_velocity = False
 
-        # 最后一个有限观测位置与持续静止帧计数
+        # 最后一个有限观测位置/时间戳与持续静止帧计数
         self._last_valid_xy: Optional[Tuple[float, float]] = None
+        self._last_timestamp_s: Optional[float] = None
         self._stationary_streak = 0
 
         # 类别滞回状态：新类别需连续多帧确认才生效
@@ -119,6 +120,11 @@ class TrackMotionTracker:
                 is_stationary=self._stationary_streak >= self.stationary_min_frames,
             )
 
+        # 时间戳必须严格递增：回退/重复观测会让窗口差分 dt <= 0，
+        # 静默写历史会得到失真速度读数，宁可响亮失败
+        if self._last_timestamp_s is not None and timestamp_s <= self._last_timestamp_s:
+            raise ValueError("timestamp_s 必须逐帧严格递增")
+        self._last_timestamp_s = timestamp_s
         self._last_valid_xy = (x_m, y_m)
         self.history.append((timestamp_s, x_m, y_m))
 
@@ -268,9 +274,18 @@ class SpeedEstimator:
                 reliable_min_span_s=self.reliable_min_span_s,
             )
         else:
+            tracker = self.tracks[track_id]
+            # 前置单调性检查：让被拒绝的观测不污染类别滞回计数；
+            # 非有限时间戳豁免（走 tracker 内部早退路径，不写历史）
+            if (
+                math.isfinite(timestamp_s)
+                and tracker._last_timestamp_s is not None
+                and timestamp_s <= tracker._last_timestamp_s
+            ):
+                raise ValueError("timestamp_s 必须逐帧严格递增")
             # 跟踪 ID 沿用期间检测类别可能被纠正（如 person -> car），
             # 但每帧观测可能抖动，需连续确认后才切换类别
-            self.tracks[track_id].observe_category(category, self.category_confirm_frames)
+            tracker.observe_category(category, self.category_confirm_frames)
         return self.tracks[track_id].update(timestamp_s, x_m, y_m)
 
     def prune_stale_tracks(self, live_track_ids: set[int]):
