@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -40,8 +39,8 @@ class EnhancedConflictVisualizer:
         pts = np.array(self.calibrator.image_points, dtype=np.int32)
         overlay = frame.copy()
         cv2.fillPoly(overlay, [pts], (240, 180, 0))
-        cv2.polylines(frame, [pts], isClosed=True, color=(0, 220, 255), thickness=2)
         cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+        cv2.polylines(frame, [pts], isClosed=True, color=(0, 220, 255), thickness=2)
 
     def draw_future_trajectory(
         self,
@@ -56,22 +55,31 @@ class EnhancedConflictVisualizer:
             return
 
         dt = horizon_s / steps
-        pixel_points = []
+        # 出画点将轨迹拆成独立线段，避免跨越不可见区域画出弦线
+        segments: List[List[Tuple[int, int]]] = []
+        current: List[Tuple[int, int]] = []
+        last_visible: Optional[Tuple[int, int]] = None
         for i in range(steps + 1):
             t = i * dt
             future_x = reading.x_m + reading.vx_ms * t
             future_y = reading.y_m + reading.vy_ms * t
             u, v = self.calibrator.ground_to_pixel(future_x, future_y)
             if 0 <= u < frame.shape[1] and 0 <= v < frame.shape[0]:
-                pixel_points.append((u, v))
+                current.append((u, v))
+                last_visible = (u, v)
+            else:
+                if len(current) >= 2:
+                    segments.append(current)
+                current = []
+        if len(current) >= 2:
+            segments.append(current)
 
-        if len(pixel_points) >= 2:
-            for j in range(len(pixel_points) - 1):
-                p1 = pixel_points[j]
-                p2 = pixel_points[j + 1]
-                cv2.line(frame, p1, p2, color, 2, cv2.LINE_AA)
-            # 绘制终点箭头圆圈
-            cv2.circle(frame, pixel_points[-1], 4, color, -1)
+        for seg in segments:
+            for j in range(len(seg) - 1):
+                cv2.line(frame, seg[j], seg[j + 1], color, 2, cv2.LINE_AA)
+        # 绘制终点箭头圆圈
+        if last_visible is not None:
+            cv2.circle(frame, last_visible, 4, color, -1)
 
     def draw_speed_badge(
         self,
@@ -220,9 +228,10 @@ class EnhancedConflictVisualizer:
             readings_list = speed_readings
 
         conflict_map = {c.veh_track_id: c for c in conflicts}
+        ped_conflict_map = {c.ped_track_id: c for c in conflicts if c.ped_track_id is not None}
 
         for r in readings_list:
-            c = conflict_map.get(r.track_id)
+            c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
             color = (
                 self.COLOR_CRITICAL
                 if (c and c.risk_level == RiskLevel.LEVEL_3_CRITICAL)
@@ -236,7 +245,7 @@ class EnhancedConflictVisualizer:
                 continue
             r = reading_map.get(tid)
             if r:
-                c = conflict_map.get(tid)
+                c = conflict_map.get(tid) or ped_conflict_map.get(tid)
                 bbox = getattr(t, "bbox_xyxy", None)
                 if bbox is not None:
                     self.draw_speed_badge(render_frame, bbox, r, c)

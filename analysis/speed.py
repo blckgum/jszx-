@@ -58,6 +58,23 @@ class TrackMotionTracker:
 
     def update(self, timestamp_s: float, x_m: float, y_m: float) -> SpeedReading:
         """输入当前帧物理坐标与时间戳，更新运动滤波器状态"""
+        # 非有限观测（如地平线附近的退化投影点）不进入历史，
+        # 否则 NaN 经差分进入 EMA 后会使平滑速度永久不可恢复
+        if not (math.isfinite(timestamp_s) and math.isfinite(x_m) and math.isfinite(y_m)):
+            return SpeedReading(
+                track_id=self.track_id,
+                category=self.category,
+                x_m=x_m,
+                y_m=y_m,
+                vx_ms=self.smoothed_vx,
+                vy_ms=self.smoothed_vy,
+                speed_ms=math.hypot(self.smoothed_vx, self.smoothed_vy),
+                speed_kmh=math.hypot(self.smoothed_vx, self.smoothed_vy) * 3.6,
+                is_speeding=False,
+                heading_deg=0.0,
+                is_reliable=False,
+            )
+
         self.history.append((timestamp_s, x_m, y_m))
 
         # 样本少于 3 个点时处于预热状态，速度不作为强判断
@@ -114,7 +131,7 @@ class TrackMotionTracker:
         elif self.category == "vehicle" and speed_kmh < 1.0:
             speed_ms, speed_kmh = 0.0, 0.0
 
-        # 方向角计算 (0~360度，正北为0度，顺时针)
+        # 方向角计算 (0~360度，以地面 +X 轴为 0 度，朝 +Y 轴正向)
         heading = (math.degrees(math.atan2(self.smoothed_vy, self.smoothed_vx)) + 360.0) % 360.0
 
         # 超速研判：车辆且车速超过 30 km/h (可设容差如 1.0 km/h)
@@ -138,9 +155,10 @@ class TrackMotionTracker:
 class SpeedEstimator:
     """多目标全局速度估算与生命周期管理器"""
 
-    def __init__(self, speed_limit_kmh: float = 30.0, window_size: int = 8):
+    def __init__(self, speed_limit_kmh: float = 30.0, window_size: int = 8, ema_alpha: float = 0.35):
         self.speed_limit_kmh = speed_limit_kmh
         self.window_size = window_size
+        self.ema_alpha = ema_alpha
         self.tracks: Dict[int, TrackMotionTracker] = {}
 
     def update(
@@ -152,12 +170,17 @@ class SpeedEstimator:
                 track_id=track_id,
                 category=category,
                 window_size=self.window_size,
+                ema_alpha=self.ema_alpha,
                 speed_limit_kmh=self.speed_limit_kmh,
             )
+        else:
+            # 跟踪 ID 沿用期间检测类别可能被纠正（如 person -> car），跟随最新观测，
+            # 否则首帧误检为行人的车辆将永远无法触发超速研判
+            self.tracks[track_id].category = category
         return self.tracks[track_id].update(timestamp_s, x_m, y_m)
 
-    def prune_stale_tracks(self, active_track_ids: set[int]):
+    def prune_stale_tracks(self, live_track_ids: set[int]):
         """清理已终结或离场的轨迹实例，防止内存泄漏"""
         for tid in list(self.tracks.keys()):
-            if tid not in active_track_ids:
+            if tid not in live_track_ids:
                 del self.tracks[tid]

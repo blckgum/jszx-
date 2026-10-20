@@ -72,7 +72,12 @@ class RoadCalibrator:
             raise RuntimeError("无法求解有效的单应性矩阵，请检查 4 个角点是否退化共线")
 
         self.H = h_mat.astype(np.float64)
-        self.H_inv = np.linalg.inv(self.H)
+        try:
+            self.H_inv = np.linalg.inv(self.H)
+        except np.linalg.LinAlgError:
+            raise RuntimeError(
+                "单应性矩阵不可逆，请检查 4 个角点是否退化共线或重复选取"
+            ) from None
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "RoadCalibrator":

@@ -12,14 +12,12 @@ from __future__ import annotations
 import csv
 import json
 import math
-import os
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import cv2
-import numpy as np
 
 from detection.core import DEFAULT_WEIGHTS
 from tracking.core import DEFAULT_TRACKER, TrackingSession, VideoClock
@@ -42,6 +40,13 @@ class ConflictPerceptionPipeline:
         conf: Optional[float] = None,
         iou: float = 0.7,
         imgsz: int = 640,
+        ema_alpha: float = 0.35,
+        window_size: int = 8,
+        zone_margin_m: float = 2.0,
+        ttc_critical_s: float = 1.8,
+        ttc_caution_s: float = 3.5,
+        horizon_s: float = 3.5,
+        parked_speed_ms: float = 0.5,
     ):
         self.calibrator = calibrator
         self.weights = weights
@@ -51,9 +56,20 @@ class ConflictPerceptionPipeline:
         self.conf = conf
         self.iou = iou
         self.imgsz = imgsz
+        self.zone_margin_m = zone_margin_m
 
-        self.speed_estimator = SpeedEstimator(speed_limit_kmh=speed_limit_kmh)
-        self.conflict_analyzer = ConflictAnalyzer(speed_limit_kmh=speed_limit_kmh)
+        self.speed_estimator = SpeedEstimator(
+            speed_limit_kmh=speed_limit_kmh,
+            window_size=window_size,
+            ema_alpha=ema_alpha,
+        )
+        self.conflict_analyzer = ConflictAnalyzer(
+            speed_limit_kmh=speed_limit_kmh,
+            ttc_critical_s=ttc_critical_s,
+            ttc_caution_s=ttc_caution_s,
+            horizon_s=horizon_s,
+            parked_speed_ms=parked_speed_ms,
+        )
         self.visualizer = EnhancedConflictVisualizer(calibrator=calibrator)
 
     def process_video(
@@ -75,7 +91,6 @@ class ConflictPerceptionPipeline:
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         video_clock = VideoClock(fps=fps)
         session = TrackingSession(
@@ -91,6 +106,9 @@ class ConflictPerceptionPipeline:
         out_video_path = out_dir / "annotated_conflict.mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(out_video_path), fourcc, fps, (width, height))
+        if not writer.isOpened():
+            cap.release()
+            raise RuntimeError(f"无法创建渲染输出视频，请检查编码器与路径: {out_video_path}")
 
         jsonl_path = out_dir / "conflicts.jsonl"
         csv_path = out_dir / "speeds.csv"
@@ -132,7 +150,6 @@ class ConflictPerceptionPipeline:
 
                 # 1. 目标检测与 ByteTrack 多目标追踪
                 frame_record = session.process(frame, timestamp_s, time_kind)
-                active_ids = set()
                 speed_readings: List[SpeedReading] = []
                 reading_map: Dict[int, SpeedReading] = {}
 
@@ -140,11 +157,13 @@ class ConflictPerceptionPipeline:
                 for t in frame_record.tracks:
                     if t.track_id is None:
                         continue
-                    active_ids.add(t.track_id)
 
                     # 底边中心点转换为地面米制物理坐标
                     u_foot, v_foot = t.anchor_xy
                     x_m, y_m = self.calibrator.pixel_to_ground(u_foot, v_foot)
+                    if not (math.isfinite(x_m) and math.isfinite(y_m)):
+                        # 地平线附近退化投影点：不产生读数，防止 NaN 污染速度历史
+                        continue
 
                     reading = self.speed_estimator.update(
                         track_id=t.track_id,
@@ -153,17 +172,26 @@ class ConflictPerceptionPipeline:
                         x_m=x_m,
                         y_m=y_m,
                     )
-                    speed_readings.append(reading)
                     reading_map[t.track_id] = reading
+
+                    # 标定四边形以外的坐标经外推已失真，不参与冲突研判与速度统计
+                    if not self.calibrator.is_in_zone(x_m, y_m, margin_m=self.zone_margin_m):
+                        continue
+                    speed_readings.append(reading)
 
                     if reading.speed_kmh > max_observed_speed_kmh:
                         max_observed_speed_kmh = reading.speed_kmh
 
-                self.speed_estimator.prune_stale_tracks(active_ids)
+                # ByteTrack 的 lost 池仍可能找回目标并沿用原 ID，按跟踪器存活集
+                # 剪枝而非仅按本帧可见 ID，避免短暂遮挡导致速度滤波器重置
+                self.speed_estimator.prune_stale_tracks(session.retained_ids())
 
                 # 3. 车辆与行人轨迹外推预测与 TTC 碰撞研判
                 conflicts = self.conflict_analyzer.analyze_frame(speed_readings)
                 conflict_map: Dict[int, ConflictAssessment] = {c.veh_track_id: c for c in conflicts}
+                ped_conflict_map: Dict[int, ConflictAssessment] = {
+                    c.ped_track_id: c for c in conflicts if c.ped_track_id is not None
+                }
 
                 # 4. 统计与持久化记录
                 for c in conflicts:
@@ -182,8 +210,8 @@ class ConflictPerceptionPipeline:
                     jsonl_file.write(json.dumps(json_item, ensure_ascii=False) + "\n")
 
                 for r in speed_readings:
-                    c = conflict_map.get(r.track_id)
-                    risk_lvl = c.risk_level.name if c else "SAFE"
+                    c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
+                    risk_lvl = c.risk_level.name if c else "LEVEL_0_SAFE"
                     ttc_val = round(c.ttc_seconds, 2) if (c and c.ttc_seconds) else ""
                     csv_writer.writerow([
                         frame_idx, round(timestamp_s, 3), r.track_id, r.category,
@@ -196,10 +224,11 @@ class ConflictPerceptionPipeline:
                 self.visualizer.draw_calibrated_ground_zone(render_frame)
 
                 for r in speed_readings:
-                    # 绘制预测轨迹虚线
+                    # 绘制预测轨迹虚线；冲突对中的行人同样标红
+                    c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
                     traj_color = (
                         (0, 0, 255)
-                        if (conflict_map.get(r.track_id) and conflict_map[r.track_id].risk_level == RiskLevel.LEVEL_3_CRITICAL)
+                        if (c and c.risk_level == RiskLevel.LEVEL_3_CRITICAL)
                         else (0, 255, 0)
                     )
                     self.visualizer.draw_future_trajectory(render_frame, r, color=traj_color)
@@ -209,7 +238,7 @@ class ConflictPerceptionPipeline:
                         continue
                     r = reading_map.get(t.track_id)
                     if r:
-                        c = conflict_map.get(t.track_id)
+                        c = conflict_map.get(t.track_id) or ped_conflict_map.get(t.track_id)
                         self.visualizer.draw_speed_badge(render_frame, t.bbox_xyxy, r, c)
 
                 for c in conflicts:

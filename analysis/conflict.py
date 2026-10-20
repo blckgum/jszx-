@@ -51,12 +51,14 @@ class ConflictAnalyzer:
         ttc_critical_s: float = 1.8,
         ttc_caution_s: float = 3.5,
         horizon_s: float = 3.5,
+        parked_speed_ms: float = 0.5,
     ):
         self.speed_limit_kmh = speed_limit_kmh
         self.critical_dist_m = safe_radius_veh_m + safe_radius_ped_m  # 3.0 米
         self.ttc_critical_s = ttc_critical_s
         self.ttc_caution_s = ttc_caution_s
         self.horizon_s = horizon_s
+        self.parked_speed_ms = parked_speed_ms
 
     def evaluate_pair(
         self, veh: SpeedReading, ped: SpeedReading
@@ -68,6 +70,12 @@ class ConflictAnalyzer:
 
         # 超过 35 米开外不构成即时校园道路冲突威胁
         if current_dist > 35.0:
+            return None
+
+        # 速度估计已收敛且近乎静止的车辆视为泊车/停靠状态：行人走近停靠
+        # 车辆不构成交通冲突，否则 CVM 外推会对路边停靠目标持续误报；
+        # 未收敛的车辆不豁免，按当前估计保守参与研判
+        if veh.is_reliable and veh.speed_ms < self.parked_speed_ms:
             return None
 
         # 相对速度矢量：v_rel = v_ped - v_veh

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """分析模块 (标定、测速、冲突预测与 TTC 评估) 单元测试。"""
 
+import math
 import os
 import tempfile
 import unittest
@@ -141,6 +142,35 @@ class TestSpeedEstimator(unittest.TestCase):
 
         estimator.prune_stale_tracks({2})
         self.assertEqual(set(estimator.tracks.keys()), {2})
+
+    def test_nan_coordinate_does_not_poison_filter(self):
+        # 地平线退化投影返回 NaN；该观测不得进入历史污染差分与 EMA
+        estimator = SpeedEstimator()
+        for i in range(4):
+            estimator.update(1, "vehicle", i * 0.1, 3.0, i * 0.5)
+
+        r_nan = estimator.update(1, "vehicle", 0.4, float("nan"), float("nan"))
+        self.assertFalse(r_nan.is_reliable)
+
+        final = None
+        for i in range(5, 14):
+            final = estimator.update(1, "vehicle", i * 0.1, 3.0, i * 0.5)
+
+        self.assertTrue(math.isfinite(final.speed_kmh))
+        self.assertAlmostEqual(final.speed_ms, 5.0, delta=0.5)
+
+    def test_reclassified_vehicle_can_be_flagged_speeding(self):
+        # ByteTrack ID 首次观测被误检为 person，纠正为 vehicle 后应能判超速
+        estimator = SpeedEstimator()
+        for i in range(6):
+            estimator.update(1, "pedestrian", i * 0.1, 3.0, i * 0.5)
+
+        final = None
+        for i in range(6, 16):
+            final = estimator.update(1, "vehicle", i * 0.1, 3.0, i * 1.0)
+
+        self.assertTrue(final.is_reliable)
+        self.assertTrue(final.is_speeding)
 
 
 class TestConflictAnalyzer(unittest.TestCase):
@@ -285,6 +315,66 @@ class TestConflictAnalyzer(unittest.TestCase):
         assessments = self.analyzer.analyze_frame([veh])
         self.assertEqual(len(assessments), 1)
         self.assertEqual(assessments[0].risk_level, RiskLevel.LEVEL_1_SPEEDING)
+
+    def test_stationary_vehicle_exempt_from_conflict(self):
+        # 已收敛的静止车辆（泊车/停靠）：行人走近不构成交通冲突
+        parked = SpeedReading(
+            track_id=1,
+            category="vehicle",
+            x_m=3.0,
+            y_m=5.0,
+            vx_ms=0.0,
+            vy_ms=0.0,
+            speed_ms=0.0,
+            speed_kmh=0.0,
+            is_speeding=False,
+            heading_deg=0.0,
+            is_reliable=True,
+        )
+        ped = SpeedReading(
+            track_id=2,
+            category="pedestrian",
+            x_m=7.0,
+            y_m=5.0,
+            vx_ms=-2.0,
+            vy_ms=0.0,
+            speed_ms=2.0,
+            speed_kmh=7.2,
+            is_speeding=False,
+            heading_deg=180.0,
+            is_reliable=True,
+        )
+        self.assertIsNone(self.analyzer.evaluate_pair(parked, ped))
+
+    def test_unreliable_stationary_vehicle_still_evaluated(self):
+        # 速度未收敛的车辆不做静止豁免，保留保守预警
+        warming = SpeedReading(
+            track_id=1,
+            category="vehicle",
+            x_m=3.0,
+            y_m=5.0,
+            vx_ms=0.0,
+            vy_ms=0.0,
+            speed_ms=0.0,
+            speed_kmh=0.0,
+            is_speeding=False,
+            heading_deg=0.0,
+            is_reliable=False,
+        )
+        ped = SpeedReading(
+            track_id=2,
+            category="pedestrian",
+            x_m=7.0,
+            y_m=5.0,
+            vx_ms=-2.0,
+            vy_ms=0.0,
+            speed_ms=2.0,
+            speed_kmh=7.2,
+            is_speeding=False,
+            heading_deg=180.0,
+            is_reliable=True,
+        )
+        self.assertIsNotNone(self.analyzer.evaluate_pair(warming, ped))
 
     def test_analyze_frame_isolated_safe(self):
         # 仅有车辆正常行驶，无行人

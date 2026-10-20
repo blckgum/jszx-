@@ -69,6 +69,36 @@ def main(argv: list[str] | None = None):
         help="最大处理帧数限制 (测试用)",
     )
     parser.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.35,
+        help="速度 EMA 平滑系数 (0~1)，越小越平滑、响应越慢，默认 0.35",
+    )
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=8,
+        help="测速滑窗帧数，默认 8",
+    )
+    parser.add_argument(
+        "--ttc-critical",
+        type=float,
+        default=1.8,
+        help="紧急碰撞预警 TTC 阈值 (秒)，默认 1.8",
+    )
+    parser.add_argument(
+        "--ttc-caution",
+        type=float,
+        default=3.5,
+        help="注意预警 TTC 阈值 (秒)，默认 3.5",
+    )
+    parser.add_argument(
+        "--horizon",
+        type=float,
+        default=3.5,
+        help="轨迹外推预测视界 (秒)，默认 3.5",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="是否开启本地桌面实时播放窗口",
@@ -77,8 +107,10 @@ def main(argv: list[str] | None = None):
 
     calib_path = Path(args.calib).expanduser().resolve()
     if not calib_path.exists():
-        # 若默认配置不存在，自动生成一个标准校园参考标定配置
-        print(f"[*] 提示: 标定文件 {calib_path} 不存在，自动生成标准校园路面参考配置...")
+        # 若默认配置不存在，自动生成一个标准校园参考标定配置；
+        # 该参数为占位合成值，真实测速前必须用 interactive_calibrator 重新标定
+        print(f"[!] 警告: 标定文件 {calib_path} 不存在，自动生成的合成标定仅供流程演示，")
+        print(f"[!] 其物理测速与 TTC 结果不可信！请先用 python -m analysis.interactive_calibrator 实测标定。")
         sample_calib = RoadCalibrator(
             image_points=[(400, 300), (880, 300), (1150, 680), (130, 680)],
             width_m=6.0,
@@ -103,6 +135,11 @@ def main(argv: list[str] | None = None):
         speed_limit_kmh=args.speed_limit,
         device=args.device,
         conf=args.conf,
+        ema_alpha=args.ema_alpha,
+        window_size=args.window,
+        ttc_critical_s=args.ttc_critical,
+        ttc_caution_s=args.ttc_caution,
+        horizon_s=args.horizon,
     )
 
     summary = pipeline.process_video(
