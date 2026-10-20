@@ -1,8 +1,8 @@
 # 基于视觉目标检测与多目标跟踪的校园道路行人冲突感知与车速预警系统
 
-面向校园道路固定路侧摄像头，研究车辆与行人的视觉感知、连续跟踪、实际速度估计和冲突风险预警。系统以 YOLOv8 与 PyTorch 为检测基础，后续结合 ByteTrack、道路平面标定、轨迹预测及 TTC 分析，形成从视频输入到风险提示和事件记录的技术链路。
+面向校园道路固定路侧摄像头，研究车辆与行人的视觉感知、连续跟踪、实际速度估计和冲突风险预警。系统以 YOLOv8 与 PyTorch 为检测基础，通过 ByteTrack 维护连续目标身份，后续结合道路平面标定、轨迹预测及 TTC 分析，形成从视频输入到风险提示和事件记录的技术链路。
 
-**当前阶段：车辆与行人检测基线已实现；多目标跟踪、实际测速、冲突分析及预警展示按阶段推进。** 当前验证覆盖 CPU 环境中的检测及训练评估流程，尚未完成校园实景数据上的精度、测速误差或实时性评估。
+**当前阶段：车辆与行人检测、本地视频 ByteTrack 跟踪基线已实现；实际测速、冲突分析及预警展示按阶段推进。** 已在 CPU 环境验证检测训练评估、连续 ID、短暂漏检恢复和跨视频会话重置；尚未完成校园实景精度、测速误差或实时性评估。
 
 ## 1. 研究目标与实现状态
 
@@ -10,11 +10,11 @@
 |---|---|---|---|
 | 视频采集与数据集构建 | 固定路侧摄像头、校园自采视频；OpenCV、FFmpeg、CVAT | 视频片段、图像与标注、数据划分 | 支持本地输入；校园数据待提供 |
 | 车辆与行人检测 | YOLOv8n、PyTorch、Ultralytics | 类别、置信度、原图检测框 | **已实现基线** |
-| 多目标跟踪 | ByteTrack、Kalman Filter、基于 IoU 的数据关联与线性分配 | 稳定目标 ID、连续位置、历史轨迹 | 规划阶段 |
+| 多目标跟踪 | ByteTrack、Kalman Filter、基于 IoU 的数据关联与 LAPJV 线性分配 | 目标 ID、连续观测位置、有限历史轨迹 | **已实现视频跟踪基线**；校园场景待验证 |
 | 标定与运动状态估计 | OpenCV、畸变校正、单应性变换、位移/时间与轨迹滤波 | 道路坐标、运动方向、估计速度 | 规划阶段 |
 | 轨迹预测与冲突分析 | 匀速模型、速度向量外推、冲突区域几何判断 | 预测位置、冲突区域占用时段 | 规划阶段 |
 | TTC 与风险决策 | 适用条件下的 TTC、到达时间差、风险分级、独立限速判定 | 正常 / 注意 / 高风险，以及超速提醒 | 规划阶段 |
-| 实时预警与展示 | OpenCV；可选 Streamlit 或 FastAPI | 实时画面、驾驶员及路旁学生提示、危险事件记录 | 已实现检测可视化；完整预警 Demo 待开发 |
+| 实时预警与展示 | OpenCV；可选 Streamlit 或 FastAPI | 实时画面、驾驶员及路旁学生提示、危险事件记录 | 已实现检测/跟踪可视化；桌面窗口待实测，完整预警 Demo 待开发 |
 | 实验评价 | 检测、跟踪、测速、延迟与事件级评价；计划使用 Pandas、Matplotlib 等汇总结果 | 实验报告、论文图表和答辩材料 | 已提供检测评估入口；完整实验待开展 |
 
 研究重点是**道路标定与实际测速、车辆—行人时空冲突分析，以及 TTC 与风险决策**。YOLOv8 和 ByteTrack 分别提供检测与跟踪结果，后续模块据此估计运动状态并判断风险。
@@ -26,8 +26,8 @@ flowchart TD
     A[固定路侧摄像头 / 校园视频] --> B[抽帧、CVAT 标注与数据划分]
     B --> C[YOLOv8 车辆与行人检测]
     C --> D[类别、置信度、检测框与时间戳]
-    D -.-> E[ByteTrack：Kalman 预测与数据关联]
-    E --> F[相机标定、道路坐标与运动估计]
+    D --> E[ByteTrack：Kalman 预测与数据关联]
+    E -.-> F[相机标定、道路坐标与运动估计]
     F --> G[匀速外推与冲突区域判断]
     G --> H[TTC / 到达时间差与风险分级]
     F --> I[独立判断 30 km/h 限速]
@@ -35,7 +35,7 @@ flowchart TD
     I --> J
 ```
 
-检测模块后的虚线连接表示尚待集成的后续阶段。实时预警是项目目标，实际吞吐量和端到端延迟需要在完整系统与目标硬件上测量。
+跟踪模块后的虚线连接表示尚待集成的后续阶段。实时预警是项目目标，实际吞吐量和端到端延迟需要在完整系统与目标硬件上测量。
 
 ## 3. 核心算法
 
@@ -53,11 +53,11 @@ flowchart TD
 
 默认类别为 `person`、`bicycle`、`car`、`motorcycle`、`bus`、`truck`。导出保留模型细分类，同时将 `person` 归为 `pedestrian`，其余道路类别归为 `vehicle`；自行车、摩托车可在后续阶段单独分析。
 
-### 3.2 ByteTrack 多目标跟踪：后续阶段
+### 3.2 ByteTrack 多目标跟踪：已接入
 
-计划采用 ByteTrack 的高、低置信度检测框分阶段关联机制，利用 Kalman Filter 预测目标状态，以 IoU 等关联代价构建匹配矩阵，通过线性分配算法（匈牙利 / LAP 类求解）关联检测与轨迹，并管理轨迹的建立、丢失和终止。
+通过 Ultralytics `model.track()` 使用 ByteTrack 的高、低置信度检测框分阶段关联机制，利用 Kalman Filter 预测目标状态，以 IoU 等关联代价构建匹配矩阵，通过 `lap.lapjv()` 求解线性分配，并管理轨迹的建立、丢失和终止。
 
-Kalman 预测和数据关联属于 ByteTrack 的内部流程。接入时需要联合设置检测阈值与跟踪阈值，为低置信度关联保留候选框，并评估遮挡、交叉通行及短时漏检下的 ID 稳定性。
+同一视频保持 `persist=True`；每个新视频创建独立会话和模型包装实例，清空历史，避免继承前一段视频的 ID。参数放在 `configs/bytetrack.yaml`，默认检测 conf 跟随低分关联阈值。短暂漏检恢复已作功能验证，真实遮挡和交叉通行下的稳定性仍需校园数据评估。
 
 ### 3.3 摄像机标定与实际测速：核心研究阶段
 
@@ -85,12 +85,16 @@ $$
 - 为没有目标的帧保留记录，导出原图像素坐标、帧号及源时间信息。
 - 本地 YOLO 标注数据检查：类别映射、标签格式、缺少标签及训练/验证文件路径重叠。
 - 自定义数据训练、验证与测试入口，导出整体及有标注类别的检测指标。
+- ByteTrack 连续视频跟踪，显示类别、置信度、ID、分组颜色、轨迹、源 FPS、处理 FPS、帧号和当前各类数量。
+- 跟踪结果导出 `tracks.jsonl`；可选桌面 `--show` 模式支持 Space/P 暂停继续、Q/Esc 退出，默认无窗口保存视频。
 
-当前输入入口为本地文件，摄像头、网络流和网页预警端尚未接入；导出的 `track_id` 为 `null`，等待后续跟踪模块赋值。
+当前输入入口为本地文件，摄像头、网络流和网页预警端尚未接入。检测入口的 `track_id` 仍为 `null`；跟踪入口输出有效 ID，未获得 ID 的返回框保留 null。当前云机器没有桌面，按键控制已通过模拟事件测试，实际窗口仍需本地验证。
 
 ## 5. 安装与快速使用
 
 已验证环境：Python 3.12、PyTorch 2.11.0+cpu、torchvision 0.26.0+cpu、Ultralytics 8.4.182、opencv-python 5.0.0.93。模型版本由 `yolov8n.pt` 指定，Ultralytics 包版本不代表 YOLO 模型版本。
+
+跟踪新增依赖 `lap==0.5.12`，已加入 `requirements-yolo.txt`，用于 ByteTrack 的线性分配。
 
 ```bash
 git clone https://github.com/blckgum/jszx-.git
@@ -115,6 +119,12 @@ python -m detection detect --source path/to/video.mp4 --device cpu
 
 # 按类别筛选，仅处理前 100 帧
 python -m detection detect --source path/to/video.mp4 --classes person car bus truck --max-frames 100 --device cpu
+
+# 跟踪：默认无窗口保存视频和逐帧数据
+python -m tracking --source path/to/video.mp4 --tracker configs/bytetrack.yaml --device cpu
+
+# 有桌面的本机可追加 --show，GPU 机器可改为 --device 0
+python -m tracking --source path/to/video.mp4 --device cpu --show
 ```
 
 | 参数 | 用途 | 默认值 |
@@ -166,14 +176,18 @@ python -m detection val --data configs/traffic.example.yaml --weights runs/yolo/
 
 独立图片没有时间戳；视频在源时间戳不可用时使用 FPS 估计，并记录 `fps_estimate`。标注 MP4 使用固定帧率，后续运动计算以逐帧数据中的源时间信息为准。检测框累计数量不能直接作为独立目标数量。
 
+跟踪输出位于 `runs/yolo/track/run-*`，包含 `annotated.mp4`、`tracks.jsonl`、`summary.json`、`tracker.resolved.yaml`。逐帧目标还提供 ID、框底边中心像素点和观测标记，使用 `(session_id, track_id)` 区分不同视频；当前不输出实际速度或 TTC。
+
 | 评价对象 | 指标与验证方法 | 状态 |
 |---|---|---|
 | 检测 | Precision、Recall、mAP50、mAP50-95；分目标类别及难例场景统计 | 已实现指标导出，校园数据结果待测 |
-| 跟踪 | IDF1、HOTA、ID 切换数 | 待跟踪模块和 ID 标注视频 |
+| 跟踪 | IDF1、HOTA、ID 切换数 | 已完成功能验证；定量指标待实拍视频和连续 ID 标注 |
 | 测速 | MAE、RMSE；对比参考速度及不同标定位置 | 待道路标定与参考数据 |
 | 冲突预警 | 事件级召回率、误报率、预警提前量与端到端延迟 | 待冲突事件标注与完整系统 |
 
 已完成的功能验证：官方样例检出行人、公交车、汽车、自行车和卡车；3 帧拼接视频验证空帧保留、时间戳和输出解码；COCO128 重映射小样本按 4/4/2 张划分，完成单轮训练及 val/test 入口验证；6 项回归测试通过。小样本单轮微调后的指标较低，仅用于检查流程，不能代表校园检测效果。GPU 性能、真实道路动态视频及完整预警效果尚未验证。
+
+跟踪新增验证：3 帧视频中的公交车在空白帧前后保持 ID；两段各 18 帧的构造视频中，多车多人同时关联，公交车在两个空白帧后恢复原 ID；同进程处理第二段视频时正确新建会话并重新分配 ID。当前总测试数为 **17 项，全部通过、无跳过**，包含真实网络集成及模拟按键测试。构造视频不是校园实拍基准，未据此报告 IDF1/HOTA 或承诺实时性能。
 
 ```bash
 python -m unittest discover -s tests -v
@@ -188,7 +202,9 @@ jszx-/
 │   ├── core.py                    # 推理、可视化、逐帧导出
 │   └── dataset.py                 # 数据集与标签检查
 ├── configs/traffic.example.yaml   # YOLO 数据配置模板
-├── tests/test_detection.py        # 回归测试
+├── configs/bytetrack.yaml         # 独立 ByteTrack 参数
+├── tracking/                      # 跟踪会话、结构化观测及可视化
+├── tests/                         # 检测、跟踪机制与真实网络集成测试
 ├── requirements-yolo.txt          # 检测模块依赖
 ├── docs/                         # 课题需求、技术路线及检测模块说明
 ├── common.py / config.py          # 原有分类实验工具与配置
@@ -196,7 +212,7 @@ jszx-/
 └── train.py / predict.py          # 原有分类训练与推理入口
 ```
 
-检测、训练和评估统一使用 `python -m detection`。`data/`、`checkpoints/`、`runs/` 为本地数据、权重和生成结果，不随 Git 提交。
+检测、训练和评估使用 `python -m detection`，视频跟踪使用 `python -m tracking`。`data/`、`checkpoints/`、`runs/` 为本地数据、权重和生成结果，不随 Git 提交。
 
 ## 9. 开发路线与参考资料
 
@@ -204,6 +220,8 @@ jszx-/
 
 - [课题需求与技术路线](docs/课题需求与技术路线.md)
 - [检测模块实施说明](docs/车辆行人检测方案.md)
+- [目标检测 YOLOv8 与 PyTorch 解释文档](docs/modules/01_目标检测_YOLOv8与PyTorch_解释文档.md)
+- [多目标跟踪 ByteTrack 解释文档](docs/modules/02_多目标跟踪_ByteTrack_解释文档.md)
 - [Ultralytics YOLOv8 文档](https://docs.ultralytics.com/models/yolov8/)
 - [PyTorch 安装说明](https://pytorch.org/get-started/locally/)
 - [ByteTrack 项目](https://github.com/FoundationVision/ByteTrack)

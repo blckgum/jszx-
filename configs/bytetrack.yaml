@@ -1,0 +1,18 @@
+# 基于 Ultralytics 的 ByteTrack 默认参数；仅供跟踪入口使用，不改变训练配置。
+tracker_type: bytetrack
+
+# 第一阶段关联高分检测；第二阶段利用低分候选尝试维持已有轨迹。
+# 跟踪入口默认让检测 conf 等于 track_low_thresh，避免提前丢弃这部分候选。
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+
+# 未匹配的高分检测达到此阈值后，才可能建立新轨迹。
+new_track_thresh: 0.25
+
+# 当前固定的 Ultralytics 版本按处理帧保留丢失轨迹，不是固定 30 秒。
+# 缓冲期内也不能保证恢复 ID，仍要满足运动与关联条件。
+track_buffer: 30
+
+# 匹配代价的上限，不是“至少 0.8 的 IoU”；可融合检测分数共同计算代价。
+match_thresh: 0.8
+fuse_score: true

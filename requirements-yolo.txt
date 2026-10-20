@@ -8,3 +8,5 @@
 ultralytics==8.4.182
 # OpenCV 负责图片读写、视频解码/编码和画框；当前尚未在此接入标定、测速或 TTC。
 opencv-python==5.0.0.93
+# ByteTrack 使用 LAPJV 求解检测与轨迹之间的线性分配，不需要重新实现匹配算法。
+lap==0.5.12
