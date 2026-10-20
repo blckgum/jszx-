@@ -119,6 +119,7 @@ class ConflictEventTracker:
         self._states: Dict[EventKey, _KeyState] = {}
         self._finalized: List[AlertEvent] = []
         self._next_event_id = 1
+        self._last_frame_idx: Optional[int] = None
 
     @staticmethod
     def _key_of(c: ConflictAssessment) -> EventKey:
@@ -137,6 +138,10 @@ class ConflictEventTracker:
         """
         if not (math.isfinite(timestamp_s) and frame_idx >= 0):
             raise ValueError("frame_idx/timestamp_s 必须为有效帧序与有限时间戳")
+        if self._last_frame_idx is not None and frame_idx <= self._last_frame_idx:
+            # 每帧只允许一次 update：重复或回退帧序会让 alarm/gap 计数失真
+            raise ValueError("frame_idx 必须逐帧严格递增")
+        self._last_frame_idx = frame_idx
 
         alarmed: Dict[EventKey, ConflictAssessment] = {}
         for c in conflicts:

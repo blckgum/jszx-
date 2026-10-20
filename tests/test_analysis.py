@@ -826,6 +826,15 @@ class TestConflictEventTracker(unittest.TestCase):
         with self.assertRaises(ValueError):
             tr.update([], 0, float("nan"))
 
+    def test_update_rejects_non_monotonic_frame(self):
+        # 同帧重复调用或帧序回退会让 alarm/gap 计数失真，直接拒绝
+        tr = ConflictEventTracker()
+        tr.update([], 3, 0.3)
+        with self.assertRaises(ValueError):
+            tr.update([], 3, 0.4)
+        with self.assertRaises(ValueError):
+            tr.update([], 2, 0.5)
+
     def test_event_to_dict_is_json_serializable(self):
         import json
 
