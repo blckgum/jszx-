@@ -52,7 +52,7 @@ class DetectionContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             data, report = audit_dataset(self.make_dataset(root), ("train", "val"))
-            self.assertEqual(data["path"], str(root))
+            self.assertEqual(Path(data["path"]).resolve(), root.resolve())
             self.assertEqual(report["val"], {"images": 1, "objects": 1})
 
     def test_missing_labels_are_not_silently_negative_samples(self):

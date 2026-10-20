@@ -144,7 +144,7 @@ class TrackingInputTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "model unavailable"):
                     track_video(source, output=root / "output")
             capture.release.assert_called_once()
-            summary = json.loads((root / "output" / "summary.json").read_text())
+            summary = json.loads((root / "output" / "summary.json").read_text(encoding="utf-8"))
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(summary["frames_processed"], 0)
             self.assertIsNone(summary["session_id"])

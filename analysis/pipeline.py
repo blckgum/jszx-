@@ -1,0 +1,269 @@
+# -*- coding: utf-8 -*-
+"""
+校园道路车辆—行人冲突感知与测速预警完整流水线 (End-to-End Conflict Perception Pipeline)
+=============================================================================
+集成 TrackingSession 目标追踪、RoadCalibrator 单应性投影、
+SpeedEstimator 平滑测速、ConflictAnalyzer 碰撞决策与 EnhancedVisualizer 可视化，
+实现从视频输入到结构化风险告警的端到端技术闭环。
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+import time
+from dataclasses import asdict
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import cv2
+import numpy as np
+
+from detection.core import DEFAULT_WEIGHTS
+from tracking.core import DEFAULT_TRACKER, TrackingSession, VideoClock
+from .calibration import RoadCalibrator
+from .conflict import ConflictAnalyzer, ConflictAssessment, RiskLevel
+from .speed import SpeedEstimator, SpeedReading
+from .visualization import EnhancedConflictVisualizer
+
+
+class ConflictPerceptionPipeline:
+    """冲突感知与预警全流程管道执行器"""
+
+    def __init__(
+        self,
+        calibrator: RoadCalibrator,
+        weights: str = str(DEFAULT_WEIGHTS),
+        tracker_config: str = str(DEFAULT_TRACKER),
+        speed_limit_kmh: float = 30.0,
+        device: Optional[str] = None,
+        conf: Optional[float] = None,
+        iou: float = 0.7,
+        imgsz: int = 640,
+    ):
+        self.calibrator = calibrator
+        self.weights = weights
+        self.tracker_config = tracker_config
+        self.speed_limit_kmh = speed_limit_kmh
+        self.device = device
+        self.conf = conf
+        self.iou = iou
+        self.imgsz = imgsz
+
+        self.speed_estimator = SpeedEstimator(speed_limit_kmh=speed_limit_kmh)
+        self.conflict_analyzer = ConflictAnalyzer(speed_limit_kmh=speed_limit_kmh)
+        self.visualizer = EnhancedConflictVisualizer(calibrator=calibrator)
+
+    def process_video(
+        self,
+        video_path: str | Path,
+        output_dir: str | Path,
+        show_window: bool = False,
+        max_frames: Optional[int] = None,
+    ) -> dict:
+        """端到端处理整段视频，输出渲染视频与结构化告警日志"""
+        src = Path(video_path).expanduser().resolve()
+        out_dir = Path(output_dir).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        cap = cv2.VideoCapture(str(src))
+        if not cap.isOpened():
+            raise RuntimeError(f"无法打开视频输入文件: {src}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        video_clock = VideoClock(fps=fps)
+        session = TrackingSession(
+            source=str(src),
+            weights=self.weights,
+            tracker_path=self.tracker_config,
+            conf=self.conf,
+            iou=self.iou,
+            imgsz=self.imgsz,
+            device=self.device,
+        )
+
+        out_video_path = out_dir / "annotated_conflict.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(out_video_path), fourcc, fps, (width, height))
+
+        jsonl_path = out_dir / "conflicts.jsonl"
+        csv_path = out_dir / "speeds.csv"
+
+        jsonl_file = open(jsonl_path, "w", encoding="utf-8")
+        csv_file = open(csv_path, "w", encoding="utf-8", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow([
+            "frame_idx", "timestamp_s", "track_id", "category",
+            "x_m", "y_m", "speed_kmh", "is_speeding", "risk_level", "ttc_s"
+        ])
+
+        total_critical_events = 0
+        total_caution_events = 0
+        total_speeding_events = 0
+        max_observed_speed_kmh = 0.0
+
+        frame_idx = 0
+        t_start = time.time()
+
+        print("=" * 60)
+        print(f"[*] 启动校园道路冲突感知与测速预警系统:")
+        print(f"    输入视频: {src.name} ({width}x{height} @ {fps:.1f} FPS)")
+        print(f"    标定路网: {self.calibrator.name} (宽 {self.calibrator.width_m}m, 长 {self.calibrator.length_m}m)")
+        print(f"    限速标准: {self.speed_limit_kmh} km/h")
+        print("=" * 60)
+
+        try:
+            while True:
+                if max_frames and frame_idx >= max_frames:
+                    break
+
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+
+                pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                timestamp_s, time_kind = video_clock.timestamp(frame_idx, pts_ms)
+
+                # 1. 目标检测与 ByteTrack 多目标追踪
+                frame_record = session.process(frame, timestamp_s, time_kind)
+                active_ids = set()
+                speed_readings: List[SpeedReading] = []
+                reading_map: Dict[int, SpeedReading] = {}
+
+                # 2. 空间坐标单应性变换与平滑测速
+                for t in frame_record.tracks:
+                    if t.track_id is None:
+                        continue
+                    active_ids.add(t.track_id)
+
+                    # 底边中心点转换为地面米制物理坐标
+                    u_foot, v_foot = t.anchor_xy
+                    x_m, y_m = self.calibrator.pixel_to_ground(u_foot, v_foot)
+
+                    reading = self.speed_estimator.update(
+                        track_id=t.track_id,
+                        category=t.category,
+                        timestamp_s=timestamp_s,
+                        x_m=x_m,
+                        y_m=y_m,
+                    )
+                    speed_readings.append(reading)
+                    reading_map[t.track_id] = reading
+
+                    if reading.speed_kmh > max_observed_speed_kmh:
+                        max_observed_speed_kmh = reading.speed_kmh
+
+                self.speed_estimator.prune_stale_tracks(active_ids)
+
+                # 3. 车辆与行人轨迹外推预测与 TTC 碰撞研判
+                conflicts = self.conflict_analyzer.analyze_frame(speed_readings)
+                conflict_map: Dict[int, ConflictAssessment] = {c.veh_track_id: c for c in conflicts}
+
+                # 4. 统计与持久化记录
+                for c in conflicts:
+                    if c.risk_level == RiskLevel.LEVEL_3_CRITICAL:
+                        total_critical_events += 1
+                    elif c.risk_level == RiskLevel.LEVEL_2_CAUTION:
+                        total_caution_events += 1
+                    elif c.risk_level == RiskLevel.LEVEL_1_SPEEDING:
+                        total_speeding_events += 1
+
+                    json_item = {
+                        "frame_index": frame_idx,
+                        "timestamp_s": round(timestamp_s, 3),
+                        "assessment": asdict(c),
+                    }
+                    jsonl_file.write(json.dumps(json_item, ensure_ascii=False) + "\n")
+
+                for r in speed_readings:
+                    c = conflict_map.get(r.track_id)
+                    risk_lvl = c.risk_level.name if c else "SAFE"
+                    ttc_val = round(c.ttc_seconds, 2) if (c and c.ttc_seconds) else ""
+                    csv_writer.writerow([
+                        frame_idx, round(timestamp_s, 3), r.track_id, r.category,
+                        round(r.x_m, 2), round(r.y_m, 2), round(r.speed_kmh, 1),
+                        int(r.is_speeding), risk_lvl, ttc_val
+                    ])
+
+                # 5. 增强可视化渲染
+                render_frame = frame.copy()
+                self.visualizer.draw_calibrated_ground_zone(render_frame)
+
+                for r in speed_readings:
+                    # 绘制预测轨迹虚线
+                    traj_color = (
+                        (0, 0, 255)
+                        if (conflict_map.get(r.track_id) and conflict_map[r.track_id].risk_level == RiskLevel.LEVEL_3_CRITICAL)
+                        else (0, 255, 0)
+                    )
+                    self.visualizer.draw_future_trajectory(render_frame, r, color=traj_color)
+
+                for t in frame_record.tracks:
+                    if t.track_id is None:
+                        continue
+                    r = reading_map.get(t.track_id)
+                    if r:
+                        c = conflict_map.get(t.track_id)
+                        self.visualizer.draw_speed_badge(render_frame, t.bbox_xyxy, r, c)
+
+                for c in conflicts:
+                    self.visualizer.draw_conflict_link(render_frame, c, reading_map)
+
+                self.visualizer.draw_hud_banner(render_frame, conflicts)
+
+                writer.write(render_frame)
+
+                if show_window:
+                    cv2.imshow("Campus Vehicle-Pedestrian Conflict System", render_frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+
+                frame_idx += 1
+                if frame_idx % 30 == 0:
+                    fps_proc = frame_idx / (time.time() - t_start)
+                    print(f"[*] 已处理 {frame_idx} 帧 | 处理速率: {fps_proc:.1f} FPS | 最高时速: {max_observed_speed_kmh:.1f} km/h")
+
+        finally:
+            cap.release()
+            writer.release()
+            jsonl_file.close()
+            csv_file.close()
+            if show_window:
+                cv2.destroyAllWindows()
+
+        elapsed = time.time() - t_start
+        proc_fps = frame_idx / elapsed if elapsed > 0 else 0
+
+        summary = {
+            "source_video": str(src),
+            "annotated_output": str(out_video_path),
+            "conflicts_jsonl": str(jsonl_path),
+            "speeds_csv": str(csv_path),
+            "frames_processed": frame_idx,
+            "elapsed_seconds": round(elapsed, 2),
+            "average_fps": round(proc_fps, 1),
+            "speed_limit_kmh": self.speed_limit_kmh,
+            "max_observed_speed_kmh": round(max_observed_speed_kmh, 1),
+            "total_speeding_alerts": total_speeding_events,
+            "total_caution_events": total_caution_events,
+            "total_critical_conflicts": total_critical_events,
+        }
+
+        summary_path = out_dir / "summary.json"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+
+        print("=" * 60)
+        print(f"[OK] 冲突感知与测速研判处理完毕！")
+        print(f"    渲染视频已保存: {out_video_path}")
+        print(f"    告警明细已落盘: {jsonl_path} | {csv_path}")
+        print(f"    最高车速: {max_observed_speed_kmh:.1f} km/h | 紧急冲突次数: {total_critical_events}")
+        print("=" * 60)
+
+        return summary

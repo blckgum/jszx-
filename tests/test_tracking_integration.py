@@ -25,13 +25,13 @@ class TrackingIntegrationTests(unittest.TestCase):
             make_sample_video(source_a)
             shutil.copyfile(source_a, source_b)
             batch = track_directory(root, output=root / "batch", device="cpu")
-            manifest = json.loads((batch / "batch_summary.json").read_text())
+            manifest = json.loads((batch / "batch_summary.json").read_text(encoding='utf-8'))
             self.assertEqual(manifest["status"], "completed")
             self.assertEqual(manifest["videos_not_processed"], 0)
             records_by_video = []
             for item in manifest["results"]:
                 output = Path(item["output"])
-                records = [json.loads(line) for line in (output / "tracks.jsonl").read_text().splitlines()]
+                records = [json.loads(line) for line in (output / "tracks.jsonl").read_text(encoding='utf-8').splitlines()]
                 records_by_video.append(records)
                 self.assertEqual([r["frame_index"] for r in records], list(range(18)))
                 self.assertEqual(records[8]["tracks"], [])
@@ -54,14 +54,14 @@ class TrackingIntegrationTests(unittest.TestCase):
                     decoded += 1
                 capture.release()
                 self.assertEqual(decoded, 18)
-                summary = json.loads((output / "summary.json").read_text())
+                summary = json.loads((output / "summary.json").read_text(encoding='utf-8'))
                 self.assertEqual(summary["stop_reason"], "eof")
                 self.assertGreater(summary["processing_fps"], 0)
                 self.assertEqual(summary["status"], "completed")
-                events = [json.loads(line) for line in (output / "events.jsonl").read_text().splitlines()]
+                events = [json.loads(line) for line in (output / "events.jsonl").read_text(encoding='utf-8').splitlines()]
                 recovered = {e["track_id"] for e in events if e["event"] == "recovered"}
                 self.assertTrue(first_vehicles <= recovered)
-                tracklets = [json.loads(line) for line in (output / "tracklets.jsonl").read_text().splitlines()]
+                tracklets = [json.loads(line) for line in (output / "tracklets.jsonl").read_text(encoding='utf-8').splitlines()]
                 self.assertEqual({t["track_id"] for t in tracklets}, set(summary["confirmed_track_ids"]))
                 self.assertEqual(sum(t["observations"] for t in tracklets),
                                  sum(t["track_id"] is not None for r in records for t in r["tracks"]))
@@ -81,9 +81,9 @@ class TrackingIntegrationTests(unittest.TestCase):
                     patch("cv2.destroyWindow"), patch("cv2.getWindowProperty", return_value=1), \
                     patch("cv2.waitKey", side_effect=[32, -1, ord("p"), ord("q")]):
                 output = track_video(source, output=root / "output", device="cpu", show=True)
-            records = [json.loads(line) for line in (output / "tracks.jsonl").read_text().splitlines()]
+            records = [json.loads(line) for line in (output / "tracks.jsonl").read_text(encoding='utf-8').splitlines()]
             self.assertEqual([record["frame_index"] for record in records], [0, 1])
-            self.assertEqual(json.loads((output / "summary.json").read_text())["stop_reason"], "user_quit")
+            self.assertEqual(json.loads((output / "summary.json").read_text(encoding='utf-8'))["stop_reason"], "user_quit")
             capture = cv2.VideoCapture(str(output / "annotated.mp4"))
             count = 0
             while capture.read()[0]:
@@ -113,10 +113,10 @@ class TrackingIntegrationTests(unittest.TestCase):
                                 track_video(source, output=destination, device="cpu")
                         else:
                             track_video(source, output=destination, device="cpu")
-                    summary = json.loads((destination / "summary.json").read_text())
+                    summary = json.loads((destination / "summary.json").read_text(encoding='utf-8'))
                     self.assertEqual(summary["status"], name)
                     self.assertEqual(summary["frames_processed"], 2)
-                    records = [json.loads(line) for line in (destination / "tracks.jsonl").read_text().splitlines()]
+                    records = [json.loads(line) for line in (destination / "tracks.jsonl").read_text(encoding='utf-8').splitlines()]
                     self.assertEqual(len(records), 2)
                     capture = cv2.VideoCapture(str(destination / "annotated.mp4"))
                     decoded = 0
@@ -124,7 +124,7 @@ class TrackingIntegrationTests(unittest.TestCase):
                         decoded += 1
                     capture.release()
                     self.assertEqual(decoded, 2)
-                    tracklets = [json.loads(line) for line in (destination / "tracklets.jsonl").read_text().splitlines()]
+                    tracklets = [json.loads(line) for line in (destination / "tracklets.jsonl").read_text(encoding='utf-8').splitlines()]
                     reason = "session_end:error" if name == "failed" else "session_end:interrupted"
                     self.assertTrue(all(t["close_reason"] == reason for t in tracklets))
 
