@@ -55,6 +55,8 @@ class RoadCalibrator:
         self.name = name
         # 合成占位标定标记：非 --demo 模式下拒绝加载，防止演示参数被当真实标定
         self.synthetic = synthetic
+        # 旧版标定文件可能缺失 synthetic 溯源字段，由 from_yaml 置位
+        self.synthetic_field_missing = False
         self.width_m = float(width_m)
         self.length_m = float(length_m)
         self.image_points = [(float(pt[0]), float(pt[1])) for pt in image_points]
@@ -105,6 +107,7 @@ class RoadCalibrator:
                     "请修正字段或重新标定"
                 )
             synthetic = data["synthetic"]
+            field_missing = False
         else:
             warnings.warn(
                 f"标定文件 {path} 缺少 synthetic 溯源字段（旧版格式），"
@@ -113,14 +116,17 @@ class RoadCalibrator:
                 stacklevel=2,
             )
             synthetic = False
+            field_missing = True
 
-        return cls(
+        calibrator = cls(
             image_points=img_pts,
             width_m=float(data["width_m"]),
             length_m=float(data["length_m"]),
             name=data.get("name", "campus_road"),
             synthetic=synthetic,
         )
+        calibrator.synthetic_field_missing = field_missing
+        return calibrator
 
     def to_yaml(self, save_path: str | Path) -> Path:
         """持久化标定参数至 YAML 文件"""

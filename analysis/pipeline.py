@@ -59,6 +59,7 @@ class ConflictPerceptionPipeline:
         category_confirm_frames: int = 3,
         reliable_min_span_s: float = 0.2,
         alert_confirm_frames: int = 3,
+        alert_confirm_seconds: Optional[float] = None,
         alert_cooldown_frames: int = 12,
         alert_cooldown_seconds: Optional[float] = None,
         fps: Optional[float] = None,
@@ -77,6 +78,10 @@ class ConflictPerceptionPipeline:
             raise ValueError("stationary_seconds 必须为有限正数")
         if type(alert_confirm_frames) is not int or alert_confirm_frames < 1:
             raise ValueError("alert_confirm_frames 必须是 >= 1 的整数帧数")
+        if alert_confirm_seconds is not None and (
+            not math.isfinite(alert_confirm_seconds) or alert_confirm_seconds <= 0
+        ):
+            raise ValueError("alert_confirm_seconds 必须为有限正数")
         if type(alert_cooldown_frames) is not int or alert_cooldown_frames < 0:
             raise ValueError("alert_cooldown_frames 必须是 >= 0 的整数帧数")
         if alert_cooldown_seconds is not None and (
@@ -96,6 +101,7 @@ class ConflictPerceptionPipeline:
         self.window_seconds = window_seconds
         self.stationary_seconds = stationary_seconds
         self.alert_confirm_frames = alert_confirm_frames
+        self.alert_confirm_seconds = alert_confirm_seconds
         self.alert_cooldown_frames = alert_cooldown_frames
         self.alert_cooldown_seconds = alert_cooldown_seconds
         self.fps = fps
@@ -136,12 +142,16 @@ class ConflictPerceptionPipeline:
         self.speed_estimator = SpeedEstimator(**kwargs)
 
     def _configure_event_tracker(self, fps: float):
-        """按视频实际 FPS 重建告警事件跟踪器：换算秒级冷却窗，且不继承上一视频状态"""
+        """按视频实际 FPS 重建告警事件跟踪器：换算秒级窗口，且不继承上一视频状态"""
+        confirm_frames = self.alert_confirm_frames
+        if self.alert_confirm_seconds is not None:
+            # 秒级确认窗：60fps 的 3 帧只有 50ms，按帧计数跨帧率语义不一致
+            confirm_frames = max(1, int(round(fps * self.alert_confirm_seconds)))
         cooldown_frames = self.alert_cooldown_frames
         if self.alert_cooldown_seconds is not None:
             cooldown_frames = max(0, int(round(fps * self.alert_cooldown_seconds)))
         self.event_tracker = ConflictEventTracker(
-            confirm_frames=self.alert_confirm_frames,
+            confirm_frames=confirm_frames,
             cooldown_frames=cooldown_frames,
         )
 
@@ -232,6 +242,7 @@ class ConflictPerceptionPipeline:
         print(f"    限速标准: {self.speed_limit_kmh} km/h")
         print("=" * 60)
 
+        loop_state = "eof"
         try:
             while True:
                 if max_frames and frame_idx >= max_frames:
@@ -342,12 +353,18 @@ class ConflictPerceptionPipeline:
                     r = reading_map.get(t.track_id)
                     if r:
                         c = conflict_map.get(t.track_id) or ped_conflict_map.get(t.track_id)
-                        self.visualizer.draw_speed_badge(render_frame, t.bbox_xyxy, r, c)
+                        eid = (
+                            event_ids.get((c.veh_track_id, c.ped_track_id))
+                            if c is not None else None
+                        )
+                        self.visualizer.draw_speed_badge(
+                            render_frame, t.bbox_xyxy, r, c, event_id=eid
+                        )
 
                 for c in conflicts:
                     self.visualizer.draw_conflict_link(render_frame, c, reading_map)
 
-                self.visualizer.draw_hud_banner(render_frame, conflicts)
+                self.visualizer.draw_hud_banner(render_frame, conflicts, event_ids)
 
                 writer.write(render_frame)
 
@@ -361,11 +378,20 @@ class ConflictPerceptionPipeline:
                     fps_proc = frame_idx / (time.time() - t_start)
                     print(f"[*] 已处理 {frame_idx} 帧 | 处理速率: {fps_proc:.1f} FPS | 最高时速: {max_observed_speed_kmh:.1f} km/h")
 
-            # 视频结束：冷却窗内未决事件按 eof 强制归档，避免最后一段告警丢失
-            self.event_tracker.flush()
-            _drain_alert_events()
-
+        except KeyboardInterrupt:
+            loop_state = "interrupt"
+            raise
+        except BaseException:
+            loop_state = "exception"
+            raise
         finally:
+            # 无论正常结束还是异常退出，都尽力归档未决事件；
+            # flush 或写盘自身的失败不得掩盖原始异常
+            try:
+                self.event_tracker.flush(reason=loop_state)
+                _drain_alert_events()
+            except Exception:
+                pass
             cap.release()
             writer.release()
             jsonl_file.close()

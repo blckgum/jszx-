@@ -45,7 +45,7 @@ class AlertEvent:
     max_veh_speed_kmh: float
     alarm_frames: int              # 告警条件实际满足的帧数
     gap_frames: int = 0            # 事件存续期间被冷却窗吸收的静默帧总数
-    end_reason: str = ""           # "cooldown" | "eof"
+    end_reason: str = ""           # "cooldown" | "eof" | "interrupt" | "exception"
 
     @property
     def kind(self) -> str:

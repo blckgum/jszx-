@@ -891,6 +891,11 @@ class TestVisualization(unittest.TestCase):
         visualizer.draw_future_trajectory(annotated, readings[1])
         visualizer.draw_speed_badge(annotated, (10, 10, 50, 50), readings[1], assessments[0])
         visualizer.draw_hud_banner(annotated, assessments)
+        # 事件注解形态：confirmed 事件 id 标注不破坏渲染
+        visualizer.draw_speed_badge(
+            annotated, (10, 10, 50, 50), readings[1], assessments[0], event_id=3
+        )
+        visualizer.draw_hud_banner(annotated, assessments, {(1, None): 3})
 
 
 class TestPipelineIO(unittest.TestCase):
@@ -934,6 +939,8 @@ class TestPipelineIO(unittest.TestCase):
             ["--parked-frames", "0"],
             ["--parked-seconds", "0"],
             ["--alert-confirm", "0"],
+            ["--alert-confirm-s", "0"],
+            ["--alert-confirm-s", "nan"],
             ["--alert-cooldown", "-1"],
             ["--alert-cooldown-s", "-0.5"],
             ["--alert-cooldown-s", "nan"],
@@ -962,6 +969,20 @@ class TestPipelineIO(unittest.TestCase):
             }), encoding="utf-8")
             with self.assertRaises(SystemExit):
                 main(["--source", "x.mp4", "--calib", str(calib)])
+
+    def test_alert_confirm_seconds_scales_with_fps(self):
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        calib = RoadCalibrator(
+            [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+        )
+        pipe = ConflictPerceptionPipeline(
+            calibrator=calib, alert_confirm_seconds=0.4
+        )
+        pipe._configure_event_tracker(25.0)
+        self.assertEqual(pipe.event_tracker.confirm_frames, 10)
+        pipe._configure_event_tracker(60.0)
+        self.assertEqual(pipe.event_tracker.confirm_frames, 24)
 
     def test_estimator_rebuilt_per_video_and_fps_scaled(self):
         from analysis.pipeline import ConflictPerceptionPipeline
@@ -1156,6 +1177,160 @@ class TestPipelineIO(unittest.TestCase):
             ConflictPerceptionPipeline(calibrator=calib, fps=-1.0)
         with self.assertRaises(ValueError):
             ConflictPerceptionPipeline(calibrator=calib, fps=float("nan"))
+
+    def _write_video(self, path, n_frames=15):
+        import cv2
+        import numpy as np
+
+        w = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 25.0, (64, 64))
+        self.assertTrue(w.isOpened())
+        for _ in range(n_frames):
+            w.write(np.zeros((64, 64, 3), np.uint8))
+        w.release()
+
+    def _speeding_vehicle_session(self, fail_at=None, exc=RuntimeError("boom")):
+        """构造持续超速车辆的 mock 会话；fail_at 帧抛异常模拟推理/写盘失败"""
+        from unittest import mock
+
+        frame_i = {"n": 0}
+
+        def make_frame_rec(frame, timestamp_s, time_kind):
+            n = frame_i["n"]
+            frame_i["n"] += 1
+            if fail_at is not None and n >= fail_at:
+                raise exc
+            t = mock.Mock()
+            t.track_id = 1
+            t.category = "vehicle"
+            t.anchor_xy = (30.0, 10.0 + n * 0.7)
+            t.bbox_xyxy = (20.0, 10.0, 40.0, 30.0)
+            rec = mock.Mock()
+            rec.tracks = [t]
+            return rec
+
+        fake_session = mock.Mock()
+        fake_session.process.side_effect = make_frame_rec
+        fake_session.retained_ids.return_value = {1}
+        return fake_session
+
+    def _run_mocked_pipeline(self, out_dir, video_path, fail_at=None, exc=None):
+        import json as jsonlib
+        from unittest import mock
+
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        calib = RoadCalibrator(
+            [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 40.0, 40.0
+        )
+        pipe = ConflictPerceptionPipeline(
+            calibrator=calib, alert_confirm_frames=2, alert_cooldown_frames=2
+        )
+        session = self._speeding_vehicle_session(
+            fail_at=fail_at, exc=exc or RuntimeError("boom")
+        )
+        with mock.patch("analysis.pipeline.TrackingSession", return_value=session):
+            summary = pipe.process_video(video_path, out_dir)
+        events = [
+            jsonlib.loads(l)
+            for l in (out_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
+        return summary, events
+
+    def test_open_event_survives_inference_exception(self):
+        # 推理中途抛异常：存续事件不得丢失，按 exception 语义落盘
+        import json as jsonlib
+
+        with tempfile.TemporaryDirectory() as d:
+            vpath = Path(d) / "v.mp4"
+            self._write_video(vpath, 15)
+            try:
+                self._run_mocked_pipeline(Path(d) / "out", vpath, fail_at=6)
+                self.fail("process_video 应传播推理异常")
+            except RuntimeError:
+                pass
+            events = [
+                jsonlib.loads(l)
+                for l in (Path(d) / "out/events.jsonl")
+                .read_text(encoding="utf-8").splitlines() if l.strip()
+            ]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["end_reason"], "exception")
+            self.assertEqual(events[0]["kind"], "speeding")
+
+    def test_open_event_survives_keyboard_interrupt(self):
+        import json as jsonlib
+
+        with tempfile.TemporaryDirectory() as d:
+            vpath = Path(d) / "v.mp4"
+            self._write_video(vpath, 15)
+            with self.assertRaises(KeyboardInterrupt):
+                self._run_mocked_pipeline(
+                    Path(d) / "out", vpath, fail_at=6, exc=KeyboardInterrupt()
+                )
+            events = [
+                jsonlib.loads(l)
+                for l in (Path(d) / "out/events.jsonl")
+                .read_text(encoding="utf-8").splitlines() if l.strip()
+            ]
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["end_reason"], "interrupt")
+
+    def test_parked_defaults_resolve_to_seconds(self):
+        # 默认静止确认 = 3.0s 秒级（8 帧 @25fps 仅 0.32s 会把临时停车误豁免）；
+        # 显式 --parked-frames 优先于秒级默认
+        from unittest import mock
+
+        from analysis.__main__ import main
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("analysis.__main__.ConflictPerceptionPipeline") as m_pipe:
+                main(["--source", "x.mp4", "--demo", "--output", str(Path(d) / "o1")])
+            kw = m_pipe.call_args.kwargs
+            self.assertEqual(kw["stationary_seconds"], 3.0)
+
+            with mock.patch("analysis.__main__.ConflictPerceptionPipeline") as m_pipe:
+                main([
+                    "--source", "x.mp4", "--demo", "--parked-frames", "20",
+                    "--output", str(Path(d) / "o2"),
+                ])
+            kw = m_pipe.call_args.kwargs
+            self.assertEqual(kw["stationary_min_frames"], 20)
+            self.assertIsNone(kw["stationary_seconds"])
+
+    def test_legacy_calib_rejected_without_flag(self):
+        # 无 synthetic 溯源字段的旧版文件无法区分实测/占位：默认拒绝
+        from analysis.__main__ import main
+
+        with tempfile.TemporaryDirectory() as d:
+            calib = Path(d) / "calib.yaml"
+            calib.write_text(
+                "name: old\nwidth_m: 6.0\nlength_m: 15.0\n"
+                "image_points: [[0,0],[200,0],[200,100],[0,100]]\n",
+                encoding="utf-8",
+            )
+            with self.assertWarns(UserWarning):
+                with self.assertRaises(SystemExit):
+                    main(["--source", "x.mp4", "--calib", str(calib)])
+
+    def test_legacy_calib_allowed_with_explicit_flag(self):
+        # --allow-legacy-calib 显式豁免：越过溯源门后进入正常流程
+        # （此处因视频不存在而 RuntimeError，说明门控已通过而非拒绝）
+        from analysis.__main__ import main
+
+        with tempfile.TemporaryDirectory() as d:
+            calib = Path(d) / "calib.yaml"
+            calib.write_text(
+                "name: old\nwidth_m: 6.0\nlength_m: 15.0\n"
+                "image_points: [[0,0],[200,0],[200,100],[0,100]]\n",
+                encoding="utf-8",
+            )
+            with self.assertWarns(UserWarning):
+                with self.assertRaises(RuntimeError):
+                    main([
+                        "--source", str(Path(d) / "x.mp4"), "--calib", str(calib),
+                        "--allow-legacy-calib", "--output", str(Path(d) / "out"),
+                    ])
 
 
 if __name__ == "__main__":

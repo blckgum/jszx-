@@ -114,20 +114,26 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--parked-frames",
         type=int,
-        default=8,
-        help="连续多少帧低于 --parked-speed 判定为静止车辆，默认 8",
+        default=None,
+        help="连续多少帧低于 --parked-speed 判定为静止车辆；不指定时按 --parked-seconds 秒级默认值",
     )
     parser.add_argument(
         "--parked-seconds",
         type=float,
         default=None,
-        help="按秒指定静止确认时长，按视频 FPS 换算帧数；设置后覆盖 --parked-frames",
+        help="按秒指定静止确认时长，默认 3.0；显式指定 --parked-frames 后此项不生效",
     )
     parser.add_argument(
         "--alert-confirm",
         type=int,
         default=3,
         help="告警事件确认帧数：告警条件需连续满足 N 帧才开立事件，默认 3",
+    )
+    parser.add_argument(
+        "--alert-confirm-s",
+        type=float,
+        default=None,
+        help="按秒指定告警确认时长，按视频 FPS 换算帧数；设置后覆盖 --alert-confirm",
     )
     parser.add_argument(
         "--alert-cooldown",
@@ -159,6 +165,11 @@ def main(argv: list[str] | None = None):
         help="标定文件缺失时允许使用合成占位标定（仅演示，测速结果不可信）",
     )
     parser.add_argument(
+        "--allow-legacy-calib",
+        action="store_true",
+        help="允许加载缺少 synthetic 溯源字段的旧版标定文件（默认拒绝，建议重新标定）",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="是否开启本地桌面实时播放窗口",
@@ -177,12 +188,16 @@ def main(argv: list[str] | None = None):
         parser.error("TTC 阈值需满足 0 < --ttc-critical <= --ttc-caution <= --horizon")
     if not math.isfinite(args.parked_speed) or args.parked_speed <= 0:
         parser.error("--parked-speed 必须为正数")
-    if args.parked_frames < 1:
+    if args.parked_frames is not None and args.parked_frames < 1:
         parser.error("--parked-frames 必须是 >= 1 的整数")
     if args.parked_seconds is not None and (not math.isfinite(args.parked_seconds) or args.parked_seconds <= 0):
         parser.error("--parked-seconds 必须为正数")
     if args.alert_confirm < 1:
         parser.error("--alert-confirm 必须是 >= 1 的整数")
+    if args.alert_confirm_s is not None and (
+        not math.isfinite(args.alert_confirm_s) or args.alert_confirm_s <= 0
+    ):
+        parser.error("--alert-confirm-s 必须为有限正数")
     if args.alert_cooldown < 0:
         parser.error("--alert-cooldown 必须是 >= 0 的整数")
     if args.alert_cooldown_s is not None and (
@@ -200,6 +215,14 @@ def main(argv: list[str] | None = None):
     synthetic_calib = None
     if calib_path.exists():
         calibrator = RoadCalibrator.from_yaml(calib_path)
+        if calibrator.synthetic_field_missing and not args.allow_legacy_calib:
+            # 无溯源字段的旧文件无法区分实测/合成占位：旧版 --demo 产物
+            # 可能借此绕过合成标定安全门，默认拒绝并要求显式确认
+            parser.error(
+                f"标定文件 {calib_path} 缺少 synthetic 溯源字段（旧版格式），"
+                "无法确认其为实测标定；请用 python -m analysis.interactive_calibrator 重新标定，"
+                "或显式加 --allow-legacy-calib 确认加载"
+            )
         if calibrator.synthetic:
             if not args.demo:
                 parser.error(
@@ -236,6 +259,16 @@ def main(argv: list[str] | None = None):
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         synthetic_calib.to_yaml(Path(out_dir) / "calibration.synthetic.yaml")
 
+    # 静止确认默认按 3.0s 秒级换算：8 帧（25fps 下仅 0.32s）会把礼让/排队
+    # 中的临时停车误豁免为"泊车"；显式 --parked-frames 优先于秒级值，
+    # 同时给定两个参数时与 --window-s 同语义（秒覆盖帧）
+    if args.parked_frames is not None and args.parked_seconds is None:
+        stationary_min_frames = args.parked_frames
+        stationary_seconds = None
+    else:
+        stationary_min_frames = args.parked_frames if args.parked_frames is not None else 8
+        stationary_seconds = args.parked_seconds if args.parked_seconds is not None else 3.0
+
     pipeline = ConflictPerceptionPipeline(
         calibrator=calibrator,
         weights=args.weights,
@@ -250,9 +283,10 @@ def main(argv: list[str] | None = None):
         ttc_caution_s=args.ttc_caution,
         horizon_s=args.horizon,
         stationary_speed_ms=args.parked_speed,
-        stationary_min_frames=args.parked_frames,
-        stationary_seconds=args.parked_seconds,
+        stationary_min_frames=stationary_min_frames,
+        stationary_seconds=stationary_seconds,
         alert_confirm_frames=args.alert_confirm,
+        alert_confirm_seconds=args.alert_confirm_s,
         alert_cooldown_frames=args.alert_cooldown,
         alert_cooldown_seconds=args.alert_cooldown_s,
         reliable_min_span_s=args.reliable_span_s,

@@ -99,6 +99,7 @@ class EnhancedConflictVisualizer:
         box_xyxy: Tuple[float, float, float, float],
         reading: SpeedReading,
         conflict: Optional[ConflictAssessment] = None,
+        event_id: Optional[int] = None,
     ):
         """在目标检测框上方绘制测速与状态徽章"""
         x1, y1, x2, y2 = map(int, box_xyxy)
@@ -116,6 +117,10 @@ class EnhancedConflictVisualizer:
         else:
             color = self.COLOR_SAFE
             label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h"
+
+        # 已通过事件状态机确认的告警携带 event_id，与未确认瞬时帧区分
+        if event_id is not None:
+            label += f" E#{event_id}"
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
@@ -135,9 +140,15 @@ class EnhancedConflictVisualizer:
         )
 
     def draw_hud_banner(
-        self, frame: np.ndarray, conflicts: List[ConflictAssessment]
+        self,
+        frame: np.ndarray,
+        conflicts: List[ConflictAssessment],
+        event_ids: Optional[Dict[Tuple[int, Optional[int]], int]] = None,
     ):
-        """在画面顶部渲染全息状态与预警看板 (HUD Banner)"""
+        """在画面顶部渲染全息状态与预警看板 (HUD Banner)
+
+        event_ids: 事件状态机给出的 {(veh_id, ped_id): event_id}；
+        提供时按 provisional（未确认瞬时帧）/confirmed（已确认事件）区分标注"""
         h, w = frame.shape[:2]
 
         # 确定当前帧最高风险等级
@@ -164,6 +175,16 @@ class EnhancedConflictVisualizer:
         else:
             bg_color = (40, 140, 40)
             banner_text = f"CAMPUS ROAD TRAFFIC MONITOR: Normal Flow | Speed Limit: {self.speed_limit_kmh:g} km/h | Safe"
+
+        # 区分已通过确认帧数的 confirmed 事件与仍可能被去抖过滤的瞬时帧：
+        # 下游声光/GPIO/网络通知应只消费 confirmed（events.jsonl），
+        # 画面上的 provisional 前缀提示该告警可能闪断
+        if max_level > RiskLevel.LEVEL_0_SAFE and primary_conflict is not None:
+            eid = (event_ids or {}).get(
+                (primary_conflict.veh_track_id, primary_conflict.ped_track_id)
+            )
+            prefix = f"[EVT#{eid} CONFIRMED] " if eid is not None else "[PROVISIONAL] "
+            banner_text = prefix + banner_text
 
         cv2.rectangle(overlay, (0, 0), (w, banner_h), bg_color, -1)
         cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
