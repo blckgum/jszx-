@@ -73,11 +73,14 @@ class ConflictAnalyzer:
         ttc_caution_s: float = 3.5,
         horizon_s: float = 3.5,
     ):
-        if speed_limit_kmh <= 0:
-            raise ValueError("speed_limit_kmh 必须为正数")
-        if safe_radius_veh_m <= 0 or safe_radius_ped_m <= 0:
-            raise ValueError("安全半径必须为正数")
-        if not (0 < ttc_critical_s <= ttc_caution_s <= horizon_s):
+        if not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
+            raise ValueError("speed_limit_kmh 必须为有限正数")
+        if not (math.isfinite(safe_radius_veh_m) and safe_radius_veh_m > 0
+                and math.isfinite(safe_radius_ped_m) and safe_radius_ped_m > 0):
+            raise ValueError("安全半径必须为有限正数")
+        if not (math.isfinite(ttc_critical_s) and math.isfinite(ttc_caution_s)
+                and math.isfinite(horizon_s)
+                and 0 < ttc_critical_s <= ttc_caution_s <= horizon_s):
             raise ValueError("TTC 阈值需满足 0 < ttc_critical <= ttc_caution <= horizon")
         self.speed_limit_kmh = speed_limit_kmh
         self.critical_dist_m = safe_radius_veh_m + safe_radius_ped_m  # 3.0 米
@@ -197,7 +200,7 @@ class ConflictAnalyzer:
                         veh_track_id=veh.track_id,
                         ped_track_id=None,
                         risk_level=RiskLevel.LEVEL_1_SPEEDING,
-                        risk_desc=f"超速提醒: 时速 {veh.speed_kmh:.1f} km/h (限速 30 km/h)",
+                        risk_desc=f"超速提醒: 时速 {veh.speed_kmh:.1f} km/h (限速 {self.speed_limit_kmh:g} km/h)",
                         veh_speed_kmh=veh.speed_kmh,
                         ped_speed_ms=0.0,
                         current_distance_m=0.0,

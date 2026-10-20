@@ -188,6 +188,36 @@ class TestSpeedEstimator(unittest.TestCase):
         self.assertFalse(final.is_stationary)
         self.assertGreater(final.speed_ms, 0.1)
 
+    def test_crawl_below_micro_clamp_not_stationary(self):
+        # 0.2 m/s (0.72 km/h) 与 0.27 m/s (0.97 km/h)：标量被微动截断为 0，
+        # 但未截断平滑幅值仍超静止阈值，绝不能标记为"泊车"
+        for ms_per_frame, label in ((0.02, "0.2 m/s"), (0.027, "0.27 m/s")):
+            with self.subTest(label=label):
+                est = SpeedEstimator(stationary_min_frames=5)
+                final = None
+                for i in range(15):
+                    final = est.update(1, "vehicle", i * 0.1, 3.0, i * ms_per_frame)
+                self.assertTrue(final.is_reliable)
+                self.assertFalse(final.is_stationary)
+
+    def test_sub_threshold_drift_becomes_stationary(self):
+        # 0.05 m/s 平滑幅值低于 0.1 m/s 阈值，连续帧后判定静止
+        est = SpeedEstimator(stationary_min_frames=5)
+        final = None
+        for i in range(12):
+            final = est.update(1, "vehicle", i * 0.1, 3.0, i * 0.005)
+        self.assertTrue(final.is_stationary)
+
+    def test_nan_estimator_params_rejected(self):
+        with self.assertRaises(ValueError):
+            SpeedEstimator(speed_limit_kmh=float("nan"))
+        with self.assertRaises(ValueError):
+            SpeedEstimator(ema_alpha=float("nan"))
+        with self.assertRaises(ValueError):
+            SpeedEstimator(stationary_speed_ms=float("inf"))
+        with self.assertRaises(ValueError):
+            TrackMotionTracker(1, "vehicle", speed_limit_kmh=float("nan"))
+
     def test_category_hysteresis_suppresses_flicker(self):
         est = SpeedEstimator(category_confirm_frames=3)
         est.update(1, "pedestrian", 0.0, 0.0, 0.0)
@@ -440,6 +470,10 @@ class TestConflictAnalyzer(unittest.TestCase):
             ConflictAnalyzer(ttc_caution_s=4.0, horizon_s=3.0)
         with self.assertRaises(ValueError):
             ConflictAnalyzer(speed_limit_kmh=0.0)
+        with self.assertRaises(ValueError):
+            ConflictAnalyzer(horizon_s=float("nan"))
+        with self.assertRaises(ValueError):
+            ConflictAnalyzer(safe_radius_veh_m=float("nan"))
 
     def test_ped_conflict_map_picks_highest_risk(self):
         # 同一行人被两车关联：行人侧映射保留最高风险项，同级取最小 TTC
@@ -606,14 +640,80 @@ class TestPipelineIO(unittest.TestCase):
         for bad_args in (
             ["--ema-alpha", "0"],
             ["--ema-alpha", "1.5"],
+            ["--ema-alpha", "nan"],
             ["--window", "1"],
             ["--window-s", "0"],
+            ["--window-s", "nan"],
             ["--ttc-critical", "3.5", "--ttc-caution", "1.8"],
             ["--parked-speed", "0"],
+            ["--parked-speed", "nan"],
             ["--parked-frames", "0"],
+            ["--parked-seconds", "0"],
+            ["--speed-limit", "nan"],
         ):
             with self.assertRaises(SystemExit, msg=bad_args):
                 main(["--source", "x.mp4", *bad_args])
+
+    def test_synthetic_calibration_rejected_without_demo(self):
+        import yaml
+
+        from analysis.__main__ import main
+
+        with tempfile.TemporaryDirectory() as d:
+            calib = Path(d) / "calib.yaml"
+            calib.write_text(yaml.safe_dump({
+                "name": "fake", "synthetic": True,
+                "width_m": 6.0, "length_m": 15.0,
+                "image_points": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                "ground_points": [[0, 0], [6, 0], [6, 15], [0, 15]],
+            }), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                main(["--source", "x.mp4", "--calib", str(calib)])
+
+    def test_estimator_rebuilt_per_video_and_fps_scaled(self):
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        calib = RoadCalibrator(
+            [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+        )
+        pipe = ConflictPerceptionPipeline(
+            calibrator=calib, window_seconds=0.4, stationary_seconds=0.5
+        )
+        pipe.speed_estimator.update(1, "vehicle", 0.0, 0.0, 0.0)
+        self.assertEqual(len(pipe.speed_estimator.tracks), 1)
+
+        # 25 fps 下 0.4s 窗口 = 10 帧；0.5s 静止确认 = 12 帧；且旧轨迹状态清空
+        pipe._configure_speed_estimator(25.0)
+        self.assertEqual(pipe.speed_estimator.window_size, 10)
+        self.assertEqual(pipe.speed_estimator.stationary_min_frames, 12)
+        self.assertEqual(len(pipe.speed_estimator.tracks), 0)
+
+    def test_retained_ids_failure_fails_loud(self):
+        import cv2
+        import numpy as np
+        from unittest import mock
+
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        with tempfile.TemporaryDirectory() as d:
+            vpath = Path(d) / "v.mp4"
+            w = cv2.VideoWriter(str(vpath), cv2.VideoWriter_fourcc(*"mp4v"), 25.0, (64, 64))
+            for _ in range(3):
+                w.write(np.zeros((64, 64, 3), np.uint8))
+            w.release()
+
+            calib = RoadCalibrator(
+                [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+            )
+            pipe = ConflictPerceptionPipeline(calibrator=calib)
+            fake_session = mock.Mock()
+            fake_session.retained_ids.side_effect = AttributeError("no trackers")
+            frame_rec = mock.Mock()
+            frame_rec.tracks = []
+            fake_session.process.return_value = frame_rec
+            with mock.patch("analysis.pipeline.TrackingSession", return_value=fake_session):
+                with self.assertRaises(RuntimeError):
+                    pipe.process_video(vpath, Path(d) / "out")
 
 
 if __name__ == "__main__":

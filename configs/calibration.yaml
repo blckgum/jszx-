@@ -1,4 +1,5 @@
 name: default_campus_road
+synthetic: true
 width_m: 6.0
 length_m: 15.0
 image_points:

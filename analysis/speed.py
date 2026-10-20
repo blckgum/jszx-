@@ -47,12 +47,12 @@ class TrackMotionTracker:
     ):
         if type(window_size) is not int or window_size < 3:
             raise ValueError("window_size 必须是 >= 3 的整数帧数")
-        if not (0 < ema_alpha <= 1):
+        if not math.isfinite(ema_alpha) or not (0 < ema_alpha <= 1):
             raise ValueError("ema_alpha 必须在 (0, 1] 区间")
-        if speed_limit_kmh <= 0:
-            raise ValueError("speed_limit_kmh 必须为正数")
-        if stationary_speed_ms <= 0:
-            raise ValueError("stationary_speed_ms 必须为正数")
+        if not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
+            raise ValueError("speed_limit_kmh 必须为有限正数")
+        if not math.isfinite(stationary_speed_ms) or stationary_speed_ms <= 0:
+            raise ValueError("stationary_speed_ms 必须为有限正数")
         if type(stationary_min_frames) is not int or stationary_min_frames < 1:
             raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
 
@@ -163,7 +163,17 @@ class TrackMotionTracker:
                 self.ema_alpha * raw_vy + (1.0 - self.ema_alpha) * self.smoothed_vy
             )
 
-        speed_ms = math.hypot(self.smoothed_vx, self.smoothed_vy)
+        # 静止判定必须使用截断前的平滑速度幅值：
+        # 微动截断（<1 km/h 显示为 0）只影响展示标量，
+        # 若用截断后值判定，0.2 m/s 蠕行车辆会被误豁免为"泊车"导致碰撞漏报
+        smoothed_mag = math.hypot(self.smoothed_vx, self.smoothed_vy)
+        if smoothed_mag < self.stationary_speed_ms:
+            self._stationary_streak += 1
+        else:
+            self._stationary_streak = 0
+        is_stationary = self._stationary_streak >= self.stationary_min_frames
+
+        speed_ms = smoothed_mag
         speed_kmh = speed_ms * 3.6
 
         # 行人微动阈值截断（静止站立摆动不计为移动速度）
@@ -171,14 +181,6 @@ class TrackMotionTracker:
             speed_ms, speed_kmh = 0.0, 0.0
         elif self.category == "vehicle" and speed_kmh < 1.0:
             speed_ms, speed_kmh = 0.0, 0.0
-
-        # 持续静止帧计数：仅当截断后速度连续多帧低于阈值才认定为"泊车"状态，
-        # 缓慢蠕行的车辆（如 0.4 m/s）不会满足条件，避免碰撞漏报
-        if speed_ms < self.stationary_speed_ms:
-            self._stationary_streak += 1
-        else:
-            self._stationary_streak = 0
-        is_stationary = self._stationary_streak >= self.stationary_min_frames
 
         # 方向角计算 (0~360度，以地面 +X 轴为 0 度，朝 +Y 轴正向)
         heading = (math.degrees(math.atan2(self.smoothed_vy, self.smoothed_vx)) + 360.0) % 360.0
@@ -214,12 +216,16 @@ class SpeedEstimator:
         stationary_min_frames: int = 8,
         category_confirm_frames: int = 3,
     ):
-        if not (0 < ema_alpha <= 1):
+        if not math.isfinite(ema_alpha) or not (0 < ema_alpha <= 1):
             raise ValueError("ema_alpha 必须在 (0, 1] 区间")
         if type(window_size) is not int or window_size < 3:
             raise ValueError("window_size 必须是 >= 3 的整数帧数")
-        if speed_limit_kmh <= 0:
-            raise ValueError("speed_limit_kmh 必须为正数")
+        if not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
+            raise ValueError("speed_limit_kmh 必须为有限正数")
+        if not math.isfinite(stationary_speed_ms) or stationary_speed_ms <= 0:
+            raise ValueError("stationary_speed_ms 必须为有限正数")
+        if type(stationary_min_frames) is not int or stationary_min_frames < 1:
+            raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
         if type(category_confirm_frames) is not int or category_confirm_frames < 1:
             raise ValueError("category_confirm_frames 必须是 >= 1 的整数帧数")
         self.speed_limit_kmh = speed_limit_kmh

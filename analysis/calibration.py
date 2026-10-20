@@ -44,6 +44,7 @@ class RoadCalibrator:
         width_m: float,
         length_m: float,
         name: str = "campus_road",
+        synthetic: bool = False,
     ):
         if len(image_points) != 4:
             raise ValueError(f"地面标定必须严格提供 4 个角点，当前提供了 {len(image_points)} 个")
@@ -51,6 +52,8 @@ class RoadCalibrator:
             raise ValueError("道路的实际物理宽度和长度必须为大于 0 的正数（单位：米）")
 
         self.name = name
+        # 合成占位标定标记：非 --demo 模式下拒绝加载，防止演示参数被当真实标定
+        self.synthetic = synthetic
         self.width_m = float(width_m)
         self.length_m = float(length_m)
         self.image_points = [(float(pt[0]), float(pt[1])) for pt in image_points]
@@ -95,6 +98,7 @@ class RoadCalibrator:
             width_m=float(data["width_m"]),
             length_m=float(data["length_m"]),
             name=data.get("name", "campus_road"),
+            synthetic=bool(data.get("synthetic", False)),
         )
 
     def to_yaml(self, save_path: str | Path) -> Path:
@@ -104,6 +108,7 @@ class RoadCalibrator:
 
         config_data = {
             "name": self.name,
+            "synthetic": self.synthetic,
             "width_m": self.width_m,
             "length_m": self.length_m,
             "image_points": [list(pt) for pt in self.image_points],

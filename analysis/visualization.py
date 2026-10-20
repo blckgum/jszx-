@@ -35,8 +35,9 @@ def trajectory_color(conflict: Optional[ConflictAssessment]) -> Tuple[int, int, 
 class EnhancedConflictVisualizer:
     """视觉增强渲染引擎"""
 
-    def __init__(self, calibrator: RoadCalibrator):
+    def __init__(self, calibrator: RoadCalibrator, speed_limit_kmh: float = 30.0):
         self.calibrator = calibrator
+        self.speed_limit_kmh = speed_limit_kmh
 
         # 调色板定义 (BGR 格式)
         self.COLOR_SAFE = (50, 205, 50)       # 绿色 (正常)
@@ -159,10 +160,10 @@ class EnhancedConflictVisualizer:
             banner_text = f"CAUTION: Trajectory Convergence (Veh #{primary_conflict.veh_track_id} <-> Ped #{primary_conflict.ped_track_id} | TTC: {primary_conflict.ttc_seconds:.1f}s)"
         elif max_level == RiskLevel.LEVEL_1_SPEEDING:
             bg_color = (0, 180, 210)
-            banner_text = f"SPEED LIMIT WARNING: Veh #{primary_conflict.veh_track_id} @ {primary_conflict.veh_speed_kmh:.1f} km/h (Limit: 30.0 km/h)"
+            banner_text = f"SPEED LIMIT WARNING: Veh #{primary_conflict.veh_track_id} @ {primary_conflict.veh_speed_kmh:.1f} km/h (Limit: {self.speed_limit_kmh:g} km/h)"
         else:
             bg_color = (40, 140, 40)
-            banner_text = "CAMPUS ROAD TRAFFIC MONITOR: Normal Flow | Speed Limit: 30 km/h | Safe"
+            banner_text = f"CAMPUS ROAD TRAFFIC MONITOR: Normal Flow | Speed Limit: {self.speed_limit_kmh:g} km/h | Safe"
 
         cv2.rectangle(overlay, (0, 0), (w, banner_h), bg_color, -1)
         cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)

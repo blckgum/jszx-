@@ -54,16 +54,19 @@ class ConflictPerceptionPipeline:
         horizon_s: float = 3.5,
         stationary_speed_ms: float = 0.1,
         stationary_min_frames: int = 8,
+        stationary_seconds: Optional[float] = None,
         category_confirm_frames: int = 3,
     ):
-        if not (0 < iou <= 1):
+        if not math.isfinite(iou) or not (0 < iou <= 1):
             raise ValueError("iou 必须在 (0, 1] 区间")
         if type(imgsz) is not int or imgsz <= 0:
             raise ValueError("imgsz 必须是正整数")
-        if zone_margin_m < 0:
-            raise ValueError("zone_margin_m 不能为负数")
-        if window_seconds is not None and window_seconds <= 0:
-            raise ValueError("window_seconds 必须为正数")
+        if not math.isfinite(zone_margin_m) or zone_margin_m < 0:
+            raise ValueError("zone_margin_m 必须为有限非负数")
+        if window_seconds is not None and (not math.isfinite(window_seconds) or window_seconds <= 0):
+            raise ValueError("window_seconds 必须为有限正数")
+        if stationary_seconds is not None and (not math.isfinite(stationary_seconds) or stationary_seconds <= 0):
+            raise ValueError("stationary_seconds 必须为有限正数")
 
         self.calibrator = calibrator
         self.weights = weights
@@ -75,8 +78,10 @@ class ConflictPerceptionPipeline:
         self.imgsz = imgsz
         self.zone_margin_m = zone_margin_m
         self.window_seconds = window_seconds
+        self.stationary_seconds = stationary_seconds
 
-        self.speed_estimator = SpeedEstimator(
+        # 每次 process_video 按实际 FPS 重建 estimator，跨视频不串状态
+        self._estimator_kwargs = dict(
             speed_limit_kmh=speed_limit_kmh,
             window_size=window_size,
             ema_alpha=ema_alpha,
@@ -84,14 +89,26 @@ class ConflictPerceptionPipeline:
             stationary_min_frames=stationary_min_frames,
             category_confirm_frames=category_confirm_frames,
         )
+        self.speed_estimator = SpeedEstimator(**self._estimator_kwargs)
         self.conflict_analyzer = ConflictAnalyzer(
             speed_limit_kmh=speed_limit_kmh,
             ttc_critical_s=ttc_critical_s,
             ttc_caution_s=ttc_caution_s,
             horizon_s=horizon_s,
         )
-        self.visualizer = EnhancedConflictVisualizer(calibrator=calibrator)
-        self._retained_ids_warned = False
+        self.visualizer = EnhancedConflictVisualizer(
+            calibrator=calibrator, speed_limit_kmh=speed_limit_kmh
+        )
+
+    def _configure_speed_estimator(self, fps: float):
+        """按视频实际 FPS 重建速度估计器：换算秒级窗口，且不继承上一视频状态"""
+        kwargs = dict(self._estimator_kwargs)
+        if self.window_seconds is not None:
+            # 以秒表达的测速窗口：按实际 FPS 换算帧数，跨帧率视频保持一致时间窗
+            kwargs["window_size"] = max(3, int(round(fps * self.window_seconds)))
+        if self.stationary_seconds is not None:
+            kwargs["stationary_min_frames"] = max(1, int(round(fps * self.stationary_seconds)))
+        self.speed_estimator = SpeedEstimator(**kwargs)
 
     def process_video(
         self,
@@ -114,9 +131,7 @@ class ConflictPerceptionPipeline:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         video_clock = VideoClock(fps=fps)
-        if self.window_seconds is not None:
-            # 以秒表达的测速窗口：按实际 FPS 换算帧数，跨帧率视频保持一致时间窗
-            self.speed_estimator.window_size = max(3, int(round(fps * self.window_seconds)))
+        self._configure_speed_estimator(fps)
         session = TrackingSession(
             source=str(src),
             weights=self.weights,
@@ -214,12 +229,13 @@ class ConflictPerceptionPipeline:
                 # 区外轨迹的滤波器状态一并清除，重回区内时重新预热
                 try:
                     live_ids = session.retained_ids()
-                except Exception:
-                    # Ultralytics 内部 tracker 池结构变化时退回本帧可见 ID
-                    live_ids = {t.track_id for t in frame_record.tracks if t.track_id is not None}
-                    if not self._retained_ids_warned:
-                        print("[!] 警告: retained_ids 不可用，退化为按本帧可见轨迹剪枝")
-                        self._retained_ids_warned = True
+                except Exception as exc:
+                    # 内部结构变化说明 Ultralytics 版本不兼容；预警系统宁可终止
+                    # 也不静默降级为"按本帧可见 ID 剪枝"而恢复遮挡闪断问题
+                    raise RuntimeError(
+                        "无法读取跟踪器存活池 (tracked/lost stracks)，"
+                        "当前 Ultralytics 版本接口不兼容；请固定 ultralytics==8.4.142 或更新适配"
+                    ) from exc
                 live_ids -= out_of_zone_ids
                 self.speed_estimator.prune_stale_tracks(live_ids)
 
