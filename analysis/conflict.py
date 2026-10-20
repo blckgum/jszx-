@@ -195,7 +195,9 @@ class ConflictAnalyzer:
 
             if highest_conflict is not None:
                 assessments.append(highest_conflict)
-            elif veh.is_speeding:
+            elif veh.category == "vehicle" and veh.speed_kmh > self.speed_limit_kmh:
+                # 用本分析器自身的限速值重判而非信任 reading.is_speeding：
+                # 独立使用 ConflictAnalyzer 时两侧限速参数可能不一致
                 # 独立超速判定分支：车辆超速 30 km/h，但前方暂无相交行人
                 assessments.append(
                     ConflictAssessment(

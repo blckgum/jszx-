@@ -302,6 +302,16 @@ class TestSpeedEstimator(unittest.TestCase):
         est.update(1, "vehicle", 1.1, 3.0, 1.5)
         self.assertEqual(len(est.tracks[1].history), 2)
 
+    def test_invalid_observation_skips_category_hysteresis(self):
+        # 无效观测（NaN 坐标/时间戳）不写历史，同样不得推进类别确认计数
+        est = SpeedEstimator(category_confirm_frames=2)
+        est.update(1, "person", 1.0, 3.0, 0.0)
+        est.update(1, "vehicle", math.nan, math.nan, math.nan)
+        est.update(1, "vehicle", 1.1, 3.0, 0.5)
+        self.assertEqual(est.tracks[1].category, "person")  # 仅 1 次有效 vehicle
+        est.update(1, "vehicle", 1.2, 3.0, 1.0)
+        self.assertEqual(est.tracks[1].category, "vehicle")  # 连续 2 次才确认
+
     def test_invalid_reliable_span_rejected(self):
         with self.assertRaises(ValueError):
             SpeedEstimator(reliable_min_span_s=-0.1)
@@ -395,6 +405,27 @@ class TestConflictAnalyzer(unittest.TestCase):
         self.assertIsNotNone(assessment.conflict_ground_xy)
         self.assertAlmostEqual(assessment.conflict_ground_xy[0], 3.0, delta=0.1)
         self.assertAlmostEqual(assessment.conflict_ground_xy[1], 10.0, delta=0.1)
+
+    def test_analyzer_uses_own_speed_limit(self):
+        # analyzer 用自身 speed_limit_kmh 重判而非信任 reading.is_speeding：
+        # 独立使用且两侧限速不一致时，以 analyzer 契约为准
+        analyzer = ConflictAnalyzer(speed_limit_kmh=20.0)
+        r = SpeedReading(
+            track_id=1,
+            category="vehicle",
+            x_m=10.0,
+            y_m=10.0,
+            vx_ms=7.0,
+            vy_ms=0.0,
+            speed_ms=7.0,
+            speed_kmh=25.0,
+            is_speeding=False,  # 读数按 30 km/h 限速判定，与本 analyzer 不一致
+            heading_deg=0.0,
+            is_reliable=True,
+        )
+        assessments = analyzer.analyze_frame([r])
+        self.assertEqual(len(assessments), 1)
+        self.assertEqual(assessments[0].risk_level, RiskLevel.LEVEL_1_SPEEDING)
 
     def test_caution_warning_when_ttc_moderate(self):
         # 场景：机动车 (3, 0), vy=6 m/s (21.6 km/h)
@@ -1302,6 +1333,14 @@ class TestPipelineIO(unittest.TestCase):
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["end_reason"], "exception")
             self.assertEqual(events[0]["kind"], "speeding")
+            # 异常路径同样落盘 summary：仅凭输出目录即可分辨失败原因与进度
+            summary = jsonlib.loads(
+                (Path(d) / "out/summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["stop_reason"], "exception")
+            self.assertEqual(summary["frames_processed"], 6)
+            self.assertIn("RuntimeError", summary["error"])
 
     def test_open_event_survives_keyboard_interrupt(self):
         import json as jsonlib
@@ -1320,6 +1359,11 @@ class TestPipelineIO(unittest.TestCase):
             ]
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["end_reason"], "interrupt")
+            summary = jsonlib.loads(
+                (Path(d) / "out/summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["status"], "interrupted")
+            self.assertEqual(summary["stop_reason"], "interrupt")
 
     def test_max_frames_cutoff_reason(self):
         # 人为截断不得标成 eof：事件结束原因记 max_frames
@@ -1436,6 +1480,47 @@ class TestPipelineIO(unittest.TestCase):
                 pipe.process_video("v.mp4", Path(d) / "out")
             fake_cap.release.assert_called_once()
             fake_writer.release.assert_called_once()
+
+    def test_csv_header_failure_releases_resources(self):
+        # 表头写入（文件打开之后）磁盘失败同样触发完整释放
+        import cv2
+        from unittest import mock
+
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        with tempfile.TemporaryDirectory() as d:
+            fake_cap = mock.Mock()
+            fake_cap.isOpened.return_value = True
+            fake_cap.get.side_effect = lambda prop: {
+                cv2.CAP_PROP_FPS: 25.0,
+                cv2.CAP_PROP_FRAME_WIDTH: 64.0,
+                cv2.CAP_PROP_FRAME_HEIGHT: 64.0,
+            }.get(prop, 0.0)
+            fake_writer = mock.Mock()
+            fake_writer.isOpened.return_value = True
+            fake_csv = mock.MagicMock()
+            fake_csv.__enter__.return_value = fake_csv
+            fake_csv.write.side_effect = IOError("磁盘已满")
+            real_open = open
+
+            def selective_open(path, *a, **k):
+                if str(path).endswith("speeds.csv"):
+                    return fake_csv
+                return real_open(path, *a, **k)
+
+            calib = RoadCalibrator(
+                [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+            )
+            pipe = ConflictPerceptionPipeline(calibrator=calib)
+            with mock.patch("analysis.pipeline.cv2.VideoCapture", return_value=fake_cap), \
+                 mock.patch("analysis.pipeline.cv2.VideoWriter", return_value=fake_writer), \
+                 mock.patch("analysis.pipeline.TrackingSession"), \
+                 mock.patch("builtins.open", side_effect=selective_open), \
+                 self.assertRaises(IOError):
+                pipe.process_video("v.mp4", Path(d) / "out")
+            fake_cap.release.assert_called_once()
+            fake_writer.release.assert_called_once()
+            fake_csv.__exit__.assert_called_once()
 
     def test_parked_defaults_resolve_to_seconds(self):
         # 默认静止确认 = 3.0s 秒级（8 帧 @25fps 仅 0.32s 会把临时停车误豁免）；

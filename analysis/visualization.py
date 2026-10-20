@@ -104,16 +104,17 @@ class EnhancedConflictVisualizer:
         """在目标检测框上方绘制测速与状态徽章"""
         x1, y1, x2, y2 = map(int, box_xyxy)
 
-        # 确定框体与文字颜色
+        # 确认与未确认告警视觉语义区分：已确认 "!"+E#n，未确认瞬时量 "?"
+        mark = "!" if event_id is not None else "?"
         if conflict and conflict.risk_level == RiskLevel.LEVEL_3_CRITICAL:
             color = self.COLOR_CRITICAL
-            label = f"ID:{reading.track_id} {reading.category.upper()} | {reading.speed_kmh:.1f} km/h [COLLISION ALERT!]"
+            label = f"ID:{reading.track_id} {reading.category.upper()} | {reading.speed_kmh:.1f} km/h [COLLISION ALERT{mark}]"
         elif conflict and conflict.risk_level == RiskLevel.LEVEL_2_CAUTION:
             color = self.COLOR_CAUTION
-            label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h [CAUTION]"
+            label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h [CAUTION{mark}]"
         elif reading.is_speeding:
             color = self.COLOR_SPEEDING
-            label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h [SPEEDING!]"
+            label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h [SPEEDING{mark}]"
         else:
             color = self.COLOR_SAFE
             label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h"

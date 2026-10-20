@@ -275,17 +275,17 @@ class SpeedEstimator:
             )
         else:
             tracker = self.tracks[track_id]
-            # 前置单调性检查：让被拒绝的观测不污染类别滞回计数；
-            # 非有限时间戳豁免（走 tracker 内部早退路径，不写历史）
-            if (
-                math.isfinite(timestamp_s)
-                and tracker._last_timestamp_s is not None
-                and timestamp_s <= tracker._last_timestamp_s
-            ):
-                raise ValueError("timestamp_s 必须逐帧严格递增")
-            # 跟踪 ID 沿用期间检测类别可能被纠正（如 person -> car），
-            # 但每帧观测可能抖动，需连续确认后才切换类别
-            tracker.observe_category(category, self.category_confirm_frames)
+            # 无效观测（非有限时间戳/坐标）在 tracker 内会早退不写历史，
+            # 此处同样不得推进类别滞回计数——拒绝与忽略都必须无副作用
+            if math.isfinite(timestamp_s) and math.isfinite(x_m) and math.isfinite(y_m):
+                if (
+                    tracker._last_timestamp_s is not None
+                    and timestamp_s <= tracker._last_timestamp_s
+                ):
+                    raise ValueError("timestamp_s 必须逐帧严格递增")
+                # 跟踪 ID 沿用期间检测类别可能被纠正（如 person -> car），
+                # 但每帧观测可能抖动，需连续确认后才切换类别
+                tracker.observe_category(category, self.category_confirm_frames)
         return self.tracks[track_id].update(timestamp_s, x_m, y_m)
 
     def prune_stale_tracks(self, live_track_ids: set[int]):

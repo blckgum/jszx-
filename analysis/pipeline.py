@@ -217,16 +217,18 @@ class ConflictPerceptionPipeline:
             jsonl_file = resources.enter_context(open(jsonl_path, "w", encoding="utf-8"))
             events_file = resources.enter_context(open(events_path, "w", encoding="utf-8"))
             csv_file = resources.enter_context(open(csv_path, "w", encoding="utf-8", newline=""))
+
+            # 表头写入也在保护范围内：此刻磁盘失败不能跳过资源释放
+            csv_writer = csv.writer(csv_file)
+            csv_writer.writerow([
+                "frame_idx", "timestamp_s", "track_id", "category",
+                "x_m", "y_m", "speed_kmh", "is_speeding", "risk_level", "ttc_s",
+                "event_id", "is_reliable", "is_stationary"
+            ])
         except BaseException:
             # 初始化任何一步失败：释放已登记的 cap/writer/已开文件
             resources.close()
             raise
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow([
-            "frame_idx", "timestamp_s", "track_id", "category",
-            "x_m", "y_m", "speed_kmh", "is_speeding", "risk_level", "ttc_s",
-            "event_id", "is_reliable", "is_stationary"
-        ])
 
         total_critical_events = 0
         total_caution_events = 0
@@ -256,6 +258,7 @@ class ConflictPerceptionPipeline:
         print("=" * 60)
 
         loop_state = "eof"
+        loop_error = ""
         try:
             while True:
                 if max_frames is not None and frame_idx >= max_frames:
@@ -405,9 +408,11 @@ class ConflictPerceptionPipeline:
 
         except KeyboardInterrupt:
             loop_state = "interrupt"
+            loop_error = "KeyboardInterrupt"
             raise
-        except BaseException:
+        except BaseException as exc:
             loop_state = "exception"
+            loop_error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
             # 无论正常结束还是异常退出，都尽力归档未决事件；
@@ -419,6 +424,24 @@ class ConflictPerceptionPipeline:
                 pass
             # 统一释放 ExitStack 登记的 cap/writer/三个输出文件
             resources.close()
+            # 异常退出同样落一份 summary：下游仅凭输出目录即可分辨
+            # "处理了多少帧/何种失败/输出是否完整"，不必回放日志
+            if loop_state in ("interrupt", "exception"):
+                try:
+                    (out_dir / "summary.json").write_text(
+                        json.dumps({
+                            "status": "interrupted" if loop_state == "interrupt" else "failed",
+                            "stop_reason": loop_state,
+                            "error": loop_error,
+                            "frames_processed": frame_idx,
+                            "elapsed_s": round(time.time() - t_start, 2),
+                            "max_observed_speed_kmh": round(max_observed_speed_kmh, 1),
+                            "events_jsonl": str(events_path.resolve()),
+                        }, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
             if show_window:
                 cv2.destroyAllWindows()
 
@@ -426,6 +449,9 @@ class ConflictPerceptionPipeline:
         proc_fps = frame_idx / elapsed if elapsed > 0 else 0
 
         summary = {
+            "status": "ok",
+            # eof / max_frames / user_quit：与异常路径中止摘要同契约
+            "stop_reason": loop_state,
             "source_video": str(src),
             "annotated_output": str(out_video_path),
             "conflicts_jsonl": str(jsonl_path),
