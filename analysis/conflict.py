@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .speed import SpeedReading
 
@@ -40,6 +40,27 @@ class ConflictAssessment:
     conflict_ground_xy: Optional[Tuple[float, float]]  # 预测冲突点地面坐标 (米)
 
 
+def _conflict_sort_key(c: ConflictAssessment):
+    """冲突项比较键：先按风险等级，同等级按 TTC 越小越紧急"""
+    return (int(c.risk_level), -(c.ttc_seconds or 999.0))
+
+
+def build_conflict_maps(
+    conflicts: List[ConflictAssessment],
+) -> Tuple[Dict[int, ConflictAssessment], Dict[int, ConflictAssessment]]:
+    """构建车辆侧与行人侧的 track_id -> 最高风险冲突映射；
+    同一行人被多车关联时保留最高 risk_level、同级取最小 TTC"""
+    veh_map = {c.veh_track_id: c for c in conflicts}
+    ped_map: Dict[int, ConflictAssessment] = {}
+    for c in conflicts:
+        if c.ped_track_id is None:
+            continue
+        cur = ped_map.get(c.ped_track_id)
+        if cur is None or _conflict_sort_key(c) > _conflict_sort_key(cur):
+            ped_map[c.ped_track_id] = c
+    return veh_map, ped_map
+
+
 class ConflictAnalyzer:
     """车辆—行人时空交互冲突研判与 TTC 决策核心"""
 
@@ -51,14 +72,18 @@ class ConflictAnalyzer:
         ttc_critical_s: float = 1.8,
         ttc_caution_s: float = 3.5,
         horizon_s: float = 3.5,
-        parked_speed_ms: float = 0.5,
     ):
+        if speed_limit_kmh <= 0:
+            raise ValueError("speed_limit_kmh 必须为正数")
+        if safe_radius_veh_m <= 0 or safe_radius_ped_m <= 0:
+            raise ValueError("安全半径必须为正数")
+        if not (0 < ttc_critical_s <= ttc_caution_s <= horizon_s):
+            raise ValueError("TTC 阈值需满足 0 < ttc_critical <= ttc_caution <= horizon")
         self.speed_limit_kmh = speed_limit_kmh
         self.critical_dist_m = safe_radius_veh_m + safe_radius_ped_m  # 3.0 米
         self.ttc_critical_s = ttc_critical_s
         self.ttc_caution_s = ttc_caution_s
         self.horizon_s = horizon_s
-        self.parked_speed_ms = parked_speed_ms
 
     def evaluate_pair(
         self, veh: SpeedReading, ped: SpeedReading
@@ -72,10 +97,10 @@ class ConflictAnalyzer:
         if current_dist > 35.0:
             return None
 
-        # 速度估计已收敛且近乎静止的车辆视为泊车/停靠状态：行人走近停靠
-        # 车辆不构成交通冲突，否则 CVM 外推会对路边停靠目标持续误报；
-        # 未收敛的车辆不豁免，按当前估计保守参与研判
-        if veh.is_reliable and veh.speed_ms < self.parked_speed_ms:
+        # 持续静止的车辆（泊车/停靠，由速度滤波器多帧确认）不参与碰撞研判：
+        # 行人走近停靠车辆不构成交通冲突，否则 CVM 外推会对路边停靠目标
+        # 持续误报；缓慢蠕行或速度未收敛的车辆不满足该条件，仍正常评估
+        if veh.is_stationary:
             return None
 
         # 相对速度矢量：v_rel = v_ped - v_veh

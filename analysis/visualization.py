@@ -17,8 +17,19 @@ import cv2
 import numpy as np
 
 from .calibration import RoadCalibrator
-from .conflict import ConflictAssessment, RiskLevel
+from .conflict import ConflictAssessment, RiskLevel, build_conflict_maps
 from .speed import SpeedReading
+
+
+def trajectory_color(conflict: Optional[ConflictAssessment]) -> Tuple[int, int, int]:
+    """按冲突等级给预测轨迹配色：L3 红 / L2 橙 / 其他绿 (BGR)"""
+    if conflict is None:
+        return (0, 255, 0)
+    if conflict.risk_level == RiskLevel.LEVEL_3_CRITICAL:
+        return (0, 0, 255)
+    if conflict.risk_level == RiskLevel.LEVEL_2_CAUTION:
+        return (0, 140, 255)
+    return (0, 255, 0)
 
 
 class EnhancedConflictVisualizer:
@@ -227,17 +238,11 @@ class EnhancedConflictVisualizer:
             reading_map = {r.track_id: r for r in speed_readings}
             readings_list = speed_readings
 
-        conflict_map = {c.veh_track_id: c for c in conflicts}
-        ped_conflict_map = {c.ped_track_id: c for c in conflicts if c.ped_track_id is not None}
+        conflict_map, ped_conflict_map = build_conflict_maps(conflicts)
 
         for r in readings_list:
             c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
-            color = (
-                self.COLOR_CRITICAL
-                if (c and c.risk_level == RiskLevel.LEVEL_3_CRITICAL)
-                else self.COLOR_SAFE
-            )
-            self.draw_future_trajectory(render_frame, r, color=color)
+            self.draw_future_trajectory(render_frame, r, color=trajectory_color(c))
 
         for t in tracks:
             tid = getattr(t, "track_id", None)

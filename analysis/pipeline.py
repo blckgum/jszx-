@@ -22,9 +22,14 @@ import cv2
 from detection.core import DEFAULT_WEIGHTS
 from tracking.core import DEFAULT_TRACKER, TrackingSession, VideoClock
 from .calibration import RoadCalibrator
-from .conflict import ConflictAnalyzer, ConflictAssessment, RiskLevel
+from .conflict import (
+    ConflictAnalyzer,
+    ConflictAssessment,
+    RiskLevel,
+    build_conflict_maps,
+)
 from .speed import SpeedEstimator, SpeedReading
-from .visualization import EnhancedConflictVisualizer
+from .visualization import EnhancedConflictVisualizer, trajectory_color
 
 
 class ConflictPerceptionPipeline:
@@ -42,12 +47,24 @@ class ConflictPerceptionPipeline:
         imgsz: int = 640,
         ema_alpha: float = 0.35,
         window_size: int = 8,
+        window_seconds: Optional[float] = None,
         zone_margin_m: float = 2.0,
         ttc_critical_s: float = 1.8,
         ttc_caution_s: float = 3.5,
         horizon_s: float = 3.5,
-        parked_speed_ms: float = 0.5,
+        stationary_speed_ms: float = 0.1,
+        stationary_min_frames: int = 8,
+        category_confirm_frames: int = 3,
     ):
+        if not (0 < iou <= 1):
+            raise ValueError("iou 必须在 (0, 1] 区间")
+        if type(imgsz) is not int or imgsz <= 0:
+            raise ValueError("imgsz 必须是正整数")
+        if zone_margin_m < 0:
+            raise ValueError("zone_margin_m 不能为负数")
+        if window_seconds is not None and window_seconds <= 0:
+            raise ValueError("window_seconds 必须为正数")
+
         self.calibrator = calibrator
         self.weights = weights
         self.tracker_config = tracker_config
@@ -57,20 +74,24 @@ class ConflictPerceptionPipeline:
         self.iou = iou
         self.imgsz = imgsz
         self.zone_margin_m = zone_margin_m
+        self.window_seconds = window_seconds
 
         self.speed_estimator = SpeedEstimator(
             speed_limit_kmh=speed_limit_kmh,
             window_size=window_size,
             ema_alpha=ema_alpha,
+            stationary_speed_ms=stationary_speed_ms,
+            stationary_min_frames=stationary_min_frames,
+            category_confirm_frames=category_confirm_frames,
         )
         self.conflict_analyzer = ConflictAnalyzer(
             speed_limit_kmh=speed_limit_kmh,
             ttc_critical_s=ttc_critical_s,
             ttc_caution_s=ttc_caution_s,
             horizon_s=horizon_s,
-            parked_speed_ms=parked_speed_ms,
         )
         self.visualizer = EnhancedConflictVisualizer(calibrator=calibrator)
+        self._retained_ids_warned = False
 
     def process_video(
         self,
@@ -93,6 +114,9 @@ class ConflictPerceptionPipeline:
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         video_clock = VideoClock(fps=fps)
+        if self.window_seconds is not None:
+            # 以秒表达的测速窗口：按实际 FPS 换算帧数，跨帧率视频保持一致时间窗
+            self.speed_estimator.window_size = max(3, int(round(fps * self.window_seconds)))
         session = TrackingSession(
             source=str(src),
             weights=self.weights,
@@ -152,6 +176,7 @@ class ConflictPerceptionPipeline:
                 frame_record = session.process(frame, timestamp_s, time_kind)
                 speed_readings: List[SpeedReading] = []
                 reading_map: Dict[int, SpeedReading] = {}
+                out_of_zone_ids = set()
 
                 # 2. 空间坐标单应性变换与平滑测速
                 for t in frame_record.tracks:
@@ -165,6 +190,12 @@ class ConflictPerceptionPipeline:
                         # 地平线附近退化投影点：不产生读数，防止 NaN 污染速度历史
                         continue
 
+                    # 标定四边形以外的坐标是外推伪影：先于滤波器更新就门控，
+                    # 不进入速度历史，也不参与冲突研判与速度统计
+                    if not self.calibrator.is_in_zone(x_m, y_m, margin_m=self.zone_margin_m):
+                        out_of_zone_ids.add(t.track_id)
+                        continue
+
                     reading = self.speed_estimator.update(
                         track_id=t.track_id,
                         category=t.category,
@@ -173,25 +204,28 @@ class ConflictPerceptionPipeline:
                         y_m=y_m,
                     )
                     reading_map[t.track_id] = reading
-
-                    # 标定四边形以外的坐标经外推已失真，不参与冲突研判与速度统计
-                    if not self.calibrator.is_in_zone(x_m, y_m, margin_m=self.zone_margin_m):
-                        continue
                     speed_readings.append(reading)
 
                     if reading.speed_kmh > max_observed_speed_kmh:
                         max_observed_speed_kmh = reading.speed_kmh
 
                 # ByteTrack 的 lost 池仍可能找回目标并沿用原 ID，按跟踪器存活集
-                # 剪枝而非仅按本帧可见 ID，避免短暂遮挡导致速度滤波器重置
-                self.speed_estimator.prune_stale_tracks(session.retained_ids())
+                # 剪枝而非仅按本帧可见 ID，避免短暂遮挡导致速度滤波器重置；
+                # 区外轨迹的滤波器状态一并清除，重回区内时重新预热
+                try:
+                    live_ids = session.retained_ids()
+                except Exception:
+                    # Ultralytics 内部 tracker 池结构变化时退回本帧可见 ID
+                    live_ids = {t.track_id for t in frame_record.tracks if t.track_id is not None}
+                    if not self._retained_ids_warned:
+                        print("[!] 警告: retained_ids 不可用，退化为按本帧可见轨迹剪枝")
+                        self._retained_ids_warned = True
+                live_ids -= out_of_zone_ids
+                self.speed_estimator.prune_stale_tracks(live_ids)
 
                 # 3. 车辆与行人轨迹外推预测与 TTC 碰撞研判
                 conflicts = self.conflict_analyzer.analyze_frame(speed_readings)
-                conflict_map: Dict[int, ConflictAssessment] = {c.veh_track_id: c for c in conflicts}
-                ped_conflict_map: Dict[int, ConflictAssessment] = {
-                    c.ped_track_id: c for c in conflicts if c.ped_track_id is not None
-                }
+                conflict_map, ped_conflict_map = build_conflict_maps(conflicts)
 
                 # 4. 统计与持久化记录
                 for c in conflicts:
@@ -224,14 +258,11 @@ class ConflictPerceptionPipeline:
                 self.visualizer.draw_calibrated_ground_zone(render_frame)
 
                 for r in speed_readings:
-                    # 绘制预测轨迹虚线；冲突对中的行人同样标红
+                    # 绘制预测轨迹虚线；冲突对中的行人同样按风险等级着色
                     c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
-                    traj_color = (
-                        (0, 0, 255)
-                        if (c and c.risk_level == RiskLevel.LEVEL_3_CRITICAL)
-                        else (0, 255, 0)
+                    self.visualizer.draw_future_trajectory(
+                        render_frame, r, color=trajectory_color(c)
                     )
-                    self.visualizer.draw_future_trajectory(render_frame, r, color=traj_color)
 
                 for t in frame_record.tracks:
                     if t.track_id is None:

@@ -151,6 +151,8 @@ class TestSpeedEstimator(unittest.TestCase):
 
         r_nan = estimator.update(1, "vehicle", 0.4, float("nan"), float("nan"))
         self.assertFalse(r_nan.is_reliable)
+        # 无效观测回填最后有效位置而非暴露 NaN
+        self.assertEqual((r_nan.x_m, r_nan.y_m), (3.0, 1.5))
 
         final = None
         for i in range(5, 14):
@@ -158,6 +160,57 @@ class TestSpeedEstimator(unittest.TestCase):
 
         self.assertTrue(math.isfinite(final.speed_kmh))
         self.assertAlmostEqual(final.speed_ms, 5.0, delta=0.5)
+
+    def test_nan_timestamp_rejected_without_corruption(self):
+        estimator = SpeedEstimator()
+        estimator.update(1, "vehicle", 0.0, 3.0, 0.0)
+        estimator.update(1, "vehicle", 0.1, 3.0, 0.5)
+        r = estimator.update(1, "vehicle", float("nan"), 3.0, 1.0)
+        self.assertFalse(r.is_reliable)
+        self.assertEqual(len(estimator.tracks[1].history), 2)
+
+    def test_stationary_streak_requires_sustained_low_speed(self):
+        # 真实滤波器路径：静止目标需连续 parked-frames 帧后才标记 is_stationary
+        estimator = SpeedEstimator(stationary_min_frames=5)
+        readings = [
+            estimator.update(1, "vehicle", i * 0.1, 3.0, 5.0) for i in range(10)
+        ]
+        self.assertFalse(readings[5].is_stationary)   # 尚未连续 5 帧
+        self.assertTrue(readings[-1].is_stationary)
+
+    def test_slow_crawling_vehicle_never_marked_stationary(self):
+        # 0.4 m/s 蠕行车辆：速度超过静止阈值，永不被豁免
+        estimator = SpeedEstimator(stationary_min_frames=5)
+        final = None
+        for i in range(12):
+            final = estimator.update(1, "vehicle", i * 0.1, 3.0, i * 0.04)
+        self.assertTrue(final.is_reliable)
+        self.assertFalse(final.is_stationary)
+        self.assertGreater(final.speed_ms, 0.1)
+
+    def test_category_hysteresis_suppresses_flicker(self):
+        est = SpeedEstimator(category_confirm_frames=3)
+        est.update(1, "pedestrian", 0.0, 0.0, 0.0)
+        est.update(1, "vehicle", 0.1, 0.0, 0.1)
+        est.update(1, "pedestrian", 0.2, 0.0, 0.2)   # 抵消 pending
+        est.update(1, "vehicle", 0.3, 0.0, 0.3)      # pending 1
+        self.assertEqual(est.tracks[1].category, "pedestrian")  # 未满 3 帧不切换
+
+        est.update(1, "vehicle", 0.4, 0.0, 0.4)      # pending 2
+        r = est.update(1, "vehicle", 0.5, 0.0, 0.5)  # pending 3 -> 确认
+        self.assertEqual(r.category, "vehicle")
+
+    def test_invalid_estimator_params_rejected(self):
+        with self.assertRaises(ValueError):
+            SpeedEstimator(ema_alpha=0.0)
+        with self.assertRaises(ValueError):
+            SpeedEstimator(ema_alpha=1.5)
+        with self.assertRaises(ValueError):
+            SpeedEstimator(window_size=2)
+        with self.assertRaises(ValueError):
+            SpeedEstimator(speed_limit_kmh=-1.0)
+        with self.assertRaises(ValueError):
+            SpeedEstimator(category_confirm_frames=0)
 
     def test_reclassified_vehicle_can_be_flagged_speeding(self):
         # ByteTrack ID 首次观测被误检为 person，纠正为 vehicle 后应能判超速
@@ -317,7 +370,7 @@ class TestConflictAnalyzer(unittest.TestCase):
         self.assertEqual(assessments[0].risk_level, RiskLevel.LEVEL_1_SPEEDING)
 
     def test_stationary_vehicle_exempt_from_conflict(self):
-        # 已收敛的静止车辆（泊车/停靠）：行人走近不构成交通冲突
+        # 持续静止的泊车/停靠车辆（is_stationary=True）：行人走近不构成交通冲突
         parked = SpeedReading(
             track_id=1,
             category="vehicle",
@@ -330,6 +383,7 @@ class TestConflictAnalyzer(unittest.TestCase):
             is_speeding=False,
             heading_deg=0.0,
             is_reliable=True,
+            is_stationary=True,
         )
         ped = SpeedReading(
             track_id=2,
@@ -345,6 +399,78 @@ class TestConflictAnalyzer(unittest.TestCase):
             is_reliable=True,
         )
         self.assertIsNone(self.analyzer.evaluate_pair(parked, ped))
+
+    def test_slow_crawling_vehicle_not_exempt(self):
+        # 0.4 m/s 蠕行车辆（is_stationary=False）必须参与碰撞研判，不得漏报
+        crawler = SpeedReading(
+            track_id=1,
+            category="vehicle",
+            x_m=3.0,
+            y_m=0.0,
+            vx_ms=0.4,
+            vy_ms=0.0,
+            speed_ms=0.4,
+            speed_kmh=1.44,
+            is_speeding=False,
+            heading_deg=0.0,
+            is_reliable=True,
+            is_stationary=False,
+        )
+        ped = SpeedReading(
+            track_id=2,
+            category="pedestrian",
+            x_m=6.0,
+            y_m=0.0,
+            vx_ms=-2.0,
+            vy_ms=0.0,
+            speed_ms=2.0,
+            speed_kmh=7.2,
+            is_speeding=False,
+            heading_deg=180.0,
+            is_reliable=True,
+        )
+        assessment = self.analyzer.evaluate_pair(crawler, ped)
+        self.assertIsNotNone(assessment)
+        self.assertEqual(assessment.risk_level, RiskLevel.LEVEL_3_CRITICAL)
+
+    def test_invalid_analyzer_params_rejected(self):
+        with self.assertRaises(ValueError):
+            ConflictAnalyzer(ttc_critical_s=3.5, ttc_caution_s=1.8)
+        with self.assertRaises(ValueError):
+            ConflictAnalyzer(ttc_caution_s=4.0, horizon_s=3.0)
+        with self.assertRaises(ValueError):
+            ConflictAnalyzer(speed_limit_kmh=0.0)
+
+    def test_ped_conflict_map_picks_highest_risk(self):
+        # 同一行人被两车关联：行人侧映射保留最高风险项，同级取最小 TTC
+        from analysis.conflict import build_conflict_maps
+
+        def mk(veh_id, ped_id, level, ttc):
+            return ConflictAssessment(
+                veh_track_id=veh_id,
+                ped_track_id=ped_id,
+                risk_level=level,
+                risk_desc="x",
+                veh_speed_kmh=20.0,
+                ped_speed_ms=1.0,
+                current_distance_m=5.0,
+                min_distance_m=1.0,
+                ttc_seconds=ttc,
+                conflict_ground_xy=(1.0, 2.0),
+            )
+
+        c_caution = mk(1, 9, RiskLevel.LEVEL_2_CAUTION, 2.5)
+        c_critical = mk(2, 9, RiskLevel.LEVEL_3_CRITICAL, 1.0)
+        veh_map, ped_map = build_conflict_maps([c_caution, c_critical])
+        self.assertIs(ped_map[9], c_critical)
+        self.assertIs(veh_map[1], c_caution)
+        self.assertIs(veh_map[2], c_critical)
+
+        # 同级冲突取更小 TTC
+        c_far = mk(1, 9, RiskLevel.LEVEL_2_CAUTION, 3.0)
+        c_near = mk(2, 9, RiskLevel.LEVEL_2_CAUTION, 2.0)
+        _, ped_map2 = build_conflict_maps([c_far, c_near])
+        self.assertIs(ped_map2[9], c_near)
 
     def test_unreliable_stationary_vehicle_still_evaluated(self):
         # 速度未收敛的车辆不做静止豁免，保留保守预警
@@ -448,6 +574,46 @@ class TestVisualization(unittest.TestCase):
         visualizer.draw_speed_badge(annotated, (10, 10, 50, 50), readings[1], assessments[0])
         visualizer.draw_hud_banner(annotated, assessments)
 
+
+class TestPipelineIO(unittest.TestCase):
+    def test_video_writer_failure_raises(self):
+        import cv2
+        import numpy as np
+        from unittest import mock
+
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        with tempfile.TemporaryDirectory() as d:
+            vpath = Path(d) / "v.mp4"
+            w = cv2.VideoWriter(str(vpath), cv2.VideoWriter_fourcc(*"mp4v"), 25.0, (64, 64))
+            self.assertTrue(w.isOpened())
+            for _ in range(3):
+                w.write(np.zeros((64, 64, 3), np.uint8))
+            w.release()
+
+            calib = RoadCalibrator(
+                [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+            )
+            pipeline = ConflictPerceptionPipeline(calibrator=calib)
+            with mock.patch("analysis.pipeline.cv2.VideoWriter") as m_writer:
+                m_writer.return_value.isOpened.return_value = False
+                with self.assertRaises(RuntimeError):
+                    pipeline.process_video(vpath, Path(d) / "out")
+
+    def test_cli_rejects_invalid_numeric_args(self):
+        from analysis.__main__ import main
+
+        for bad_args in (
+            ["--ema-alpha", "0"],
+            ["--ema-alpha", "1.5"],
+            ["--window", "1"],
+            ["--window-s", "0"],
+            ["--ttc-critical", "3.5", "--ttc-caution", "1.8"],
+            ["--parked-speed", "0"],
+            ["--parked-frames", "0"],
+        ):
+            with self.assertRaises(SystemExit, msg=bad_args):
+                main(["--source", "x.mp4", *bad_args])
 
 
 if __name__ == "__main__":

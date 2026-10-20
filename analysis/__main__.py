@@ -81,6 +81,12 @@ def main(argv: list[str] | None = None):
         help="测速滑窗帧数，默认 8",
     )
     parser.add_argument(
+        "--window-s",
+        type=float,
+        default=None,
+        help="测速滑窗时长 (秒)，按视频 FPS 自动换算帧数；设置后覆盖 --window",
+    )
+    parser.add_argument(
         "--ttc-critical",
         type=float,
         default=1.8,
@@ -99,16 +105,51 @@ def main(argv: list[str] | None = None):
         help="轨迹外推预测视界 (秒)，默认 3.5",
     )
     parser.add_argument(
+        "--parked-speed",
+        type=float,
+        default=0.1,
+        help="判定持续静止/泊车的速度阈值 (m/s)，默认 0.1",
+    )
+    parser.add_argument(
+        "--parked-frames",
+        type=int,
+        default=8,
+        help="连续多少帧低于 --parked-speed 判定为静止车辆，默认 8",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="标定文件缺失时允许使用合成占位标定（仅演示，测速结果不可信）",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="是否开启本地桌面实时播放窗口",
     )
     args = parser.parse_args(argv)
 
+    if not (0 < args.ema_alpha <= 1):
+        parser.error("--ema-alpha 必须在 (0, 1] 区间")
+    if args.window < 3:
+        parser.error("--window 必须是 >= 3 的整数")
+    if args.window_s is not None and args.window_s <= 0:
+        parser.error("--window-s 必须为正数")
+    if not (0 < args.ttc_critical <= args.ttc_caution <= args.horizon):
+        parser.error("TTC 阈值需满足 0 < --ttc-critical <= --ttc-caution <= --horizon")
+    if args.parked_speed <= 0:
+        parser.error("--parked-speed 必须为正数")
+    if args.parked_frames < 1:
+        parser.error("--parked-frames 必须是 >= 1 的整数")
+
     calib_path = Path(args.calib).expanduser().resolve()
     if not calib_path.exists():
-        # 若默认配置不存在，自动生成一个标准校园参考标定配置；
-        # 该参数为占位合成值，真实测速前必须用 interactive_calibrator 重新标定
+        if not args.demo:
+            parser.error(
+                f"标定文件 {calib_path} 不存在。"
+                "请先运行 python -m analysis.interactive_calibrator 实测标定，"
+                "或显式加 --demo 使用合成占位标定（仅演示）"
+            )
+        # 合成标定仅供流程演示；其物理测速与 TTC 结果不可信
         print(f"[!] 警告: 标定文件 {calib_path} 不存在，自动生成的合成标定仅供流程演示，")
         print(f"[!] 其物理测速与 TTC 结果不可信！请先用 python -m analysis.interactive_calibrator 实测标定。")
         sample_calib = RoadCalibrator(
@@ -137,9 +178,12 @@ def main(argv: list[str] | None = None):
         conf=args.conf,
         ema_alpha=args.ema_alpha,
         window_size=args.window,
+        window_seconds=args.window_s,
         ttc_critical_s=args.ttc_critical,
         ttc_caution_s=args.ttc_caution,
         horizon_s=args.horizon,
+        stationary_speed_ms=args.parked_speed,
+        stationary_min_frames=args.parked_frames,
     )
 
     summary = pipeline.process_video(
