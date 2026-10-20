@@ -11,6 +11,7 @@ import numpy as np
 
 from analysis.calibration import RoadCalibrator
 from analysis.conflict import ConflictAnalyzer, ConflictAssessment, RiskLevel
+from analysis.events import ConflictEventTracker
 from analysis.speed import SpeedEstimator, SpeedReading, TrackMotionTracker
 from analysis.visualization import EnhancedConflictVisualizer
 
@@ -556,6 +557,183 @@ class TestConflictAnalyzer(unittest.TestCase):
         self.assertEqual(assessments[0].risk_level, RiskLevel.LEVEL_0_SAFE)
 
 
+class TestConflictEventTracker(unittest.TestCase):
+    """告警事件状态机：连续确认、等级滞回、冷却合并"""
+
+    def _mk(self, veh, ped, level, ttc=None, speed=20.0):
+        return ConflictAssessment(
+            veh_track_id=veh,
+            ped_track_id=ped,
+            risk_level=level,
+            risk_desc="x",
+            veh_speed_kmh=speed,
+            ped_speed_ms=1.0 if ped is not None else 0.0,
+            current_distance_m=5.0,
+            min_distance_m=1.0,
+            ttc_seconds=ttc,
+            conflict_ground_xy=(1.0, 2.0) if ped is not None else None,
+        )
+
+    def test_single_frame_flicker_produces_no_event(self):
+        tr = ConflictEventTracker(confirm_frames=3, cooldown_frames=5)
+        ann = tr.update([self._mk(1, 2, RiskLevel.LEVEL_3_CRITICAL, 1.0)], 0, 0.0)
+        self.assertEqual(ann, {})
+        for i in range(1, 8):
+            tr.update([], i, i * 0.1)
+        tr.flush()
+        self.assertEqual(tr.pop_finalized(), [])
+
+    def test_sustained_alert_becomes_single_event(self):
+        tr = ConflictEventTracker(confirm_frames=3, cooldown_frames=5)
+        anns = [
+            tr.update(
+                [self._mk(1, 2, RiskLevel.LEVEL_3_CRITICAL, ttc=1.0, speed=36.0)],
+                i, i * 0.04,
+            )
+            for i in range(10)
+        ]
+        # 前两帧挂起不注解，第 3 帧确认后全程同一 event_id
+        self.assertEqual(anns[0], {})
+        self.assertEqual(anns[1], {})
+        self.assertTrue(all(a == {(1, 2): 1} for a in anns[2:]))
+
+        tr.flush()
+        (ev,) = tr.pop_finalized()
+        self.assertEqual(ev.event_id, 1)
+        self.assertEqual(ev.start_frame, 0)   # 起始帧回溯包含确认前挂起帧
+        self.assertEqual(ev.end_frame, 9)
+        self.assertEqual(ev.alarm_frames, 10)
+        self.assertEqual(ev.gap_frames, 0)
+        self.assertEqual(ev.peak_risk_level, RiskLevel.LEVEL_3_CRITICAL)
+        self.assertEqual(ev.min_ttc_seconds, 1.0)
+        self.assertEqual(ev.max_veh_speed_kmh, 36.0)
+        self.assertEqual(ev.kind, "conflict")
+        self.assertEqual(ev.end_reason, "eof")
+
+    def test_gap_within_cooldown_merges_same_event(self):
+        tr = ConflictEventTracker(confirm_frames=2, cooldown_frames=4)
+        for i in range(5):  # f0-4 告警
+            ann = tr.update(
+                [self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.5)], i, i * 0.1
+            )
+        self.assertEqual(ann, {(1, 2): 1})
+        for i in range(5, 8):  # f5-7 静默 3 帧 <= cooldown=4，不归档
+            tr.update([], i, i * 0.1)
+        self.assertEqual(tr.pop_finalized(), [])
+
+        ann = tr.update([self._mk(1, 2, RiskLevel.LEVEL_3_CRITICAL, 1.0)], 8, 0.8)
+        self.assertEqual(ann, {(1, 2): 1})  # 同一事件延续且峰值升级为 L3
+        tr.flush()
+        (ev,) = tr.pop_finalized()
+        self.assertEqual(ev.end_frame, 8)
+        self.assertEqual(ev.gap_frames, 3)
+        self.assertEqual(ev.alarm_frames, 6)
+        self.assertEqual(ev.peak_risk_level, RiskLevel.LEVEL_3_CRITICAL)
+        self.assertEqual(ev.min_ttc_seconds, 1.0)
+
+    def test_gap_beyond_cooldown_splits_into_two_events(self):
+        tr = ConflictEventTracker(confirm_frames=2, cooldown_frames=2)
+        for i in range(3):
+            tr.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.0)], i, i * 0.1)
+        for i in range(3, 7):  # 静默 4 帧 > cooldown=2 -> 归档
+            tr.update([], i, i * 0.1)
+        (first,) = tr.pop_finalized()
+        self.assertEqual(first.end_reason, "cooldown")
+        self.assertEqual(first.end_frame, 2)
+
+        anns = [
+            tr.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.0)], i, i * 0.1)
+            for i in range(7, 11)
+        ]
+        self.assertEqual(anns[-1], {(1, 2): 2})
+        tr.flush()
+        (second,) = tr.pop_finalized()
+        self.assertEqual(second.event_id, 2)
+        self.assertEqual(second.start_frame, 7)
+
+    def test_level_hysteresis_peak_never_downgrades(self):
+        tr = ConflictEventTracker(confirm_frames=2, cooldown_frames=3)
+        tr.update([self._mk(1, 2, RiskLevel.LEVEL_3_CRITICAL, 1.0)], 0, 0.0)
+        tr.update([self._mk(1, 2, RiskLevel.LEVEL_3_CRITICAL, 1.0)], 1, 0.1)
+        tr.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.5)], 2, 0.2)
+        tr.flush()
+        (ev,) = tr.pop_finalized()
+        self.assertEqual(ev.peak_risk_level, RiskLevel.LEVEL_3_CRITICAL)
+        self.assertEqual(ev.alarm_frames, 3)
+
+    def test_speeding_and_conflict_are_independent_events(self):
+        tr = ConflictEventTracker(confirm_frames=2, cooldown_frames=2)
+        for i in range(4):
+            ann = tr.update(
+                [
+                    self._mk(1, None, RiskLevel.LEVEL_1_SPEEDING, speed=40.0),
+                    self._mk(1, 5, RiskLevel.LEVEL_2_CAUTION, ttc=2.0, speed=40.0),
+                ],
+                i, i * 0.1,
+            )
+        self.assertEqual(ann[(1, None)], 1)
+        self.assertEqual(ann[(1, 5)], 2)
+        tr.flush()
+        evts = sorted(tr.pop_finalized(), key=lambda e: e.event_id)
+        self.assertEqual(len(evts), 2)
+        self.assertEqual(evts[0].kind, "speeding")
+        self.assertIsNone(evts[0].ped_track_id)
+        self.assertEqual(evts[1].kind, "conflict")
+
+    def test_pending_streak_interrupted_resets(self):
+        tr = ConflictEventTracker(confirm_frames=3, cooldown_frames=2)
+        tr.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.0)], 0, 0.0)
+        tr.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.0)], 1, 0.1)
+        tr.update([], 2, 0.2)  # 中断挂起
+        tr.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.0)], 3, 0.3)
+        ann = tr.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.0)], 4, 0.4)
+        self.assertEqual(ann, {})  # 重新累计仅 2 帧，未确认
+        tr.flush()
+        self.assertEqual(tr.pop_finalized(), [])
+
+    def test_safe_assessment_never_alarms(self):
+        tr = ConflictEventTracker()
+        ann = tr.update([self._mk(1, None, RiskLevel.LEVEL_0_SAFE)], 0, 0.0)
+        self.assertEqual(ann, {})
+        tr.flush()
+        self.assertEqual(tr.pop_finalized(), [])
+
+    def test_min_ttc_tracks_worst_case(self):
+        tr = ConflictEventTracker(confirm_frames=2, cooldown_frames=2)
+        tr.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.8)], 0, 0.0)
+        tr.update([self._mk(1, 2, RiskLevel.LEVEL_3_CRITICAL, 1.2)], 1, 0.1)
+        tr.update([self._mk(1, 2, RiskLevel.LEVEL_3_CRITICAL, 0.9)], 2, 0.2)
+        tr.flush()
+        (ev,) = tr.pop_finalized()
+        self.assertAlmostEqual(ev.min_ttc_seconds, 0.9)
+
+    def test_invalid_params_rejected(self):
+        with self.assertRaises(ValueError):
+            ConflictEventTracker(confirm_frames=0)
+        with self.assertRaises(ValueError):
+            ConflictEventTracker(cooldown_frames=-1)
+
+    def test_update_rejects_invalid_frame_args(self):
+        tr = ConflictEventTracker()
+        with self.assertRaises(ValueError):
+            tr.update([], -1, 0.0)
+        with self.assertRaises(ValueError):
+            tr.update([], 0, float("nan"))
+
+    def test_event_to_dict_is_json_serializable(self):
+        import json
+
+        tr = ConflictEventTracker(confirm_frames=1, cooldown_frames=1)
+        tr.update([self._mk(1, 2, RiskLevel.LEVEL_3_CRITICAL, 1.0)], 0, 0.0)
+        tr.flush()
+        (ev,) = tr.pop_finalized()
+        d = ev.to_dict()
+        json.dumps(d)
+        self.assertEqual(d["peak_risk_name"], "LEVEL_3_CRITICAL")
+        self.assertEqual(d["kind"], "conflict")
+        self.assertEqual(d["event_id"], 1)
+
+
 class TestVisualization(unittest.TestCase):
     def test_visualizer_render_frame_without_error(self):
         image_points = [(100.0, 50.0), (300.0, 50.0), (350.0, 250.0), (50.0, 250.0)]
@@ -649,6 +827,10 @@ class TestPipelineIO(unittest.TestCase):
             ["--parked-speed", "nan"],
             ["--parked-frames", "0"],
             ["--parked-seconds", "0"],
+            ["--alert-confirm", "0"],
+            ["--alert-cooldown", "-1"],
+            ["--alert-cooldown-s", "-0.5"],
+            ["--alert-cooldown-s", "nan"],
             ["--speed-limit", "nan"],
         ):
             with self.assertRaises(SystemExit, msg=bad_args):
@@ -688,6 +870,33 @@ class TestPipelineIO(unittest.TestCase):
         self.assertEqual(pipe.speed_estimator.stationary_min_frames, 12)
         self.assertEqual(len(pipe.speed_estimator.tracks), 0)
 
+    def test_event_tracker_rebuilt_per_video_and_fps_scaled(self):
+        from analysis.conflict import RiskLevel
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        calib = RoadCalibrator(
+            [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
+        )
+        pipe = ConflictPerceptionPipeline(
+            calibrator=calib, alert_confirm_frames=2, alert_cooldown_seconds=0.4
+        )
+        # 旧视频中遗留一个存续事件：重建后不得串到下一视频
+        pipe.event_tracker.update(
+            [
+                ConflictAssessment(
+                    veh_track_id=1, ped_track_id=None,
+                    risk_level=RiskLevel.LEVEL_1_SPEEDING, risk_desc="x",
+                    veh_speed_kmh=40.0, ped_speed_ms=0.0, current_distance_m=0.0,
+                    min_distance_m=0.0, ttc_seconds=None, conflict_ground_xy=None,
+                )
+            ],
+            0, 0.0,
+        )
+        pipe._configure_event_tracker(25.0)
+        # 0.4s 冷却 @25fps = 10 帧；内部状态清空
+        self.assertEqual(pipe.event_tracker.cooldown_frames, 10)
+        self.assertEqual(len(pipe.event_tracker._states), 0)
+
     def test_retained_ids_failure_fails_loud(self):
         import cv2
         import numpy as np
@@ -714,6 +923,84 @@ class TestPipelineIO(unittest.TestCase):
             with mock.patch("analysis.pipeline.TrackingSession", return_value=fake_session):
                 with self.assertRaises(RuntimeError):
                     pipe.process_video(vpath, Path(d) / "out")
+
+    def test_pipeline_writes_debounced_alert_events(self):
+        # 端到端：单目标持续超速 -> 去抖后 events.jsonl 恰有 1 条事件，
+        # conflicts.jsonl 已确认帧回填 event_id，summary 按事件计数
+        import json as jsonlib
+
+        import cv2
+        import numpy as np
+        from unittest import mock
+
+        from analysis.pipeline import ConflictPerceptionPipeline
+
+        with tempfile.TemporaryDirectory() as d:
+            vpath = Path(d) / "v.mp4"
+            w = cv2.VideoWriter(str(vpath), cv2.VideoWriter_fourcc(*"mp4v"), 25.0, (64, 64))
+            self.assertTrue(w.isOpened())
+            for _ in range(15):
+                w.write(np.zeros((64, 64, 3), np.uint8))
+            w.release()
+
+            # 40m x 40m 标定区：锚点每帧下移 0.7px ≈ 地面 0.56m/帧 ≈ 50 km/h
+            calib = RoadCalibrator(
+                [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 40.0, 40.0
+            )
+            pipe = ConflictPerceptionPipeline(
+                calibrator=calib, alert_confirm_frames=2, alert_cooldown_frames=2
+            )
+
+            frame_i = {"n": 0}
+
+            def make_frame_rec(frame, timestamp_s, time_kind):
+                t = mock.Mock()
+                t.track_id = 1
+                t.category = "vehicle"
+                t.anchor_xy = (30.0, 10.0 + frame_i["n"] * 0.7)
+                t.bbox_xyxy = (20.0, 10.0, 40.0, 30.0)
+                frame_i["n"] += 1
+                rec = mock.Mock()
+                rec.tracks = [t]
+                return rec
+
+            fake_session = mock.Mock()
+            fake_session.process.side_effect = make_frame_rec
+            fake_session.retained_ids.return_value = {1}
+
+            out_dir = Path(d) / "out"
+            with mock.patch("analysis.pipeline.TrackingSession", return_value=fake_session):
+                summary = pipe.process_video(vpath, out_dir)
+
+            events_path = out_dir / "events.jsonl"
+            events = [
+                jsonlib.loads(l)
+                for l in events_path.read_text(encoding="utf-8").splitlines()
+                if l.strip()
+            ]
+            self.assertEqual(len(events), 1)
+            ev = events[0]
+            self.assertEqual(ev["event_id"], 1)
+            self.assertEqual(ev["veh_track_id"], 1)
+            self.assertIsNone(ev["ped_track_id"])
+            self.assertEqual(ev["kind"], "speeding")
+            self.assertEqual(ev["peak_risk_name"], "LEVEL_1_SPEEDING")
+            self.assertEqual(ev["end_reason"], "eof")
+            self.assertGreaterEqual(ev["alarm_frames"], 2)
+
+            self.assertEqual(summary["total_alert_events"], 1)
+            self.assertEqual(summary["total_speeding_alerts"], 1)
+            self.assertEqual(summary["total_critical_conflicts"], 0)
+
+            lines = [
+                jsonlib.loads(l)
+                for l in (out_dir / "conflicts.jsonl").read_text(encoding="utf-8").splitlines()
+                if l.strip()
+            ]
+            confirmed = [l for l in lines if l.get("event_id") == 1]
+            self.assertGreaterEqual(len(confirmed), 1)
+            # 每帧一行原始评估仍在，确认前帧 event_id 为空
+            self.assertTrue(any(l.get("event_id") is None for l in lines))
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from .conflict import (
     RiskLevel,
     build_conflict_maps,
 )
+from .events import ConflictEventTracker
 from .speed import SpeedEstimator, SpeedReading
 from .visualization import EnhancedConflictVisualizer, trajectory_color
 
@@ -56,6 +57,9 @@ class ConflictPerceptionPipeline:
         stationary_min_frames: int = 8,
         stationary_seconds: Optional[float] = None,
         category_confirm_frames: int = 3,
+        alert_confirm_frames: int = 3,
+        alert_cooldown_frames: int = 12,
+        alert_cooldown_seconds: Optional[float] = None,
     ):
         if not math.isfinite(iou) or not (0 < iou <= 1):
             raise ValueError("iou 必须在 (0, 1] 区间")
@@ -67,6 +71,14 @@ class ConflictPerceptionPipeline:
             raise ValueError("window_seconds 必须为有限正数")
         if stationary_seconds is not None and (not math.isfinite(stationary_seconds) or stationary_seconds <= 0):
             raise ValueError("stationary_seconds 必须为有限正数")
+        if type(alert_confirm_frames) is not int or alert_confirm_frames < 1:
+            raise ValueError("alert_confirm_frames 必须是 >= 1 的整数帧数")
+        if type(alert_cooldown_frames) is not int or alert_cooldown_frames < 0:
+            raise ValueError("alert_cooldown_frames 必须是 >= 0 的整数帧数")
+        if alert_cooldown_seconds is not None and (
+            not math.isfinite(alert_cooldown_seconds) or alert_cooldown_seconds < 0
+        ):
+            raise ValueError("alert_cooldown_seconds 必须为有限非负数")
 
         self.calibrator = calibrator
         self.weights = weights
@@ -79,6 +91,9 @@ class ConflictPerceptionPipeline:
         self.zone_margin_m = zone_margin_m
         self.window_seconds = window_seconds
         self.stationary_seconds = stationary_seconds
+        self.alert_confirm_frames = alert_confirm_frames
+        self.alert_cooldown_frames = alert_cooldown_frames
+        self.alert_cooldown_seconds = alert_cooldown_seconds
 
         # 每次 process_video 按实际 FPS 重建 estimator，跨视频不串状态
         self._estimator_kwargs = dict(
@@ -90,6 +105,10 @@ class ConflictPerceptionPipeline:
             category_confirm_frames=category_confirm_frames,
         )
         self.speed_estimator = SpeedEstimator(**self._estimator_kwargs)
+        self.event_tracker = ConflictEventTracker(
+            confirm_frames=alert_confirm_frames,
+            cooldown_frames=alert_cooldown_frames,
+        )
         self.conflict_analyzer = ConflictAnalyzer(
             speed_limit_kmh=speed_limit_kmh,
             ttc_critical_s=ttc_critical_s,
@@ -109,6 +128,16 @@ class ConflictPerceptionPipeline:
         if self.stationary_seconds is not None:
             kwargs["stationary_min_frames"] = max(1, int(round(fps * self.stationary_seconds)))
         self.speed_estimator = SpeedEstimator(**kwargs)
+
+    def _configure_event_tracker(self, fps: float):
+        """按视频实际 FPS 重建告警事件跟踪器：换算秒级冷却窗，且不继承上一视频状态"""
+        cooldown_frames = self.alert_cooldown_frames
+        if self.alert_cooldown_seconds is not None:
+            cooldown_frames = max(0, int(round(fps * self.alert_cooldown_seconds)))
+        self.event_tracker = ConflictEventTracker(
+            confirm_frames=self.alert_confirm_frames,
+            cooldown_frames=cooldown_frames,
+        )
 
     def process_video(
         self,
@@ -132,6 +161,7 @@ class ConflictPerceptionPipeline:
 
         video_clock = VideoClock(fps=fps)
         self._configure_speed_estimator(fps)
+        self._configure_event_tracker(fps)
         session = TrackingSession(
             source=str(src),
             weights=self.weights,
@@ -150,9 +180,11 @@ class ConflictPerceptionPipeline:
             raise RuntimeError(f"无法创建渲染输出视频，请检查编码器与路径: {out_video_path}")
 
         jsonl_path = out_dir / "conflicts.jsonl"
+        events_path = out_dir / "events.jsonl"
         csv_path = out_dir / "speeds.csv"
 
         jsonl_file = open(jsonl_path, "w", encoding="utf-8")
+        events_file = open(events_path, "w", encoding="utf-8")
         csv_file = open(csv_path, "w", encoding="utf-8", newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
@@ -164,6 +196,18 @@ class ConflictPerceptionPipeline:
         total_caution_events = 0
         total_speeding_events = 0
         max_observed_speed_kmh = 0.0
+
+        def _drain_alert_events():
+            # 事件级计数：一次持续危险只记 1 条，峰值等级为事件归档等级
+            nonlocal total_critical_events, total_caution_events, total_speeding_events
+            for evt in self.event_tracker.pop_finalized():
+                if evt.peak_risk_level == RiskLevel.LEVEL_3_CRITICAL:
+                    total_critical_events += 1
+                elif evt.peak_risk_level == RiskLevel.LEVEL_2_CAUTION:
+                    total_caution_events += 1
+                elif evt.peak_risk_level == RiskLevel.LEVEL_1_SPEEDING:
+                    total_speeding_events += 1
+                events_file.write(json.dumps(evt.to_dict(), ensure_ascii=False) + "\n")
 
         frame_idx = 0
         t_start = time.time()
@@ -243,18 +287,17 @@ class ConflictPerceptionPipeline:
                 conflicts = self.conflict_analyzer.analyze_frame(speed_readings)
                 conflict_map, ped_conflict_map = build_conflict_maps(conflicts)
 
+                # 3b. 告警事件去抖：逐帧评估收敛为生命周期事件；
+                # 已确认存续的事件把 event_id 回填到本帧原始评估记录上
+                event_ids = self.event_tracker.update(conflicts, frame_idx, timestamp_s)
+                _drain_alert_events()
+
                 # 4. 统计与持久化记录
                 for c in conflicts:
-                    if c.risk_level == RiskLevel.LEVEL_3_CRITICAL:
-                        total_critical_events += 1
-                    elif c.risk_level == RiskLevel.LEVEL_2_CAUTION:
-                        total_caution_events += 1
-                    elif c.risk_level == RiskLevel.LEVEL_1_SPEEDING:
-                        total_speeding_events += 1
-
                     json_item = {
                         "frame_index": frame_idx,
                         "timestamp_s": round(timestamp_s, 3),
+                        "event_id": event_ids.get((c.veh_track_id, c.ped_track_id)),
                         "assessment": asdict(c),
                     }
                     jsonl_file.write(json.dumps(json_item, ensure_ascii=False) + "\n")
@@ -305,10 +348,15 @@ class ConflictPerceptionPipeline:
                     fps_proc = frame_idx / (time.time() - t_start)
                     print(f"[*] 已处理 {frame_idx} 帧 | 处理速率: {fps_proc:.1f} FPS | 最高时速: {max_observed_speed_kmh:.1f} km/h")
 
+            # 视频结束：冷却窗内未决事件按 eof 强制归档，避免最后一段告警丢失
+            self.event_tracker.flush()
+            _drain_alert_events()
+
         finally:
             cap.release()
             writer.release()
             jsonl_file.close()
+            events_file.close()
             csv_file.close()
             if show_window:
                 cv2.destroyAllWindows()
@@ -320,12 +368,16 @@ class ConflictPerceptionPipeline:
             "source_video": str(src),
             "annotated_output": str(out_video_path),
             "conflicts_jsonl": str(jsonl_path),
+            "events_jsonl": str(events_path),
             "speeds_csv": str(csv_path),
             "frames_processed": frame_idx,
             "elapsed_seconds": round(elapsed, 2),
             "average_fps": round(proc_fps, 1),
             "speed_limit_kmh": self.speed_limit_kmh,
             "max_observed_speed_kmh": round(max_observed_speed_kmh, 1),
+            "total_alert_events": (
+                total_speeding_events + total_caution_events + total_critical_events
+            ),
             "total_speeding_alerts": total_speeding_events,
             "total_caution_events": total_caution_events,
             "total_critical_conflicts": total_critical_events,
@@ -338,8 +390,8 @@ class ConflictPerceptionPipeline:
         print("=" * 60)
         print(f"[OK] 冲突感知与测速研判处理完毕！")
         print(f"    渲染视频已保存: {out_video_path}")
-        print(f"    告警明细已落盘: {jsonl_path} | {csv_path}")
-        print(f"    最高车速: {max_observed_speed_kmh:.1f} km/h | 紧急冲突次数: {total_critical_events}")
+        print(f"    告警明细已落盘: {jsonl_path} | {events_path} | {csv_path}")
+        print(f"    最高车速: {max_observed_speed_kmh:.1f} km/h | 紧急冲突事件数: {total_critical_events}")
         print("=" * 60)
 
         return summary

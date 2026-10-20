@@ -124,6 +124,24 @@ def main(argv: list[str] | None = None):
         help="按秒指定静止确认时长，按视频 FPS 换算帧数；设置后覆盖 --parked-frames",
     )
     parser.add_argument(
+        "--alert-confirm",
+        type=int,
+        default=3,
+        help="告警事件确认帧数：告警条件需连续满足 N 帧才开立事件，默认 3",
+    )
+    parser.add_argument(
+        "--alert-cooldown",
+        type=int,
+        default=12,
+        help="告警事件冷却帧数：告警消失未超过 N 帧复现视为同一事件，默认 12",
+    )
+    parser.add_argument(
+        "--alert-cooldown-s",
+        type=float,
+        default=None,
+        help="按秒指定告警冷却窗，按视频 FPS 换算帧数；设置后覆盖 --alert-cooldown",
+    )
+    parser.add_argument(
         "--demo",
         action="store_true",
         help="标定文件缺失时允许使用合成占位标定（仅演示，测速结果不可信）",
@@ -151,6 +169,14 @@ def main(argv: list[str] | None = None):
         parser.error("--parked-frames 必须是 >= 1 的整数")
     if args.parked_seconds is not None and (not math.isfinite(args.parked_seconds) or args.parked_seconds <= 0):
         parser.error("--parked-seconds 必须为正数")
+    if args.alert_confirm < 1:
+        parser.error("--alert-confirm 必须是 >= 1 的整数")
+    if args.alert_cooldown < 0:
+        parser.error("--alert-cooldown 必须是 >= 0 的整数")
+    if args.alert_cooldown_s is not None and (
+        not math.isfinite(args.alert_cooldown_s) or args.alert_cooldown_s < 0
+    ):
+        parser.error("--alert-cooldown-s 必须为非负数")
     if not math.isfinite(args.speed_limit) or args.speed_limit <= 0:
         parser.error("--speed-limit 必须为正数")
 
@@ -210,6 +236,9 @@ def main(argv: list[str] | None = None):
         stationary_speed_ms=args.parked_speed,
         stationary_min_frames=args.parked_frames,
         stationary_seconds=args.parked_seconds,
+        alert_confirm_frames=args.alert_confirm,
+        alert_cooldown_frames=args.alert_cooldown,
+        alert_cooldown_seconds=args.alert_cooldown_s,
     )
 
     summary = pipeline.process_video(
