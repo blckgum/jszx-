@@ -1,3 +1,6 @@
+# 原理笔记：docs/modules/03_图像分类实验_原理笔记.md。
+# 本文件属于原有分类学习模块；校园道路检测与跟踪使用 detection/、tracking/ 入口。
+
 """
 train.py —— 完整训练流程
 
@@ -259,7 +262,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(),      # ★ 必须传模型参数，否则什么都更新不了！
         lr=args.lr,
-        weight_decay=config.WEIGHT_DECAY,   # L2 正则，防过拟合
+        weight_decay=config.WEIGHT_DECAY,   # AdamW 的解耦权重衰减
     )
 
     # ---------- 学习率调度器 ----------
@@ -280,6 +283,8 @@ def main() -> None:
             print(f"\n从检查点恢复: {resume_path}")
             # ★ weights_only=False 才能加载含优化器状态的完整检查点
             #   PyTorch 2.6+ 默认 weights_only=True，加载自己存的字典会报错
+            # 当前仅恢复模型、优化器和轮号；调度器、随机状态、历史最佳值均未恢复，
+            # 因此它支持继续优化，不保证与一次不中断的训练得到相同轨迹。
             ckpt = torch.load(resume_path, map_location=device, weights_only=False)
             model.load_state_dict(ckpt["model_state"])
             optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -289,6 +294,8 @@ def main() -> None:
             print(f"[警告] 找不到检查点 {resume_path}，从头开始训练")
 
     # ---------- 准备保存目录 ----------
+    # 分类脚本使用固定 best.pt/last.pt/history.json，重新训练会覆盖同名产物。
+    # 做对比实验前另存旧结果；检测/跟踪入口则通过 new_run 自动隔离目录。
     ensure_dir(config.CKPT_DIR)
     ensure_dir(config.RUNS_DIR)
 
@@ -383,7 +390,7 @@ def main() -> None:
             print(f"  · 未提升 ({epochs_no_improve}/{args.patience})  "
                   f"历史最佳 {best_val_acc:.2f}% (第 {best_epoch} 轮)")
 
-        # ---- 每轮都存一份 last.pt，断电也能续训 ----
+        # ---- 每轮保存 last.pt，供下一次从已写好的检查点继续优化 ----
         torch.save(
             {
                 "epoch": epoch,
@@ -397,8 +404,8 @@ def main() -> None:
         )
 
         # ---- 早停 ----
-        # ★ 验证 loss 长时间不降，说明模型已经学完了（再练只会过拟合）。
-        #   与其让 GPU 空转几小时，不如提前停。
+        # 当前实现结合两个条件：本轮 val_loss 高于此前最小值，且验证准确率
+        # 已连续 patience 轮没有提高；不能解读成单独按 loss 计数的标准早停。
         if len(history["val_loss"]) > 1:
             if val_loss > min(history["val_loss"][:-1]) and epochs_no_improve >= args.patience:
                 print(f"\n[早停] 验证损失连续 {args.patience} 轮没有改善，停止训练")

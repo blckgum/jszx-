@@ -1,6 +1,6 @@
 # 多目标跟踪模块解释文档：YOLOv8 + ByteTrack
 
-**文档类型：模块解释文档。** 面向有 Python 基础、刚接触计算机视觉的读者。本文讲解已实现的本地视频及目录跟踪、轨迹生命周期、关键库函数、算法参数与验证边界；项目总体定位参见根目录 README。
+**文档类型：模块解释文档。** 面向有 Python 基础、刚接触计算机视觉的读者。本文讲解已实现的本地视频及目录跟踪、轨迹生命周期、关键库函数、算法参数与验证边界；项目总体定位参见根目录 README，其他学习模块见[阅读总索引](README.md)。第 11 节新增对照 `a31c390` 实现的逐帧演算示例。
 
 当前通过 Ultralytics 的 `model.track()` 接入标准 ByteTrack，没有重新实现卡尔曼滤波或匹配算法。新增代码不训练模型，不修改原有数据集和模型权重。
 
@@ -326,3 +326,74 @@ python -m tracking --source runs/tracking-fixtures/sample_01 --device cpu --outp
 | 希望直接得到车速 | 先建立可靠的道路标定和时间尺度，Track ID 本身不提供米制距离 |
 
 继续阅读：[目标检测解释文档](01_目标检测_YOLOv8与PyTorch_解释文档.md)、[Ultralytics 跟踪接口](https://docs.ultralytics.com/modes/track/)、[ByteTrack 项目](https://github.com/FoundationVision/ByteTrack)。
+
+## 11. 跟随一条轨迹读懂事件与汇总
+
+本节是人工设定的受控输入示例，对照 [`RunExports`](../../tracking/export.py) 与已有的 `test_recovery_class_change_pending_csv_and_summary` 测试阅读。它解释导出规则，不表示真实模型观测到了“行人变成汽车”。
+
+### 11.1 四帧输入与五个事件
+
+假设同一会话每 0.1 秒一帧，`retained_ids={7}` 在四帧内始终成立：
+
+| frame_index | 时间 / 秒 | 本帧返回目标 | 导出事件 |
+|---|---:|---|---|
+| 0 | 0.0 | ID 7：person，0.9；另有一个 ID 为 null 的 pending 框 | ID 7 `started` |
+| 1 | 0.1 | 空目标列表 | ID 7 `lost` |
+| 2 | 0.2 | 空目标列表 | 无新事件，继续等待 |
+| 3 | 0.3 | ID 7：car，0.7 | ID 7 `recovered`，再记 `class_changed` |
+
+第 3 帧结束后，若调用 `finish("max_frames")`，还会记录 ID 7 的 `closed`，原因为 `session_end:max_frames`。完整事件顺序为：
+
+```text
+started -> lost -> recovered -> class_changed -> closed
+```
+
+恢复缺口为 `3 - 0 - 1 = 2`，不是 3：首末两次观测之间只缺少帧 1、2。连续缺失期间 `missing` 标记阻止重复写入 lost，成功恢复才累计 recoveries。
+
+如果 ID 在恢复前已从真实关联池移除，导出层会先关闭它；后续出现的新 ID 将产生新轨迹。导出代码不自行合并两个 ID，也不修改 ByteTrack 规则。
+
+### 11.2 四种输出为什么数量不同
+
+对于上面的输入：
+
+| 文件 | 示例行数 | 原因 |
+|---|---:|---|
+| `tracks.jsonl` | 4 | 每帧一行，含两个空帧 |
+| `observations.csv` | 3 条数据行，另有表头 | 帧 0 有两个返回框，帧 3 有一个；pending 也保留 |
+| `events.jsonl` | 5 | 同一 ID 的状态变化记录，非每帧一行 |
+| `tracklets.jsonl` | 1 | 关闭时汇总 ID 7；pending 没有身份，不建立轨迹统计 |
+
+ID 7 的主要汇总值为：
+
+```json
+{
+  "track_id": 7,
+  "observations": 2,
+  "observed_span_s": 0.3,
+  "unobserved_frames_within_span": 2,
+  "recoveries": 1,
+  "max_recovered_gap_frames": 2,
+  "class_counts": {"person": 1, "car": 1},
+  "class_changes": 1,
+  "mean_confidence": 0.8,
+  "close_reason": "session_end:max_frames"
+}
+```
+
+这是字段摘录，完整行还包含会话、首末帧及关闭时间等。浮点序列化可能有小数舍入差异。
+
+首末观测跨越 0.3 秒，不能解释成连续 0.3 秒都有检测。平均分数 `(0.9+0.7)/2=0.8` 是这两次输出分数的均值，不是身份正确率。分类变化表示检测语义出现抖动或关联可能出错，需要检查原画面。
+
+### 11.3 像素、时间与显示各自的边界
+
+假设首帧框为 `(10,20,30,80)`，`extract_tracks()` 计算 `anchor_xy=(20,80)`；末帧框 `(12,20,32,80)` 的锚点为 `(22,80)`。两次观测只说明图像底边中心变化了 2 像素。中间还有两帧缺口，不能把它们当成每一帧的连续真实位置，更不能直接得到 km/h。
+
+`VideoClock` 的时间来自视频 PTS，必要时回退到 `frame_index/fps` 并注明来源。`TrackingSession.process()` 校验时间递增，但第三方 ByteTrack 每调用一次仍只推进一个帧时间步，并不将这个时间戳作为 Kalman 的秒制步长。
+
+`TrailHistory.segments()` 会在帧号不连续处断线；它消费已经确定的观测，不负责找回 ID。暂停则只重画最后一帧：如果暂停时又调用 `process()`，会错误推进跟踪器，即使源视频没有前进。当前主循环明确将等待按键与读帧/推理分开。
+
+### 11.4 如何核对而不混淆指标
+
+先比较 JSONL 的帧号和时间轴，再核对 CSV 的观测行、事件顺序及每条 tracklet 的统计；确认源视频与会话键一致后再看标注 MP4。使用已有导出测试可核对上述缺口、pending、类别变化与均值规则。
+
+`confirmed_track_ids` 的长度是出现过的数字 ID 数；同一物理目标可能换 ID，不同视频也可能重复用同一数字。统计真实车辆数量、跟踪准确率或速度还需要额外定义与真实标注，不能由上述文件行数直接推出。

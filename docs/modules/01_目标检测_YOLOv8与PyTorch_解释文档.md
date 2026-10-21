@@ -2,7 +2,7 @@
 
 **文档类型：模块解释文档。** 本文件配合源码讲解概念、算法和库函数，项目概览仍以仓库根目录的 README 为准。
 
-适合读者：掌握 Python 基础，刚开始接触计算机视觉与深度学习。本文依据检测代码版本 `1ed4291` 编写，先理解数据如何流动，再阅读具体函数。
+适合读者：掌握 Python 基础，刚开始接触计算机视觉与深度学习。原解释依据检测代码版本 `1ed4291` 编写，本轮对照 `a31c390` 补充训练数据的完整示例；先理解数据如何流动，再阅读具体函数。其他模块入口见[阅读总索引](README.md)。
 
 当前检测模块完成图片、图片目录和本地视频检测，以及标注数据的训练和评估。ByteTrack 已通过独立的 tracking 模块接入，详见 [多目标跟踪解释文档](02_多目标跟踪_ByteTrack_解释文档.md)；实际测速、TTC 和完整预警仍属于后续阶段。
 
@@ -36,12 +36,12 @@
 | 顺序 | 文件或函数 | 阅读重点 |
 |---|---|---|
 | 1 | [`detection/__init__.py`](../../detection/__init__.py) | 模块定位与阅读提示 |
-| 2 | [`main()`](../../detection/__main__.py#L103) | 命令参数如何分派到 detect、train 和 val |
-| 3 | [`load_model()`](../../detection/core.py#L42) | 权重加载与模型任务检查 |
-| 4 | [`select_classes()`](../../detection/core.py#L63) | 模型类别 ID 与道路类别筛选 |
-| 5 | [`detect()`](../../detection/core.py#L99) | 一帧从读取到预测、绘图和导出的全过程 |
-| 6 | [`audit_dataset()`](../../detection/dataset.py#L17) | 标注格式、目录配对、数据划分检查 |
-| 7 | [`run_training_or_validation()`](../../detection/__main__.py#L34) | 训练、评估及指标保存 |
+| 2 | [`main()`](../../detection/__main__.py) | 命令参数如何分派到 detect、train 和 val |
+| 3 | [`load_model()`](../../detection/core.py) | 权重加载与模型任务检查 |
+| 4 | [`select_classes()`](../../detection/core.py) | 模型类别 ID 与道路类别筛选 |
+| 5 | [`detect()`](../../detection/core.py) | 一帧从读取到预测、绘图和导出的全过程 |
+| 6 | [`audit_dataset()`](../../detection/dataset.py) | 标注格式、目录配对、数据划分检查 |
+| 7 | [`run_training_or_validation()`](../../detection/__main__.py) | 训练、评估及指标保存 |
 | 8 | [`tests/test_detection.py`](../../tests/test_detection.py) | 哪些错误需要在运行模型前发现 |
 
 仓库根目录的 `model.py`、`dataset.py`、`train.py` 和 `predict.py` 保留了原有分类实验。当前目标检测统一使用 `python -m detection`，其数据集审计代码是 `detection/dataset.py`。
@@ -492,3 +492,54 @@ python -m unittest discover -s tests -v
 - [Ultralytics Predict 接口](https://docs.ultralytics.com/modes/predict/)
 - [PyTorch 张量基础](https://pytorch.org/tutorials/beginner/basics/tensorqs_tutorial.html)
 - [PyTorch 自动求导基础](https://pytorch.org/tutorials/beginner/basics/autogradqs_tutorial.html)
+
+## 13. 数据审计、训练与评估：跟随一个标签走完流程
+
+本节用人工设定的小例子解释已有实现，不代表实际采集或训练结果。对照 [`audit_dataset()`](../../detection/dataset.py) 和 [`run_training_or_validation()`](../../detection/__main__.py) 阅读。
+
+### 13.1 从 YAML 找到图片和标签
+
+假设某个 `configs/campus.yaml` 包含以下配置，且已经准备了互不重叠的 train/val 图片及标签：
+
+```yaml
+path: ../data/traffic
+train: images/train
+val: images/val
+names:
+  0: person
+  1: car
+```
+
+路径首先相对于 **YAML 所在目录** 解析，再将 `images/train` 等拼到数据根路径，不取决于终端当前目录。图像 `data/traffic/images/train/a.jpg` 应配对 `data/traffic/labels/train/a.txt`，子目录结构也应一致。
+
+设 `a.jpg` 为 640×480，标签一行为：
+
+```text
+1 0.5 0.5 0.25 0.5
+```
+
+它表示此自定义模型中的 car（ID 为 1），中心像素 `(320,240)`，宽高 `(160,240)`。换为原图 xyxy 得到 `(240,120,400,360)`。数字 1 的含义来自这份 YAML，不是 COCO 官方 ID，修改 `names` 也不会自动重新标注文件里的数字。
+
+审计器检查五列、有限数值、合法整数类别以及中心坐标和宽高的归一化范围，并统计每个划分的图片数、目标数。无目标图必须配空 txt，缺标签不能被默认为确认过的负样本。
+
+审计的边界也要清楚：当前不解码核对图片内容，不查图片副本或相邻帧的视觉重复，不判断标注框是否框对目标；它检查各归一化值的范围，但不额外判断由中心与宽高推导出的框是否越过图像边界。通过审计后仍应人工抽检，按视频或场景划分数据。
+
+### 13.2 训练为何与推理类别筛选不同
+
+执行 `train` 时先检查 train/val，再保存 `dataset.resolved.yaml` 和 `dataset_audit.json`，随后调用 Ultralytics 的完整 `model.train()`。数据中的 `names` 为训练提供类别语义，训练框架据此适配检测头。
+
+推理时的 `--classes` 则只按当前模型已有名称筛选输出，不训练新检测头。对 COCO 权重只保留人、车输出，与训练一个两类模型不是同一操作。
+
+本入口使用 `amp=False`、`workers=0`，并传入 seed 与 deterministic 选项以减少环境差异；它们是当前基线的执行选择，不保证跨硬件、版本逐位一致。参数调整及真实精度需要独立实验。
+
+### 13.3 验证必须使用语义一致的权重
+
+对于上面的两类数据，直接使用官方 80 类 COCO 权重执行本入口的 `val` 会在 `model.names != data["names"]` 时被拒绝，避免类别 ID 错位产生错误指标。应传入使用这份类别定义训练得到的权重，并选择 val 或 test 集合。
+
+指标导出时，假设评估集合只有 car 标注，则 `ap_class_index` 可能只含 `[1]`。此时指标数组的第 0 项对应 **class_id=1**，代码必须根据 `ap_class_index` 映射，不能把数组下标 0 写成 person。
+
+`metrics.json` 中 `per_class` 只包含实际有标注的类别，其名为 `mAP50` / `mAP50_95` 的字段在每一行存放该单类的 AP。整体指标保存在 `metrics` 中；不要将缺少某类指标理解为该类 AP 被测为 0。训练结束的指标与 `evaluated_weights` 指向本次选出的 best.pt，`initial_weights` 则描述训练起点。
+
+### 13.4 对应哪些已有检查
+
+[`tests/test_detection.py`](../../tests/test_detection.py) 覆盖类别按模型名称映射、输出目录保护、相对路径、缺标签、非法类别/非有限坐标和 train/val 路径重叠。这些接口检查可发现输入约定错误，但不测校园检测精度。真实训练和 val/test 命令见第 9 节，数据来源及历史功能验证见第 11 节。

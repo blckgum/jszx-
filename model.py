@@ -1,3 +1,6 @@
+# 原理笔记：docs/modules/03_图像分类实验_原理笔记.md。
+# 本文件属于原有分类学习模块；校园道路检测与跟踪使用 detection/、tracking/ 入口。
+
 """
 model.py —— 网络结构
 
@@ -119,6 +122,7 @@ class SimpleCNN(nn.Module):
 
         # ---------- 特征提取部分（也叫 backbone / 主干）----------
         # nn.Sequential 就是"按顺序执行"的容器，代码更干净
+        # 每阶段实际有两个 ConvBlock；文件开头的数据流图按阶段概括。
         self.features = nn.Sequential(
             # 第 1 阶段：[N,3,32,32] → [N,32,32,32] → 池化 → [N,32,16,16]
             ConvBlock(in_channels, 32),
@@ -226,6 +230,7 @@ def build_resnet18(num_classes: int = config.NUM_CLASSES, pretrained: bool = Tru
 
     # ResNet18 原本输出 1000 类（ImageNet 的类别数），换成我们自己的
     in_features = model.fc.in_features      # 512
+    # 当前没有冻结主干，训练器传入全部 model.parameters()，默认是全网络微调。
     model.fc = nn.Linear(in_features, num_classes)
 
     return model

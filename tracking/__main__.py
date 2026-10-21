@@ -1,5 +1,8 @@
 """python -m tracking：独立跟踪入口，不改变现有 detection 命令。"""
 
+# 原理笔记：docs/modules/02_多目标跟踪_ByteTrack_解释文档.md，第 8 节。
+# CLI 将参数整理为关键字传给单视频或目录入口，再把汇总状态转成进程退出码。
+
 import argparse
 import json
 from pathlib import Path
@@ -34,6 +37,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         is_batch = Path(args.source).expanduser().is_dir()
+        # vars(args) 的键与函数参数对应；一个目录作为一个批次，各视频内部状态独立。
         output = (track_directory if is_batch else track_video)(**vars(args))
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
         notes = "".join(f"{note}\n" for note in getattr(exc, "__notes__", []))
@@ -45,6 +49,7 @@ def main(argv=None):
         if any(r.get("reported_frame_count_mismatch") for r in summary["results"]):
             print("注意：部分视频的解码帧数与元数据不一致，请核对批次清单及源视频。")
         if summary["status"] == "interrupted":
+            # 130 对应主动中断；打印了输出位置，也不代表全部视频已成功处理。
             raise SystemExit(130)
         if summary["status"] == "completed_with_errors" or any(r["status"] == "failed" for r in summary["results"]):
             raise SystemExit(1)

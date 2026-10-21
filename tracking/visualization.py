@@ -1,5 +1,8 @@
 """分组配色、有限长度轨迹和运行信息；本文件不执行目标关联。"""
 
+# 原理笔记：docs/modules/02_多目标跟踪_ByteTrack_解释文档.md，第 6 节。
+# 历史点只用于显示；清理它们不会删除 ByteTrack 中的目标身份。
+
 from __future__ import annotations
 
 from collections import Counter, deque
@@ -19,6 +22,7 @@ class TrailHistory:
         for target in record.tracks:
             if target.track_id is None:
                 continue
+            # 队列限制点数，下面的源帧号裁剪限制时间范围；漏检后两种限制并不等价。
             history = self.points.setdefault(target.track_id, deque(maxlen=self.length))
             history.append((record.frame_index, record.timestamp_s, *target.anchor_xy))
             self.last_seen[target.track_id] = record.frame_index
@@ -49,6 +53,7 @@ class PlaybackController:
         self.quit_requested = False
 
     def handle_key(self, key: int):
+        # OpenCV 无按键通常返回 -1；掩码后为 255，不会触发任何控制动作。
         key &= 0xFF
         if key in (ord("q"), ord("Q"), 27):
             self.quit_requested = True
@@ -76,6 +81,7 @@ def annotate(frame, record, history, source_fps, processing_fps, total_frames, c
                     cv2.circle(canvas, tuple(points[0, 0]), 2, color, -1)
 
     counts = Counter(target.class_name for target in record.tracks)
+    # 数量是当前帧观测数；pending 计入总数，只有有 ID 的框计入 confirmed。
     confirmed = sum(target.track_id is not None for target in record.tracks)
     total = str(total_frames) if total_frames is not None else "?"
     source_label = f"{source_fps:.2f}" if source_fps is not None else "unknown"
