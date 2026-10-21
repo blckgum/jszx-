@@ -5,6 +5,7 @@ from pathlib import Path
 
 from detection.core import VIDEO_SUFFIXES, new_run, write_json
 from .core import DEFAULT_TRACKER, read_tracker_config, track_video
+from .motion import DEFAULT_MOTION_CONFIG, read_motion_config
 
 
 def track_directory(source, *, output=None, **options):
@@ -17,6 +18,7 @@ def track_directory(source, *, output=None, **options):
     if not videos:
         raise ValueError("目录中没有支持的视频文件")
     read_tracker_config(options.get("tracker", DEFAULT_TRACKER))
+    read_motion_config(options.get("motion_config", DEFAULT_MOTION_CONFIG))
     output = new_run(output, "track-batch")
     summary = {"schema_version": 1, "source": str(source), "videos_discovered": len(videos),
                "status": "running", "results": []}

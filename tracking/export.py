@@ -39,6 +39,12 @@ class RunExports:
         "width", "height", "track_id", "class_id", "class_name", "category", "confidence",
         "x1", "y1", "x2", "y2", "anchor_x", "anchor_y", "anchor_type", "observation",
     )
+    MOTION_COLUMNS = COLUMNS + (
+        "coordinate_space", "position_unit", "speed_unit", "segment_id", "dt_s", "gap_frames",
+        "smoothed_anchor_x_px", "smoothed_anchor_y_px", "raw_dx_px", "raw_dy_px", "dx_px", "dy_px",
+        "displacement_px", "raw_vx_px_s", "raw_vy_px_s", "vx_px_s", "vy_px_s", "speed_px_s",
+        "direction_dx", "direction_dy", "direction_deg", "velocity_valid", "image_motion_state", "reset_reason",
+    )
 
     def __init__(self, output):
         self.resources = ExitStack()
@@ -50,6 +56,10 @@ class RunExports:
             stream = self.resources.enter_context((output / "observations.csv").open("w", encoding="utf-8", newline=""))
             self.csv = csv.writer(stream)
             self.csv.writerow(self.COLUMNS)
+            self.motion_frames = self.resources.enter_context((output / "motion.jsonl").open("w", encoding="utf-8"))
+            motion_csv = self.resources.enter_context((output / "motion.csv").open("w", encoding="utf-8", newline=""))
+            self.motion_csv = csv.writer(motion_csv)
+            self.motion_csv.writerow(self.MOTION_COLUMNS)
         except BaseException:
             self.resources.close()
             raise
@@ -57,6 +67,9 @@ class RunExports:
         self.event_counts = Counter()
         self.closed_tracks = 0
         self.last_record = None
+        self.motion_states = Counter()
+        self.motion_resets = Counter()
+        self.valid_velocity_observations = 0
 
     def _event(self, record, track_id, event, **extra):
         json_line(self.events, {
@@ -91,17 +104,23 @@ class RunExports:
         stats.confidence_sum += target.confidence
         stats.class_counts[target.class_name] += 1
 
-    def write(self, record: FrameRecord, retained_ids: set[int]):
+    @staticmethod
+    def observation_row(record, target):
+        return (
+            record.session_id, record.source, record.frame_index, record.timestamp_s,
+            record.timestamp_source, record.width, record.height, target.track_id,
+            target.class_id, target.class_name, target.category, target.confidence,
+            *target.bbox_xyxy, *target.anchor_xy, target.anchor_type, target.observation,
+        )
+
+    def write(self, record: FrameRecord, retained_ids: set[int], motion=None):
         """retained_ids 来自真实跟踪器的存活池，包含暂时 Lost 的轨迹。"""
+        if motion is not None and motion.frame != record:
+            raise ValueError("运动记录与原始跟踪帧不一致")
         json_line(self.frames, record.to_dict())
         observed = set()
         for target in record.tracks:
-            self.csv.writerow((
-                record.session_id, record.source, record.frame_index, record.timestamp_s,
-                record.timestamp_source, record.width, record.height, target.track_id,
-                target.class_id, target.class_name, target.category, target.confidence,
-                *target.bbox_xyxy, *target.anchor_xy, target.anchor_type, target.observation,
-            ))
+            self.csv.writerow(self.observation_row(record, target))
             if target.track_id is not None:
                 observed.add(target.track_id)
                 self._observe(record, target)
@@ -115,6 +134,25 @@ class RunExports:
                 stats.missing = True
                 self._event(record, track_id, "lost", last_observed_frame=stats.last_frame)
         self.last_record = record
+        if motion is not None:
+            self._write_motion(motion)
+
+    def _write_motion(self, motion):
+        json_line(self.motion_frames, motion.to_dict())
+        for item in motion.tracks:
+            # 缺失的导数用空单元格表示，不能填 0 混淆成“目标速度为零”。
+            self.motion_csv.writerow(self.observation_row(motion.frame, item.target) + (
+                "image", "px", "px/s", item.segment_id, item.dt_s, item.gap_frames,
+                *item.smoothed_anchor_xy, *(item.raw_displacement_xy_px or (None, None)),
+                *(item.displacement_xy_px or (None, None)), item.displacement_px,
+                *(item.raw_velocity_xy_px_s or (None, None)), *(item.velocity_xy_px_s or (None, None)),
+                item.speed_px_s, *(item.direction_xy or (None, None)), item.direction_deg,
+                item.velocity_valid, item.image_motion_state, item.reset_reason,
+            ))
+            self.motion_states[item.image_motion_state] += 1
+            self.valid_velocity_observations += int(item.velocity_valid)
+            if item.reset_reason is not None:
+                self.motion_resets[item.reset_reason] += 1
 
     def _close_track(self, record, track_id, reason):
         stats = self.active.pop(track_id)

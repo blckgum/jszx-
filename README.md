@@ -2,7 +2,7 @@
 
 面向校园道路固定路侧摄像头，研究车辆与行人的视觉感知、连续跟踪、实际速度估计和冲突风险预警。系统以 YOLOv8 + ByteTrack 提供检测与连续轨迹，`analysis` 模块完成道路标定、物理测速、TTC 冲突研判、事件去抖与四级预警，形成从视频输入到风险提示和事件记录的完整技术链路。
 
-**当前阶段：全链路已实现**（检测 → 跟踪 → 标定测速 → 冲突分析 → 预警）。CPU 环境下 107 项测试全部通过；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
+**当前阶段：全链路已实现**（检测 → 跟踪 → 标定测速 → 冲突分析 → 预警）。CPU 环境下 125 项测试全部通过；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
 
 ## 技术链路
 
@@ -25,6 +25,7 @@ flowchart TD
 |---|---|---|
 | 车辆与行人检测 | YOLOv8n、PyTorch、Ultralytics | 已实现基线 |
 | 多目标跟踪 | ByteTrack：Kalman 预测 + 高/低分检测分阶段关联 | 已实现；校园场景待验证 |
+| 图像轨迹与运动记录 | 时间自适应位置/速度 EMA、像素位移、方向、px/s | 已实现；独立配置、有界缓存、漏检分段 |
 | 标定与测速 | 4 点单应性标定、滑窗两端微分、EMA 滤波 | 已实现；精度待实景验证 |
 | 冲突分析与 TTC | CVM 匀速外推、t_cpa/D_min 闭式解、四级风险 | 已实现；阈值待实景调优 |
 | 告警事件去抖 | N 帧确认 + 等级滞回 + 冷却合并 | 已实现；confirmed/provisional 分流 |
@@ -40,7 +41,7 @@ python -m pip install -r requirements-yolo.txt
 
 # 检测 / 跟踪
 python -m detection detect --source path/to/video.mp4 --device cpu
-python -m tracking --source path/to/video.mp4 --tracker configs/bytetrack.yaml --device cpu
+python -m tracking --source path/to/video.mp4 --tracker configs/bytetrack.yaml --motion-config configs/motion.yaml --device cpu
 
 # 路面标定：在含已知尺寸参照物的图像/首帧上取 4 个角点
 python -m analysis.interactive_calibrator --source path/to/road.jpg --width 6.0 --length 15.0
@@ -52,11 +53,13 @@ python -m analysis --source path/to/video.mp4 --device cpu --show
 python -m analysis --source path/to/video.mp4 --demo
 ```
 
-已验证环境：Python 3.11.9、PyTorch 2.11.0、torchvision 0.26.0、Ultralytics 8.4.182、opencv-python 5.0.0.93、lap 0.10.0。
+本次 CPU 验证环境：Python 3.12、PyTorch 2.11.0+cpu、torchvision 0.26.0、Ultralytics 8.4.182、opencv-python 5.0.0.93、lap 0.5.12。依赖中不存在的 lap 0.10.0 已修正。
 
 `python -m analysis` 主要参数：`--speed-limit`（30 km/h）、`--ema-alpha`（0.35）、`--window`/`--window-s`（测速窗）、`--ttc-critical`/`--ttc-caution`/`--horizon`（1.8/3.5/3.5 s）、`--parked-seconds`（3.0 s 静止确认）、`--alert-confirm`/`--alert-confirm-s`、`--alert-cooldown`/`--alert-cooldown-s`（去抖窗口）、`--reliable-span-s`（0.2 s 可信度跨度）、`--fps`（无源 FPS 时显式指定）、`--max-frames`、`--demo`、`--show`。**帧数/秒数成对参数一律秒级覆盖帧级。** 训练与检测评估入口 `python -m detection train|val` 见[检测模块实施说明](docs/车辆行人检测方案.md)。
 
 ## 输出产物
+
+`python -m tracking` 默认写入 `runs/yolo/track/run-*`，保存带 ID、轨迹、方向和 **px/s** 标签的 `annotated.mp4`，原有跟踪 JSONL/CSV、生命周期记录，以及新增的 `motion.jsonl`、`motion.csv` 和 `motion.resolved.yaml`。运动数据保留框、类别、置信度、输入/平滑接地点、源时间及有效性；漏检不补造观测，恢复首帧速度为空。`--source` 也可传入视频目录，`--trail-length` 覆盖配置中的历史长度。像素速度不表示实际 km/h，详见[运动模块解释文档](docs/modules/03_目标轨迹与图像运动状态_解释文档.md)。
 
 `runs/analysis/run-*`（或 `--output` 指定目录）：
 
@@ -79,10 +82,10 @@ python -m analysis --source path/to/video.mp4 --demo
 
 ```text
 detection/   YOLOv8 检测、训练与评估入口
-tracking/    ByteTrack 会话、轨迹导出与批处理
+tracking/    ByteTrack 会话、轨迹与 px/s 运动记录、平滑、可视化、批处理
 analysis/    标定 · 测速 · 冲突研判 · 事件去抖 · 渲染 · 端到端管线
-configs/     bytetrack.yaml、calibration.yaml、数据配置模板
-tests/       单元、集成与异常路径测试（107 项）
+configs/     bytetrack.yaml、motion.yaml、calibration.yaml、数据配置模板
+tests/       单元、集成与异常路径测试（125 项）
 docs/        课题需求、研究蓝图（含数学推导）与模块解释文档
 ```
 
@@ -90,4 +93,5 @@ docs/        课题需求、研究蓝图（含数学推导）与模块解释文�
 
 - [课题需求与技术路线](docs/课题需求与技术路线.md) · [课题全景蓝图与数学推导](docs/MASTER_RESEARCH_PROMPT.md)
 - [检测模块实施说明](docs/车辆行人检测方案.md) · [YOLOv8 解释文档](docs/modules/01_目标检测_YOLOv8与PyTorch_解释文档.md) · [ByteTrack 解释文档](docs/modules/02_多目标跟踪_ByteTrack_解释文档.md)
+- [目标轨迹与图像运动状态解释文档](docs/modules/03_目标轨迹与图像运动状态_解释文档.md)
 - [Ultralytics YOLOv8](https://docs.ultralytics.com/models/yolov8/) · [ByteTrack 项目](https://github.com/FoundationVision/ByteTrack)

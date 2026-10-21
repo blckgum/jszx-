@@ -7,6 +7,7 @@ from pathlib import Path
 from detection.core import DEFAULT_WEIGHTS
 from .core import DEFAULT_TRACKER, track_video
 from .batch import track_directory
+from .motion import DEFAULT_MOTION_CONFIG
 
 
 def positive_int(text):
@@ -27,7 +28,8 @@ def main(argv=None):
     parser.add_argument("--imgsz", type=positive_int, default=640)
     parser.add_argument("--conf", type=float, default=None, help="默认跟随 track_low_thresh，不能高于它")
     parser.add_argument("--iou", type=float, default=0.7, help="检测 NMS 阈值，不是跟踪匹配阈值")
-    parser.add_argument("--trail-length", type=positive_int, default=60, help="最近多少源帧的观测轨迹")
+    parser.add_argument("--motion-config", default=str(DEFAULT_MOTION_CONFIG), help="图像运动与平滑 YAML")
+    parser.add_argument("--trail-length", type=positive_int, default=None, help="覆盖运动 YAML 的历史源帧数")
     parser.add_argument("--max-frames", type=positive_int, default=None)
     parser.add_argument("--fps", type=float, default=None, help="覆盖输出 FPS 和固定间隔时间轴")
     parser.add_argument("--show", action="store_true", help="本地桌面显示，支持 Space/P 暂停、Q/Esc 退出")
