@@ -149,6 +149,8 @@ class TrackMotionTracker:
         t_last, x_last, y_last = self.history[-1]
         dt = t_last - t_first
 
+        # 窗口首末时间戳无跨度时（重复投影位置挤占窗口等）dt≈0，
+        # 差分会放大成无穷速度：按零速度处理而不除以微小 dt
         if dt <= 1e-4:
             raw_vx, raw_vy = 0.0, 0.0
         else:

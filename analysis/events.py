@@ -223,6 +223,8 @@ class ConflictEventTracker:
                     self._finalized.append(st.event)
                     del self._states[key]
             else:
+                # 仅挂起过就静默的键整键移除：从未确认的事件不占内存，
+                # 防止一闪而过的干扰让 _states 无限膨胀
                 del self._states[key]
 
         return annotations

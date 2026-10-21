@@ -270,6 +270,8 @@ class ConflictPerceptionPipeline:
                 if not ok or frame is None:
                     break
 
+                # 时间戳优先级：容器内嵌 PTS 优先，解码器给不出有效 PTS 时
+                # VideoClock 按帧率推算，保证时间轴严格递增
                 pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
                 timestamp_s, time_kind = video_clock.timestamp(frame_idx, pts_ms)
 
@@ -345,6 +347,8 @@ class ConflictPerceptionPipeline:
                     jsonl_file.write(json.dumps(json_item, ensure_ascii=False) + "\n")
 
                 for r in speed_readings:
+                    # 车辆读数在 veh_map 按 veh_track_id 命中；行人读数落在
+                    # ped_map（按其关联车辆中的最高风险聚合），两次查找或取一
                     c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
                     risk_lvl = c.risk_level.name if c else "LEVEL_0_SAFE"
                     ttc_val = round(c.ttc_seconds, 2) if (c and c.ttc_seconds) else ""
