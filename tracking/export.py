@@ -1,5 +1,8 @@
 """流式保存观测与轨迹生命周期；不把丢失期间的预测当作真实检测。"""
 
+# 配套笔记：docs/modules/02_多目标跟踪_ByteTrack_解释文档.md，第 6.4、8、11 节。
+# 本文件记录“看到了什么”和“何时丢失/恢复”，不负责决定两个框是不是同一目标。
+
 from __future__ import annotations
 
 import csv
@@ -12,11 +15,13 @@ from .records import FrameRecord, TargetRecord
 
 
 def json_line(stream, value):
+    # 每行一个完整 JSON，便于长视频逐行读取；拒绝 NaN/Infinity，避免下游解析歧义。
     stream.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
 
 
 @dataclass
 class TrackStatistics:
+    # 只保存一条活动 ID 的累计量；这里的 last_frame 是最后观测帧，不是最后预测帧。
     first_frame: int
     first_time: float
     last_frame: int
@@ -43,6 +48,7 @@ class RunExports:
     def __init__(self, output):
         self.resources = ExitStack()
         try:
+            # 多文件构造中任一步失败，都关闭此前已打开的流，避免留下文件句柄。
             self.frames = self.resources.enter_context((output / "tracks.jsonl").open("w", encoding="utf-8"))
             self.events = self.resources.enter_context((output / "events.jsonl").open("w", encoding="utf-8"))
             self.tracklets = self.resources.enter_context((output / "tracklets.jsonl").open("w", encoding="utf-8"))
@@ -75,6 +81,7 @@ class RunExports:
             self.active[track_id] = stats
             self._event(record, track_id, "started")
         elif stats.missing:
+            # 例如帧 0 和帧 3 有观测，中间缺帧 1、2：gap = 3 - 0 - 1 = 2。
             gap = record.frame_index - stats.last_frame - 1
             stats.recoveries += 1
             stats.max_gap_frames = max(stats.max_gap_frames, gap)
@@ -94,6 +101,7 @@ class RunExports:
     def write(self, record: FrameRecord, retained_ids: set[int]):
         """retained_ids 来自真实跟踪器的存活池，包含暂时 Lost 的轨迹。"""
         json_line(self.frames, record.to_dict())
+        # 先保存整帧，空帧也有一行；CSV 只保存目标，因此不能单靠 CSV 重建空帧时间轴。
         observed = set()
         for target in record.tracks:
             self.csv.writerow((
@@ -103,6 +111,7 @@ class RunExports:
                 *target.bbox_xyxy, *target.anchor_xy, target.anchor_type, target.observation,
             ))
             if target.track_id is not None:
+                # pending 框仍写入 CSV，但没有有效身份，不能进入按 ID 聚合的统计。
                 observed.add(target.track_id)
                 self._observe(record, target)
         for track_id, stats in list(self.active.items()):
@@ -112,17 +121,20 @@ class RunExports:
                 # 可能是超时删除，也可能是库内部去重；不能一概解释成超过 buffer。
                 self._close_track(record, track_id, "tracker_removed")
             elif not stats.missing:
+                # 连续丢失只记录一次；再次真正观测到这个 ID 时，由 _observe 记录恢复。
                 stats.missing = True
                 self._event(record, track_id, "lost", last_observed_frame=stats.last_frame)
         self.last_record = record
 
     def _close_track(self, record, track_id, reason):
+        # 关闭后写出汇总并从 active 移除，避免所有历史轨迹统计随视频长度一直驻留。
         stats = self.active.pop(track_id)
         self._event(record, track_id, "closed", reason=reason, last_observed_frame=stats.last_frame)
         json_line(self.tracklets, {
             "schema_version": 1, "session_id": record.session_id, "track_id": track_id,
             "first_frame_index": stats.first_frame, "last_frame_index": stats.last_frame,
             "first_timestamp_s": stats.first_time, "last_timestamp_s": stats.last_time,
+            # 这是首末观测的时间差，包含中间缺口；不等于每一瞬间都有有效检测。
             "observed_span_s": stats.last_time - stats.first_time,
             "observations": stats.observations,
             "unobserved_frames_within_span": stats.last_frame - stats.first_frame + 1 - stats.observations,

@@ -1,3 +1,6 @@
+# 原理笔记：docs/modules/03_图像分类实验_原理笔记.md。
+# 本文件属于原有分类学习模块；校园道路检测与跟踪使用 detection/、tracking/ 入口。
+
 """
 common.py —— 通用工具
 
@@ -183,7 +186,9 @@ def set_seed(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
-    # 让 Python 的哈希也稳定（影响 set/dict 的遍历顺序）
+    # 为后续子进程提供哈希种子；当前进程的哈希随机化不变
+    # 哈希种子在进程启动时读取；此设置只影响随后启动并继承环境的 Python 进程。
+    # 当前进程的哈希随机化不会因此改变，跨硬件/版本复现还需单独核验。
     os.environ["PYTHONHASHSEED"] = str(seed)
 
 

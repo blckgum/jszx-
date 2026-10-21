@@ -1,5 +1,8 @@
 """生成可复现的功能样例；镜像、平移和黑帧不代表真实校园交通运动。"""
 
+# 原理笔记：docs/modules/02_多目标跟踪_ByteTrack_解释文档.md，第 8.2、9 节。
+# 两个黑帧检查“没有检测仍推进一帧”；相同内容的第二段检查“换视频重置会话”。
+
 import argparse
 import importlib.util
 import shutil

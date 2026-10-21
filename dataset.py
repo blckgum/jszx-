@@ -1,3 +1,6 @@
+# 原理笔记：docs/modules/03_图像分类实验_原理笔记.md。
+# 本文件属于原有分类学习模块；校园道路检测与跟踪使用 detection/、tracking/ 入口。
+
 """
 dataset.py —— 数据加载与增强
 
@@ -267,7 +270,7 @@ def build_dataloaders(
 
         # ★ 从训练集里再切出 10% 做验证集
         #   注意：验证集要用 eval_tf（无增强），所以不能直接从 train_full 切。
-        #   正确做法是从 test_set 借一个 clean 版本 —— 这里我们手工切。
+        #   下面重新加载训练数据的无增强视图；不从官方测试集借样本。
         n_total = len(train_full)
         n_val = int(n_total * 0.1)
         n_train = n_total - n_val
@@ -293,9 +296,8 @@ def build_dataloaders(
         print(f"测试集: {len(test_set)} 张 (无增强，最终评估用)")
 
     # ---------- 包装成 DataLoader ----------
-    # ★ Windows 上 num_workers 必须为 0，否则多进程会反复重启、卡死。
-    #   这是 Windows + PyTorch 的经典坑，报错信息通常是
-    #   "RuntimeError: An attempt has been made to start a new process..."
+    # 教学默认 num_workers=0，减少进程启动配置；Windows 多进程并非不可用，
+    # 但需主入口保护与可序列化对象。合成数据也强制主进程加载，便于离线检查。
     num_workers = 0 if use_synthetic else config.NUM_WORKERS
 
     # pin_memory: 把数据先放进"锁页内存"，传到 GPU 时更快。
@@ -317,7 +319,8 @@ def build_dataloaders(
                            #   否则每轮都是同样的顺序，模型会学到"顺序"这个无关信息，
                            #   而且连续读到同一类会导致梯度方向偏斜。
         drop_last=True,    # 丢掉最后不满的批次。
-                           # 因为 BatchNorm 在 batch_size=1 时会报错。
+                           # 避免末批过小影响批统计；BatchNorm2d 是否报错还取决于空间尺寸。
+                           # 注意 batch_size 大于训练集长度时，drop_last 会使整轮没有批次。
         **common_kwargs,
     )
 

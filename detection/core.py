@@ -6,7 +6,8 @@
 # 本文件的数据流：
 # OpenCV 读图/解码视频 -> YOLOv8 预处理及推理 -> 置信度筛选和 NMS
 # -> 原图坐标下的检测框 -> 绘制标注 + 逐帧 JSONL。
-# 这是检测阶段；稳定目标 ID、真实速度和 TTC 由后续模块完成。
+# 检测入口不关联跨帧身份；ID 由已实现的 tracking 模块维护，实际速度和 TTC 尚待实现。
+# 原理笔记：docs/modules/01_目标检测_YOLOv8与PyTorch_解释文档.md。
 
 from __future__ import annotations
 
@@ -160,7 +161,7 @@ def detect(args) -> Path:
                 "confidence": confidence, "bbox_xyxy": coords, "track_id": None,
             })
             # track_id 暂为 None：逐帧检测不判断“这一帧的车是不是上一帧那辆车”。
-            # 接入 ByteTrack 后，才由跟踪器为连续目标分配并维护 ID。
+            # 需要跨帧 ID 时使用 python -m tracking，由 ByteTrack 分配并维护身份。
             counts[class_name] += 1
             # OpenCV 的绘图颜色也是 BGR。绘制时坐标取整，JSON 仍保留浮点坐标，
             # 避免将显示所需的舍入误差传给后续轨迹与几何计算。

@@ -1,5 +1,9 @@
 """独立视频跟踪会话：YOLOv8 检测 + Ultralytics ByteTrack，逐帧保持状态。"""
 
+# 原理笔记：docs/modules/02_多目标跟踪_ByteTrack_解释文档.md。
+# 阅读主线：参数校验 -> VideoClock 源时间 -> TrackingSession 逐帧关联
+# -> FrameRecord 数据接口 -> RunExports 保存。画面绘制只消费结果，不改变关联。
+
 from __future__ import annotations
 
 import math
@@ -22,6 +26,8 @@ DEFAULT_TRACKER = ROOT / "configs" / "bytetrack.yaml"
 
 
 def resolve_conf(config, conf):
+    # 检测筛选先于跟踪关联；若这里丢掉低分框，ByteTrack 第二阶段无法再找回来。
+    # 默认沿用低分阈值；更低的 conf 可以传入，但新轨迹仍受跟踪器自身阈值约束。
     value = config["track_low_thresh"] if conf is None else conf
     if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= config["track_low_thresh"]:
         raise ValueError("检测 conf 必须大于 0 且不高于 track_low_thresh，保留第二阶段关联候选")
@@ -34,6 +40,7 @@ def read_tracker_config(path):
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
         raise ValueError(f"跟踪配置 YAML 格式错误：{exc}") from None
+    # 限定已支持的键，及早发现拼写错误；safe_load 不执行 YAML 中的 Python 对象。
     required = {"tracker_type", "track_high_thresh", "track_low_thresh", "new_track_thresh",
                 "track_buffer", "match_thresh", "fuse_score"}
     if not isinstance(config, dict) or set(config) != required:
@@ -54,6 +61,8 @@ def read_tracker_config(path):
 
 
 class VideoClock:
+    # 这里管理视频的采样时间；time.perf_counter() 只用于衡量处理耗时。
+    # CPU 跑得慢不会让源视频中的运动变慢，后续位移计算应读取 timestamp_s。
     def __init__(self, fps: float, force_fps: bool = False):
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError("fps 必须是有限正数")
@@ -64,6 +73,8 @@ class VideoClock:
     def timestamp(self, frame_index: int, milliseconds: float):
         timestamp = milliseconds / 1000.0
         kind = "video_pts"
+        # 解码器未给出有效且递增的时间时，用从 0 开始的帧号 / FPS 估计。
+        # 若估计值仍倒退就报错，而不悄悄修改时间；--fps 会对整段统一采用估计轴。
         if (self.force_fps or not math.isfinite(timestamp) or timestamp < 0
                 or timestamp <= self.previous):
             timestamp, kind = frame_index / self.fps, "fps_estimate"
@@ -84,6 +95,7 @@ class TrackingSession:
         self.class_ids = select_classes(self.model.names, classes)
         self.class_names = [self.model.names[index] for index in self.class_ids]
         self.source = str(Path(source).expanduser().resolve())
+        # 数字 ID 可在新视频重复，跨视频引用必须同时带上 session_id。
         self.session_id = uuid4().hex
         self.frame_index = 0
         self.tracker_path = str(Path(tracker_path).resolve())
@@ -109,10 +121,12 @@ class TrackingSession:
             classes=self.class_ids, imgsz=self.imgsz, iou=self.iou,
             device=self.device, batch=1, verbose=False,
         )[0]
+        # 一次只输入一帧，所以 [0] 是这帧的 Results；其中可包含多个目标或空列表。
         height, width = frame.shape[:2]
         record = FrameRecord(self.session_id, self.source, self.frame_index, timestamp,
                              timestamp_source, width, height, extract_tracks(result))
         self.frame_index += 1
+        # 仅在本帧处理成功后推进本项目的计数；非法输入不会消耗一个跟踪时间步。
         self.previous_time, self.frame_shape = timestamp, frame.shape
         return record
 
@@ -191,6 +205,7 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
         frozen_tracker.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
         exports = RunExports(output_path)
         session = TrackingSession(source, weights, frozen_tracker, classes, conf, imgsz, iou, device)
+        # 显示历史与关联缓冲分工不同：前者决定画多少点，后者由 ByteTrack 管理丢失 ID。
         history = TrailHistory(trail_length, config["track_buffer"])
         playback = PlaybackController()
         if show:
@@ -213,6 +228,7 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
                 annotated = annotate(frame, record, history, source_fps, measured_fps,
                                      total_frames, session.class_names, interactive=show)
                 if writer is None:
+                    # 编码器使用 (宽, 高)，与 NumPy shape 的 (高, 宽, 通道) 顺序不同。
                     writer = cv2.VideoWriter(str(output_path / "annotated.mp4"),
                                              cv2.VideoWriter_fourcc(*"mp4v"), effective_fps,
                                              (record.width, record.height))
@@ -221,6 +237,7 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
                 writer.write(annotated)
                 exports.write(record, session.retained_ids())
                 processed += 1
+                # 累计观测次数会重复计入同一辆车；出现过的 ID 数也可能受到 ID 切换影响。
                 observations.update(target.class_name for target in record.tracks)
                 track_ids.update(target.track_id for target in record.tracks if target.track_id is not None)
                 duration = time.perf_counter() - frame_start
@@ -252,6 +269,7 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
         # 推理、编码或时间轴出错仍封装已完成的视频，并留下失败原因，调用方继续收到异常。
         stop_reason, failure = "error", exc
     finally:
+        # release 完成 MP4 封装；仅看到磁盘上有文件，还不能确认视频可播放。
         capture.release()
         if writer is not None:
             writer.release()
@@ -267,6 +285,8 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
         if failure is not None:
             raise failure
         raise KeyboardInterrupt
+    # 处理范围与运行状态分开保存：max_frames/user_quit 也可正常完成，但并非读完源视频。
+    # 元数据帧数可能不准，read=False 也可能是解码失败，因此额外报告帧数不一致。
     write_json(output_path / "summary.json", {
         "schema_version": 2, "session_id": session.session_id if session else None, "source": str(source),
         "weights": str(Path(weights).expanduser().resolve()),

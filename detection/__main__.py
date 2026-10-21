@@ -5,6 +5,7 @@
 # train：用图片及人工标签更新模型参数，并在验证集上评价训练进展。
 # val：用人工标签核对模型预测，计算指标，不更新模型参数；也支持选择 test 集合。
 # 三者共用 YOLOv8，但输入要求、输出和用途不同。
+# 原理笔记：docs/modules/01_目标检测_YOLOv8与PyTorch_解释文档.md，第 6、8、13 节。
 
 from __future__ import annotations
 
@@ -115,7 +116,7 @@ def main(argv=None):
             sub.add_argument("--source", required=True, help="本地图片、图片目录或视频")
             sub.add_argument("--classes", nargs="+", help="按名称筛选，如 person car bus truck")
             # conf 筛分数，iou 控制 NMS 对重复框的抑制；这两个阈值解决不同问题。
-            # 后续接 ByteTrack 时应联合调整 conf 与跟踪阈值，保留用于关联的低分候选。
+            # tracking 入口会单独约束 conf 与低分关联阈值；不能照搬本检测入口的默认值。
             sub.add_argument("--conf", type=probability, default=0.25)
             sub.add_argument("--iou", type=probability, default=0.7)
             sub.add_argument("--max-frames", type=positive_int, help="仅处理前 N 帧/张图片")

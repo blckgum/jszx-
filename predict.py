@@ -1,3 +1,6 @@
+# 原理笔记：docs/modules/03_图像分类实验_原理笔记.md。
+# 本文件属于原有分类学习模块；校园道路检测与跟踪使用 detection/、tracking/ 入口。
+
 """
 predict.py —— 推理（用训练好的模型识别新图片）
 
@@ -171,6 +174,8 @@ def predict_image(
         img = Image.open(image).convert("RGB")
         tensor = transform(img)            # [3, 32, 32]
     else:
+        # 张量输入直接使用；调用方负责尺寸、通道和训练时一致的预处理。
+        # --fake 数据训练时跳过标准化；任意真实图片路径并不与该合成分布一致。
         tensor = image                     # 已经是张量了
 
     # ---------- 2. 加一个"批次"维度 ----------
@@ -374,8 +379,8 @@ def main() -> None:
     if args.demo:
         banner("演示模式：随机输入")
         # 造一张假的图，看看模型怎么反应。
-        # 随机噪声模型当然认不出来，会输出接近均匀的概率分布。
-        # 这正好演示了"模型不确定时是什么样"。
+        # 随机输入只演示接口；即使是域外噪声，Softmax 也可能给出很高分数。
+        # 分布外数据不保证产生均匀概率，输出不能当作真实分类效果。
         fake_image = torch.randn(3, 32, 32)
 
         results = predict_image(model, fake_image, class_names, device, top_k=args.top_k)
