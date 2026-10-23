@@ -1,0 +1,30 @@
+# 示例仅用于代码功能检查；不能改个名称就当成校园机位的真实标定。
+schema_version: 1
+camera_id: synthetic_rectangle
+image_size: [800, 600]  # [width, height]，原图像素坐标系；裁剪、缩放后不能直接沿用。
+source_type: synthetic
+measurement_reference: Constructed rectangle example; no real road measurements
+
+# 对应顺序由同一个物理点决定。rectangle 模式特指矩形四角沿边界的顺序。
+method: rectangle
+image_points: [[100, 100], [700, 100], [700, 500], [100, 500]]
+ground_points_m: [[0, 0], [6, 0], [6, 20], [0, 20]]
+roi_image_points: null  # null 使用拟合内点的凸包；自定义 ROI 不得超出它。
+
+# 与拟合点不同的独立检查位置。示例坐标由构造关系产生，不是实测精度证据。
+check_image_points: [[200, 200], [600, 200], [600, 400], [200, 400]]
+check_ground_points_m: [[1, 5], [5, 5], [5, 15], [1, 15]]
+
+# 直接拟合像素→米时，RANSAC 阈值单位也是米。仅 method: ransac 时用于稳健拟合。
+ransac_threshold_m: 0.2
+# 这两个是待场景确定的验收阈值，不是已达到的实测误差。
+max_check_rmse_m: 0.25
+max_check_error_m: 0.5
+
+# null 表示“未做镜头畸变校正”，不等于镜头没有畸变。
+# 已有真实内参时使用：
+# lens:
+#   model: opencv_pinhole
+#   camera_matrix: [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+#   distortion_coefficients: [k1, k2, p1, p2, k3]
+lens: null
