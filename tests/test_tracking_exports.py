@@ -132,6 +132,32 @@ class TrackingExportTests(unittest.TestCase):
 
 
 class TrackingInputTests(unittest.TestCase):
+    def test_early_input_failure_writes_summary(self):
+        import cv2
+
+        cases = ("closed", "missing_fps")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source = root / "video.mp4"
+                source.touch()
+                capture = Mock()
+                capture.isOpened.return_value = case != "closed"
+                if case == "missing_fps":
+                    capture.get.side_effect = lambda prop: {
+                        cv2.CAP_PROP_FPS: 0.0,
+                    }.get(prop, 0.0)
+                with patch("cv2.VideoCapture", return_value=capture):
+                    with self.assertRaises(ValueError):
+                        track_video(source, output=root / "output")
+                capture.release.assert_called_once()
+                summary = json.loads(
+                    (root / "output" / "summary.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(summary["status"], "failed")
+                self.assertEqual(summary["stop_reason"], "error")
+                self.assertEqual(summary["frames_processed"], 0)
+
     def test_model_initialization_error_is_recorded_and_capture_is_released(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

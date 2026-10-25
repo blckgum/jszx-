@@ -1449,6 +1449,7 @@ class TestPipelineIO(unittest.TestCase):
             self.assertEqual(summary["stop_reason"], "initialization")
             self.assertEqual(summary["frames_processed"], 0)
             self.assertIn("RuntimeError", summary["error"])
+            self.assertIn("elapsed_seconds", summary)
 
     def test_output_file_failure_releases_resources(self):
         # 第三个输出文件打开失败：cap/writer/已开文件全部释放

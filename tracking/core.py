@@ -168,7 +168,9 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
     if show:
         check_display()
 
-    capture = cv2.VideoCapture(str(source))
+    # 先创建本次运行目录，再打开输入；这样坏视频或缺失 FPS 也能留下失败 summary。
+    output_path = new_run(output, "track")
+    capture = None
     writer = None
     window_open = False
     window_name = "YOLOv8 + ByteTrack"
@@ -178,11 +180,12 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
     recent_times = deque(maxlen=30)
     observations = Counter()
     track_ids = set()
-    session = exports = output_path = history = None
+    session = exports = history = None
     source_fps = effective_fps = total_frames = None
     failure = None
     wall_start = time.perf_counter()
     try:
+        capture = cv2.VideoCapture(str(source))
         if not capture.isOpened():
             raise ValueError(f"无法打开视频：{source}")
         raw_fps = capture.get(cv2.CAP_PROP_FPS)
@@ -193,7 +196,6 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
         reported = capture.get(cv2.CAP_PROP_FRAME_COUNT)
         total_frames = int(reported) if math.isfinite(reported) and reported > 0 else None
         clock = VideoClock(effective_fps, force_fps=fps is not None)
-        output_path = new_run(output, "track")
         # 保存本次实际使用的配置，后续调参不会改变旧实验的参数记录。
         frozen_tracker = output_path / "tracker.resolved.yaml"
         frozen_tracker.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -265,7 +267,8 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
         # 推理、编码或时间轴出错仍封装已完成的视频，并留下失败原因，调用方继续收到异常。
         stop_reason, failure = "error", exc
     finally:
-        capture.release()
+        if capture is not None:
+            capture.release()
         if writer is not None:
             writer.release()
         if window_open:
