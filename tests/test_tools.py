@@ -13,7 +13,8 @@ from analysis.calibration import RoadCalibrator
 from analysis.conflict import ConflictAnalyzer, RiskLevel
 from analysis.evaluate import evaluate_run, main as evaluate_main, to_markdown
 from analysis.pipeline import ConflictPerceptionPipeline
-from analysis.policy import object_policy
+from analysis.policy import object_policy, read_object_policy_config
+from analysis.scenarios import default_scenarios, main as scenarios_main, run_scenarios
 from analysis.speed import SpeedEstimator, SpeedReading
 
 
@@ -88,6 +89,94 @@ class AnalysisToolTests(unittest.TestCase):
         self.assertEqual(reading.object_kind, "motorcycle")
         reading2 = estimator.update(1, "vehicle", 0.1, 3.0, 0.5)
         self.assertEqual(reading2.object_kind, "motorcycle")
+
+    def test_policy_yaml_can_override_defaults(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "policy.yaml"
+            path.write_text(
+                "schema_version: 1\npolicies:\n"
+                "  person: {kind: pedestrian, safe_radius_veh_m: 0.8, label: person}\n"
+                "  pedestrian: {kind: pedestrian, safe_radius_veh_m: 0.8, label: pedestrian}\n"
+                "  vehicle: {kind: motor_vehicle, safe_radius_veh_m: 4.2, label: custom}\n"
+                "  motor_vehicle: {kind: motor_vehicle, safe_radius_veh_m: 4.2, label: custom}\n",
+                encoding="utf-8",
+            )
+            policies = read_object_policy_config(path)
+            self.assertEqual(policies["vehicle"].safe_radius_veh_m, 4.2)
+            calibrator = RoadCalibrator(
+                [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)], 10.0, 10.0
+            )
+            pipeline = ConflictPerceptionPipeline(
+                calibrator=calibrator, object_policy_config=path
+            )
+            self.assertEqual(
+                pipeline.speed_estimator.object_policies["vehicle"].safe_radius_veh_m, 4.2
+            )
+            # 验证自定义安全半径 (4.2m + 0.8m = 5.0m) 实际影响 ConflictAnalyzer 风险分级：
+            # 当 D_min = 3.5m, TTC = 1.0s 时，默认汽车 (3.0m) 为 LEVEL_2_CAUTION，
+            # 而自定义 4.2m 半径下 (3.5m <= 5.0m) 升级为 LEVEL_3_CRITICAL
+            veh = SpeedReading(
+                track_id=1, category="vehicle", object_kind="motor_vehicle",
+                x_m=3.0, y_m=0.0, vx_ms=0.0, vy_ms=6.0,
+                speed_ms=6.0, speed_kmh=21.6, is_speeding=False,
+                heading_deg=90.0, is_reliable=True,
+            )
+            ped = SpeedReading(
+                track_id=2, category="pedestrian", object_kind="pedestrian",
+                x_m=6.5, y_m=6.0, vx_ms=0.0, vy_ms=0.0,
+                speed_ms=0.0, speed_kmh=0.0, is_speeding=False,
+                heading_deg=0.0, is_reliable=True,
+            )
+            default_res = ConflictAnalyzer().evaluate_pair(veh, ped)
+            custom_res = pipeline.conflict_analyzer.evaluate_pair(veh, ped)
+            self.assertEqual(default_res.risk_level, RiskLevel.LEVEL_2_CAUTION)
+            self.assertEqual(custom_res.risk_level, RiskLevel.LEVEL_3_CRITICAL)
+
+    def test_invalid_policy_configs_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaises(FileNotFoundError):
+                read_object_policy_config(root / "missing.yaml")
+
+            bad_cases = [
+                "not: [valid: yaml",
+                "schema_version: 2\npolicies: {}\n",
+                "schema_version: 1\npolicies: {}\n",
+                (
+                    "schema_version: 1\npolicies:\n"
+                    "  person: {kind: pedestrian, safe_radius_veh_m: -1.0, label: p}\n"
+                    "  pedestrian: {kind: pedestrian, safe_radius_veh_m: 0.8, label: p}\n"
+                    "  vehicle: {kind: motor_vehicle, safe_radius_veh_m: 2.2, label: v}\n"
+                    "  motor_vehicle: {kind: motor_vehicle, safe_radius_veh_m: 2.2, label: v}\n"
+                ),
+                (
+                    "schema_version: 1\npolicies:\n"
+                    "  person: {kind: pedestrian, safe_radius_veh_m: true, label: p}\n"
+                    "  pedestrian: {kind: pedestrian, safe_radius_veh_m: 0.8, label: p}\n"
+                    "  vehicle: {kind: motor_vehicle, safe_radius_veh_m: 2.2, label: v}\n"
+                    "  motor_vehicle: {kind: motor_vehicle, safe_radius_veh_m: 2.2, label: v}\n"
+                ),
+                (
+                    "schema_version: 1\npolicies:\n"
+                    "  person: {kind: pedestrian, safe_radius_veh_m: 0.8, label: p}\n"
+                ),
+            ]
+            for idx, text in enumerate(bad_cases):
+                p = root / f"bad_{idx}.yaml"
+                p.write_text(text, encoding="utf-8")
+                with self.assertRaises(ValueError, msg=f"case {idx} should fail"):
+                    read_object_policy_config(p)
+
+    def test_synthetic_scenario_library_passes(self):
+        results = run_scenarios(default_scenarios())
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(result["passed"] for result in results))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "scenarios.json"
+            self.assertEqual(scenarios_main(["--output", str(output)]), 0)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertTrue(all(result["passed"] for result in payload["results"]))
 
     def test_vehicle_safe_radius_changes_conflict_risk_level(self):
         analyzer = ConflictAnalyzer()

@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .policy import object_policy
+from .policy import ObjectPolicy, object_policy
 
 
 @dataclass
@@ -53,6 +53,7 @@ class TrackMotionTracker:
         stationary_min_frames: int = 8,
         reliable_min_span_s: float = 0.2,
         object_kind: str | None = None,
+        object_policies: dict[str, ObjectPolicy] | None = None,
     ):
         if type(window_size) is not int or window_size < 3:
             raise ValueError("window_size 必须是 >= 3 的整数帧数")
@@ -75,7 +76,8 @@ class TrackMotionTracker:
         self.stationary_speed_ms = stationary_speed_ms
         self.stationary_min_frames = stationary_min_frames
         self.reliable_min_span_s = reliable_min_span_s
-        self.object_kind = object_policy(object_kind, category).kind
+        self.object_policies = object_policies
+        self.object_kind = object_policy(object_kind, category, object_policies).kind
 
         # 历史物理轨迹窗口: deque of (timestamp_s, x_m, y_m)
         self.history: deque[Tuple[float, float, float]] = deque(maxlen=window_size)
@@ -247,6 +249,7 @@ class SpeedEstimator:
         stationary_speed_ms: float = 0.1,
         stationary_min_frames: int = 8,
         category_confirm_frames: int = 3,
+        object_policies: dict[str, ObjectPolicy] | None = None,
         reliable_min_span_s: float = 0.2,
     ):
         if not math.isfinite(ema_alpha) or not (0 < ema_alpha <= 1):
@@ -269,6 +272,7 @@ class SpeedEstimator:
         self.stationary_speed_ms = stationary_speed_ms
         self.stationary_min_frames = stationary_min_frames
         self.category_confirm_frames = category_confirm_frames
+        self.object_policies = object_policies
         self.reliable_min_span_s = reliable_min_span_s
         self.tracks: Dict[int, TrackMotionTracker] = {}
 
@@ -288,6 +292,7 @@ class SpeedEstimator:
                 stationary_min_frames=self.stationary_min_frames,
                 reliable_min_span_s=self.reliable_min_span_s,
                 object_kind=object_kind,
+                object_policies=self.object_policies,
             )
         else:
             tracker = self.tracks[track_id]
@@ -305,7 +310,9 @@ class SpeedEstimator:
                 if tracker.category in ("pedestrian", "person"):
                     tracker.object_kind = "pedestrian"
                 elif object_kind is not None or tracker.object_kind == "pedestrian":
-                    tracker.object_kind = object_policy(object_kind, tracker.category).kind
+                    tracker.object_kind = object_policy(
+                        object_kind, tracker.category, tracker.object_policies
+                    ).kind
         return self.tracks[track_id].update(timestamp_s, x_m, y_m)
 
     def prune_stale_tracks(self, live_track_ids: set[int]):

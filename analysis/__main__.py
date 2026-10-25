@@ -14,6 +14,7 @@ from detection.core import DEFAULT_WEIGHTS
 from tracking.core import DEFAULT_TRACKER
 from .calibration import RoadCalibrator
 from .pipeline import ConflictPerceptionPipeline
+from .policy import DEFAULT_OBJECT_POLICY_CONFIG
 
 
 def main(argv: list[str] | None = None):
@@ -38,6 +39,12 @@ def main(argv: list[str] | None = None):
         type=str,
         default=str(DEFAULT_TRACKER),
         help="ByteTrack 配置文件路径 (默认 configs/bytetrack.yaml)",
+    )
+    parser.add_argument(
+        "--object-policy",
+        type=str,
+        default=str(DEFAULT_OBJECT_POLICY_CONFIG),
+        help="车辆类别与安全半径策略 YAML",
     )
     parser.add_argument(
         "--speed-limit",
@@ -296,6 +303,7 @@ def main(argv: list[str] | None = None):
         alert_cooldown_seconds=args.alert_cooldown_s,
         reliable_min_span_s=args.reliable_span_s,
         fps=args.fps,
+        object_policy_config=args.object_policy,
     )
 
     summary = pipeline.process_video(

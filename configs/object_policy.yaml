@@ -1,0 +1,39 @@
+# 代码策略默认值，用于区分目标几何包络；不是现场测量结论。
+schema_version: 1
+policies:
+  person:
+    kind: pedestrian
+    safe_radius_veh_m: 0.8
+    label: 行人
+  pedestrian:
+    kind: pedestrian
+    safe_radius_veh_m: 0.8
+    label: 行人
+  bicycle:
+    kind: bicycle
+    safe_radius_veh_m: 1.2
+    label: 非机动车·自行车
+  motorcycle:
+    kind: motorcycle
+    safe_radius_veh_m: 1.8
+    label: 机动车·摩托车
+  car:
+    kind: car
+    safe_radius_veh_m: 2.2
+    label: 机动车·汽车
+  bus:
+    kind: bus
+    safe_radius_veh_m: 2.8
+    label: 机动车·公交车
+  truck:
+    kind: truck
+    safe_radius_veh_m: 2.8
+    label: 机动车·卡车
+  vehicle:
+    kind: motor_vehicle
+    safe_radius_veh_m: 2.2
+    label: 机动车·车辆
+  motor_vehicle:
+    kind: motor_vehicle
+    safe_radius_veh_m: 2.2
+    label: 机动车·车辆

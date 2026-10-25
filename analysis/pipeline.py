@@ -30,7 +30,7 @@ from .conflict import (
     build_conflict_maps,
 )
 from .events import ConflictEventTracker
-from .policy import POLICIES
+from .policy import DEFAULT_OBJECT_POLICY_CONFIG, read_object_policy_config
 from .speed import SpeedEstimator, SpeedReading
 from .visualization import EnhancedConflictVisualizer, trajectory_color
 
@@ -65,6 +65,7 @@ class ConflictPerceptionPipeline:
         alert_cooldown_frames: int = 12,
         alert_cooldown_seconds: Optional[float] = None,
         fps: Optional[float] = None,
+        object_policy_config: str | Path = DEFAULT_OBJECT_POLICY_CONFIG,
     ):
         if not math.isfinite(iou) or not (0 < iou <= 1):
             raise ValueError("iou 必须在 (0, 1] 区间")
@@ -107,6 +108,8 @@ class ConflictPerceptionPipeline:
         self.alert_cooldown_frames = alert_cooldown_frames
         self.alert_cooldown_seconds = alert_cooldown_seconds
         self.fps = fps
+        self.object_policy_config = str(Path(object_policy_config).expanduser().resolve())
+        self.object_policies = read_object_policy_config(object_policy_config)
         self.window_size = window_size
         self.ema_alpha = ema_alpha
         self.ttc_critical_s = ttc_critical_s
@@ -126,6 +129,7 @@ class ConflictPerceptionPipeline:
             stationary_min_frames=stationary_min_frames,
             category_confirm_frames=category_confirm_frames,
             reliable_min_span_s=reliable_min_span_s,
+            object_policies=self.object_policies,
         )
         self.speed_estimator = SpeedEstimator(**self._estimator_kwargs)
         self.event_tracker = ConflictEventTracker(
@@ -137,6 +141,7 @@ class ConflictPerceptionPipeline:
             ttc_critical_s=ttc_critical_s,
             ttc_caution_s=ttc_caution_s,
             horizon_s=horizon_s,
+            object_policies=self.object_policies,
         )
         self.visualizer = EnhancedConflictVisualizer(
             calibrator=calibrator, speed_limit_kmh=speed_limit_kmh
@@ -148,6 +153,7 @@ class ConflictPerceptionPipeline:
             "schema_version": 1,
             "weights": str(Path(self.weights).expanduser().resolve()),
             "tracker_config": str(Path(self.tracker_config).expanduser().resolve()),
+            "object_policy_config": self.object_policy_config,
             "device": self.device,
             "conf": self.conf,
             "iou": self.iou,
@@ -164,7 +170,7 @@ class ConflictPerceptionPipeline:
                     "safe_radius_veh_m": policy.safe_radius_veh_m,
                     "label": policy.label,
                 }
-                for name, policy in POLICIES.items()
+                for name, policy in self.object_policies.items()
             },
             "fps_used": fps,
             "speed_limit_kmh": self.speed_limit_kmh,

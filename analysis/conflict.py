@@ -15,7 +15,7 @@ from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
 
 from .speed import SpeedReading
-from .policy import object_policy
+from .policy import ObjectPolicy, object_policy
 
 
 class RiskLevel(IntEnum):
@@ -74,6 +74,7 @@ class ConflictAnalyzer:
         ttc_critical_s: float = 1.8,
         ttc_caution_s: float = 3.5,
         horizon_s: float = 3.5,
+        object_policies: dict[str, ObjectPolicy] | None = None,
     ):
         if not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
             raise ValueError("speed_limit_kmh 必须为有限正数")
@@ -91,6 +92,7 @@ class ConflictAnalyzer:
         self.ttc_critical_s = ttc_critical_s
         self.ttc_caution_s = ttc_caution_s
         self.horizon_s = horizon_s
+        self.object_policies = object_policies
 
     def evaluate_pair(
         self, veh: SpeedReading, ped: SpeedReading
@@ -112,10 +114,10 @@ class ConflictAnalyzer:
         if veh.is_stationary and veh.is_reliable:
             return None
 
-        vehicle_policy = object_policy(veh.object_kind, veh.category)
+        vehicle_policy = object_policy(veh.object_kind, veh.category, self.object_policies)
         veh_radius_m = (
             self.safe_radius_veh_m
-            if vehicle_policy.kind == "motor_vehicle"
+            if (self.object_policies is None and vehicle_policy.kind == "motor_vehicle")
             else vehicle_policy.safe_radius_veh_m
         )
         critical_dist_m = veh_radius_m + self.safe_radius_ped_m
@@ -206,7 +208,7 @@ class ConflictAnalyzer:
                     ):
                         highest_conflict = conflict
 
-            veh_kind = object_policy(veh.object_kind, veh.category).kind
+            veh_kind = object_policy(veh.object_kind, veh.category, self.object_policies).kind
             if highest_conflict is not None:
                 assessments.append(highest_conflict)
             elif veh.category == "vehicle" and veh.speed_kmh > self.speed_limit_kmh:
