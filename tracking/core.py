@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from collections import Counter, deque
+from dataclasses import asdict, replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,8 +16,9 @@ import numpy as np
 
 from detection.core import DEFAULT_WEIGHTS, ROOT, VIDEO_SUFFIXES, load_model, new_run, prepare_runtime, select_classes, write_json
 from .records import FrameRecord, extract_tracks
-from .visualization import PlaybackController, TrailHistory, annotate
+from .visualization import PlaybackController, annotate
 from .export import RunExports
+from .motion import DEFAULT_MOTION_CONFIG, MotionEstimator, read_motion_config
 
 DEFAULT_TRACKER = ROOT / "configs" / "bytetrack.yaml"
 
@@ -135,7 +137,8 @@ def check_display():
 
 def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, output=None,
                 classes=None, conf=None, imgsz=640, iou=0.7, device=None,
-                trail_length=60, max_frames=None, fps=None, show=False):
+                trail_length=None, max_frames=None, fps=None, show=False,
+                motion_config=DEFAULT_MOTION_CONFIG):
     import cv2
 
     prepare_runtime()
@@ -146,9 +149,10 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
     source = Path(source).expanduser().resolve()
     if not source.is_file() or source.suffix.lower() not in VIDEO_SUFFIXES:
         raise ValueError("--source 必须是本地视频文件")
-    for name, value in (("imgsz", imgsz), ("trail_length", trail_length)):
-        if type(value) is not int or value <= 0:
-            raise ValueError(f"{name} 必须是正整数")
+    if type(imgsz) is not int or imgsz <= 0:
+        raise ValueError("imgsz 必须是正整数")
+    if trail_length is not None and (type(trail_length) is not int or trail_length <= 0):
+        raise ValueError("trail_length 必须是正整数")
     if max_frames is not None and (type(max_frames) is not int or max_frames <= 0):
         raise ValueError("max_frames 必须是正整数")
     if not math.isfinite(iou) or not 0 < iou <= 1:
@@ -157,6 +161,10 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
         raise ValueError("fps 必须是有限正数")
     config = read_tracker_config(tracker)
     conf = resolve_conf(config, conf)
+    motion_settings = read_motion_config(motion_config)
+    if trail_length is not None:
+        motion_settings = replace(motion_settings, history_length=trail_length)
+    trail_length = motion_settings.history_length
     if show:
         check_display()
 
@@ -170,7 +178,7 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
     recent_times = deque(maxlen=30)
     observations = Counter()
     track_ids = set()
-    session = exports = output_path = None
+    session = exports = output_path = history = None
     source_fps = effective_fps = total_frames = None
     failure = None
     wall_start = time.perf_counter()
@@ -189,9 +197,11 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
         # 保存本次实际使用的配置，后续调参不会改变旧实验的参数记录。
         frozen_tracker = output_path / "tracker.resolved.yaml"
         frozen_tracker.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        (output_path / "motion.resolved.yaml").write_text(yaml.safe_dump(asdict(motion_settings)), encoding="utf-8")
         exports = RunExports(output_path)
         session = TrackingSession(source, weights, frozen_tracker, classes, conf, imgsz, iou, device)
-        history = TrailHistory(trail_length, config["track_buffer"])
+        # 估计器同时提供有限轨迹，避免再维护一份重复的位置缓存。
+        history = MotionEstimator(motion_settings, config["track_buffer"])
         playback = PlaybackController()
         if show:
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -208,10 +218,12 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
                     break
                 timestamp, timestamp_source = clock.timestamp(processed, capture.get(cv2.CAP_PROP_POS_MSEC))
                 record = session.process(frame, timestamp, timestamp_source)
-                history.update(record)
+                retained_ids = session.retained_ids()
+                motion = history.update(record, retained_ids)
                 measured_fps = len(recent_times) / sum(recent_times) if recent_times else None
                 annotated = annotate(frame, record, history, source_fps, measured_fps,
-                                     total_frames, session.class_names, interactive=show)
+                                     total_frames, session.class_names, interactive=show,
+                                     motion=motion, motion_config=motion_settings)
                 if writer is None:
                     writer = cv2.VideoWriter(str(output_path / "annotated.mp4"),
                                              cv2.VideoWriter_fourcc(*"mp4v"), effective_fps,
@@ -219,7 +231,7 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
                     if not writer.isOpened():
                         raise RuntimeError("无法创建标注 MP4，请检查 OpenCV 编码器与输出路径")
                 writer.write(annotated)
-                exports.write(record, session.retained_ids())
+                exports.write(record, retained_ids, motion)
                 processed += 1
                 observations.update(target.class_name for target in record.tracks)
                 track_ids.update(target.track_id for target in record.tracks if target.track_id is not None)
@@ -233,7 +245,8 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
                     # 暂停期间只刷新最后一帧，不读取、推理或写出新帧。
                     while playback.paused and not playback.quit_requested:
                         paused_frame = annotate(frame, record, history, source_fps, measured_fps,
-                                                total_frames, session.class_names, interactive=True, paused=True)
+                                                total_frames, session.class_names, interactive=True, paused=True,
+                                                motion=motion, motion_config=motion_settings)
                         cv2.imshow(window_name, paused_frame)
                         playback.handle_key(cv2.waitKey(30))
                         if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
@@ -262,6 +275,8 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
                 exports.finish(stop_reason)
             finally:
                 exports.close()
+        if history is not None:
+            history.reset()
 
     if output_path is None:
         if failure is not None:
@@ -284,6 +299,10 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
         "conf": session.conf if session else conf, "iou": iou, "imgsz": imgsz, "trail_length": trail_length,
         "closed_tracklets": exports.closed_tracks if exports else 0,
         "track_events": dict(exports.event_counts) if exports else {},
+        "motion": {"config": asdict(motion_settings), "schema_version": 1, "coordinate_space": "image",
+                   "speed_unit": "px/s", "states": dict(exports.motion_states) if exports else {},
+                   "reset_reasons": dict(exports.motion_resets) if exports else {},
+                   "valid_velocity_observations": exports.valid_velocity_observations if exports else 0},
         "note": "仅导出检测观测；ID 不是物理速度或 TTC。MP4 使用固定 FPS，源时间以 JSONL 为准。",
     })
     if failure is not None:

@@ -1,6 +1,8 @@
 """真实 YOLOv8 + ByteTrack 端到端验证。素材是构造视频，不是校园实拍基准。"""
 
+import csv
 import json
+import math
 import shutil
 import tempfile
 import unittest
@@ -8,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import cv2
+import yaml
 
 from detection.core import DEFAULT_WEIGHTS
 from tracking.batch import track_directory
@@ -24,7 +27,7 @@ class TrackingIntegrationTests(unittest.TestCase):
             source_a, source_b = root / "video_a.mp4", root / "video_b.mp4"
             make_sample_video(source_a)
             shutil.copyfile(source_a, source_b)
-            batch = track_directory(root, output=root / "batch", device="cpu")
+            batch = track_directory(root, output=root / "batch", device="cpu", trail_length=5)
             manifest = json.loads((batch / "batch_summary.json").read_text(encoding='utf-8'))
             self.assertEqual(manifest["status"], "completed")
             self.assertEqual(manifest["videos_not_processed"], 0)
@@ -65,6 +68,31 @@ class TrackingIntegrationTests(unittest.TestCase):
                 self.assertEqual({t["track_id"] for t in tracklets}, set(summary["confirmed_track_ids"]))
                 self.assertEqual(sum(t["observations"] for t in tracklets),
                                  sum(t["track_id"] is not None for r in records for t in r["tracks"]))
+                motions = [json.loads(line) for line in (output / "motion.jsonl").read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(motions), 18)
+                self.assertEqual(motions[8]["tracks"], [])
+                self.assertEqual(motions[9]["tracks"], [])
+                self.assertEqual(summary["motion"]["speed_unit"], "px/s")
+                self.assertEqual(summary["motion"]["config"]["history_length"], 5)
+                resolved = yaml.safe_load((output / "motion.resolved.yaml").read_text(encoding="utf-8"))
+                self.assertEqual(resolved["history_length"], 5)
+                for raw_frame, motion_frame in zip(records, motions):
+                    self.assertEqual(raw_frame["timestamp_s"], motion_frame["timestamp_s"])
+                    self.assertEqual(motion_frame["speed_unit"], "px/s")
+                    self.assertEqual(len(raw_frame["tracks"]), len(motion_frame["tracks"]))
+                    for raw, motion in zip(raw_frame["tracks"], motion_frame["tracks"]):
+                        self.assertEqual(raw["anchor_xy"], motion["anchor_xy"])
+                        if motion["velocity_valid"]:
+                            self.assertAlmostEqual(motion["speed_px_s"], math.hypot(*motion["velocity_xy_px_s"]))
+                            self.assertGreater(motion["dt_s"], 0)
+                        else:
+                            self.assertIsNone(motion["speed_px_s"])
+                recovered_bus = [t for t in motions[10]["tracks"] if t["track_id"] in first_vehicles]
+                self.assertEqual(len(recovered_bus), len(first_vehicles))
+                self.assertTrue(all(t["reset_reason"] == "observation_gap" and not t["velocity_valid"] for t in recovered_bus))
+                with (output / "motion.csv").open(encoding="utf-8", newline="") as stream:
+                    motion_rows = list(csv.DictReader(stream))
+                self.assertEqual(len(motion_rows), sum(len(frame["tracks"]) for frame in motions))
             self.assertNotEqual(records_by_video[0][0]["session_id"], records_by_video[1][0]["session_id"])
             # 同一 Python 进程先后处理两个视频，第二段仍从自己的新 ID 空间开始。
             ids = lambda record: {t["track_id"] for t in record["tracks"] if t["track_id"] is not None}
@@ -118,6 +146,8 @@ class TrackingIntegrationTests(unittest.TestCase):
                     self.assertEqual(summary["frames_processed"], 2)
                     records = [json.loads(line) for line in (destination / "tracks.jsonl").read_text(encoding='utf-8').splitlines()]
                     self.assertEqual(len(records), 2)
+                    motions = (destination / "motion.jsonl").read_text(encoding="utf-8").splitlines()
+                    self.assertEqual(len(motions), 2)
                     capture = cv2.VideoCapture(str(destination / "annotated.mp4"))
                     decoded = 0
                     while capture.read()[0]:

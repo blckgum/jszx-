@@ -57,7 +57,7 @@ class PlaybackController:
 
 
 def annotate(frame, record, history, source_fps, processing_fps, total_frames, class_names,
-             interactive=False, paused=False):
+             interactive=False, paused=False, motion=None, motion_config=None):
     # 绘制副本，避免将文字或轨迹带回模型输入。坐标仍以原视频图像为基准。
     canvas = frame.copy()
     labels = []
@@ -74,6 +74,10 @@ def annotate(frame, record, history, source_fps, processing_fps, total_frames, c
                     cv2.polylines(canvas, [points], False, color, 2)
                 elif len(points) == 1:
                     cv2.circle(canvas, tuple(points[0, 0]), 2, color, -1)
+
+    if motion is not None:
+        from .motion_visualization import draw_motion
+        draw_motion(canvas, motion, motion_config)
 
     counts = Counter(target.class_name for target in record.tracks)
     confirmed = sum(target.track_id is not None for target in record.tracks)

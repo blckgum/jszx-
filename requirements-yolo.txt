@@ -9,4 +9,4 @@ ultralytics==8.4.182
 # OpenCV 负责图片读写、视频解码/编码、标定单应性解算和画框渲染。
 opencv-python==5.0.0.93
 # ByteTrack 使用 LAPJV 求解检测与轨迹之间的线性分配，不需要重新实现匹配算法。
-lap==0.10.0
+lap==0.5.12
