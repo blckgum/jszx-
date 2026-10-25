@@ -60,6 +60,7 @@ class RoadCalibrator:
         self.synthetic = synthetic
         # 旧版标定文件可能缺失 synthetic 溯源字段，由 from_yaml 置位
         self.synthetic_field_missing = False
+        self.source_path: Optional[str] = None
         self.width_m = float(width_m)
         self.length_m = float(length_m)
         self.image_points = [(float(pt[0]), float(pt[1])) for pt in image_points]
@@ -129,6 +130,7 @@ class RoadCalibrator:
             synthetic=synthetic,
         )
         calibrator.synthetic_field_missing = field_missing
+        calibrator.source_path = str(path)
         return calibrator
 
     def to_yaml(self, save_path: str | Path) -> Path:
@@ -149,6 +151,8 @@ class RoadCalibrator:
 
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(config_data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+        self.source_path = str(path)
 
         return path
 

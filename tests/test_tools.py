@@ -15,6 +15,7 @@ from analysis.evaluate import evaluate_run, main as evaluate_main, to_markdown
 from analysis.pipeline import ConflictPerceptionPipeline
 from analysis.policy import object_policy, read_object_policy_config
 from analysis.scenarios import default_scenarios, main as scenarios_main, run_scenarios
+from analysis.schema import validate_run
 from analysis.speed import SpeedEstimator, SpeedReading
 
 
@@ -245,6 +246,7 @@ class AnalysisToolTests(unittest.TestCase):
             self.assertEqual(config["window_seconds"], 0.4)
             self.assertIn("bicycle", config["object_policies"])
             self.assertEqual(config["object_policies"]["bicycle"]["safe_radius_veh_m"], 1.2)
+            self.assertTrue(validate_run(out_dir)["valid"])
 
     def test_speed_ablation_covers_parameter_grid(self):
         rows = run_speed_ablation(

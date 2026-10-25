@@ -50,11 +50,15 @@ def _risk_name(value) -> str:
     return f"LEVEL_{int(value)}_SAFE" if int(value) == 0 else f"LEVEL_{int(value)}"
 
 
-def evaluate_run(run_dir: str | Path) -> dict:
+def evaluate_run(run_dir: str | Path, *, validate: bool = False) -> dict:
     """读取运行产物，返回不依赖人工真值的描述性指标。"""
     root = Path(run_dir).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"运行目录不存在: {root}")
+    schema_result = None
+    if validate:
+        from .schema import validate_run
+        schema_result = validate_run(root)
 
     summary = _read_json(root / "summary.json", {})
     conflicts = _read_jsonl(root / "conflicts.jsonl")
@@ -87,6 +91,7 @@ def evaluate_run(run_dir: str | Path) -> dict:
         "schema_version": 1,
         "run_dir": str(root),
         "has_ground_truth": False,
+        "schema_validation": schema_result,
         "note": "描述性运行评价，无人工真值，不声称 Precision/Recall/MAE 等精度指标。",
         "summary": summary,
         "frames": {
@@ -157,8 +162,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run", required=True, help="runs/analysis/run-* 目录")
     parser.add_argument("--output", help="输出 JSON/Markdown 文件；不指定则打印 JSON")
     parser.add_argument("--markdown", action="store_true", help="输出简短 Markdown 而不是 JSON")
+    parser.add_argument("--validate", action="store_true", help="评价前严格校验当前输出契约")
     args = parser.parse_args(argv)
-    result = evaluate_run(args.run)
+    result = evaluate_run(args.run, validate=args.validate)
     content = to_markdown(result) if args.markdown else json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         path = Path(args.output).expanduser().resolve()

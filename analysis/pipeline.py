@@ -31,6 +31,7 @@ from .conflict import (
 )
 from .events import ConflictEventTracker
 from .policy import DEFAULT_OBJECT_POLICY_CONFIG, read_object_policy_config
+from .provenance import collect_provenance
 from .speed import SpeedEstimator, SpeedReading
 from .visualization import EnhancedConflictVisualizer, trajectory_color
 
@@ -190,6 +191,13 @@ class ConflictPerceptionPipeline:
             "alert_confirm_seconds": self.alert_confirm_seconds,
             "alert_cooldown_frames": self.event_tracker.cooldown_frames,
             "alert_cooldown_seconds": self.alert_cooldown_seconds,
+            "reproducibility": collect_provenance(
+                Path(__file__).resolve().parents[1],
+                weights=self.weights,
+                tracker_config=self.tracker_config,
+                calibration=self.calibrator.source_path,
+                object_policy=self.object_policy_config,
+            ),
         }
 
     def _configure_speed_estimator(self, fps: float):
@@ -242,6 +250,7 @@ class ConflictPerceptionPipeline:
             try:
                 (out_dir / "summary.json").write_text(
                     json.dumps({
+                        "schema_version": 1,
                         "status": "failed",
                         "stop_reason": "initialization",
                         "error": f"{type(exc).__name__}: {exc}",
@@ -253,7 +262,7 @@ class ConflictPerceptionPipeline:
                         "events_jsonl": str(events_path),
                         "speeds_csv": str(csv_path),
                         "configuration_json": str(configuration_path),
-                    }, ensure_ascii=False, indent=2),
+                    }, ensure_ascii=False, indent=2, allow_nan=False),
                     encoding="utf-8",
                 )
             except Exception:
@@ -288,10 +297,6 @@ class ConflictPerceptionPipeline:
             video_clock = VideoClock(fps=fps, force_fps=self.fps is not None)
             self._configure_speed_estimator(fps)
             self._configure_event_tracker(fps)
-            configuration = self._configuration_snapshot(fps)
-            configuration_path.write_text(
-                json.dumps(configuration, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
             session = TrackingSession(
                 source=str(src),
                 weights=self.weights,
@@ -300,6 +305,12 @@ class ConflictPerceptionPipeline:
                 iou=self.iou,
                 imgsz=self.imgsz,
                 device=self.device,
+            )
+            # 模型初始化后再做权重指纹；首次运行可能在初始化过程中下载标准权重。
+            configuration = self._configuration_snapshot(fps)
+            configuration_path.write_text(
+                json.dumps(configuration, ensure_ascii=False, indent=2, allow_nan=False),
+                encoding="utf-8",
             )
 
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -315,6 +326,7 @@ class ConflictPerceptionPipeline:
             # 表头写入也在保护范围内：此刻磁盘失败不能跳过资源释放
             csv_writer = csv.writer(csv_file)
             csv_writer.writerow([
+                "schema_version",
                 "frame_idx", "timestamp_s", "track_id", "category",
                 "x_m", "y_m", "speed_kmh", "is_speeding", "risk_level", "ttc_s",
                 "event_id", "is_reliable", "is_stationary"
@@ -343,7 +355,9 @@ class ConflictPerceptionPipeline:
                     total_caution_events += 1
                 elif evt.peak_risk_level == RiskLevel.LEVEL_1_SPEEDING:
                     total_speeding_events += 1
-                events_file.write(json.dumps(evt.to_dict(), ensure_ascii=False) + "\n")
+                events_file.write(
+                    json.dumps(evt.to_dict(), ensure_ascii=False, allow_nan=False) + "\n"
+                )
 
         frame_idx = 0
         t_start = time.time()
@@ -438,12 +452,15 @@ class ConflictPerceptionPipeline:
                 # 4. 统计与持久化记录
                 for c in conflicts:
                     json_item = {
+                        "schema_version": 1,
                         "frame_index": frame_idx,
                         "timestamp_s": round(timestamp_s, 3),
                         "event_id": event_ids.get((c.veh_track_id, c.ped_track_id)),
                         "assessment": asdict(c),
                     }
-                    jsonl_file.write(json.dumps(json_item, ensure_ascii=False) + "\n")
+                    jsonl_file.write(
+                        json.dumps(json_item, ensure_ascii=False, allow_nan=False) + "\n"
+                    )
 
                 for r in speed_readings:
                     # 车辆读数在 veh_map 按 veh_track_id 命中；行人读数落在
@@ -456,6 +473,7 @@ class ConflictPerceptionPipeline:
                         if c is not None else None
                     )
                     csv_writer.writerow([
+                        1,
                         frame_idx, round(timestamp_s, 3), r.track_id, r.category,
                         round(r.x_m, 2), round(r.y_m, 2), round(r.speed_kmh, 1),
                         int(r.is_speeding), risk_lvl, ttc_val,
@@ -533,6 +551,7 @@ class ConflictPerceptionPipeline:
                 try:
                     (out_dir / "summary.json").write_text(
                         json.dumps({
+                            "schema_version": 1,
                             "status": "interrupted" if loop_state == "interrupt" else "failed",
                             "stop_reason": loop_state,
                             "error": loop_error,
@@ -542,7 +561,7 @@ class ConflictPerceptionPipeline:
                             "events_jsonl": str(events_path.resolve()),
                             "configuration_json": str(configuration_path),
                             "configuration": configuration,
-                        }, ensure_ascii=False, indent=2),
+                        }, ensure_ascii=False, indent=2, allow_nan=False),
                         encoding="utf-8",
                     )
                 except Exception:
@@ -554,6 +573,7 @@ class ConflictPerceptionPipeline:
         proc_fps = frame_idx / elapsed if elapsed > 0 else 0
 
         summary = {
+            "schema_version": 1,
             "status": "ok",
             # eof / max_frames / user_quit：与异常路径中止摘要同契约
             "stop_reason": loop_state,
@@ -579,7 +599,7 @@ class ConflictPerceptionPipeline:
 
         summary_path = out_dir / "summary.json"
         with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
+            json.dump(summary, f, indent=2, ensure_ascii=False, allow_nan=False)
 
         print("=" * 60)
         print(f"[OK] 冲突感知与测速研判处理完毕！")
