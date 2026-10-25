@@ -170,10 +170,43 @@ class ConflictPerceptionPipeline:
         src = Path(video_path).expanduser().resolve()
         out_dir = Path(output_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
+        init_started_at = time.time()
+        out_video_path = out_dir / "annotated_conflict.mp4"
+        jsonl_path = out_dir / "conflicts.jsonl"
+        events_path = out_dir / "events.jsonl"
+        csv_path = out_dir / "speeds.csv"
 
-        cap = cv2.VideoCapture(str(src))
+        def _write_initialization_failure(exc: BaseException):
+            """初始化阶段失败时留下最小可消费摘要，不掩盖原始异常。"""
+            try:
+                (out_dir / "summary.json").write_text(
+                    json.dumps({
+                        "status": "failed",
+                        "stop_reason": "initialization",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "source_video": str(src),
+                        "frames_processed": 0,
+                        "elapsed_s": round(time.time() - init_started_at, 2),
+                        "annotated_output": str(out_video_path),
+                        "conflicts_jsonl": str(jsonl_path),
+                        "events_jsonl": str(events_path),
+                        "speeds_csv": str(csv_path),
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+        try:
+            cap = cv2.VideoCapture(str(src))
+        except BaseException as exc:
+            _write_initialization_failure(exc)
+            raise
         if not cap.isOpened():
-            raise RuntimeError(f"无法打开视频输入文件: {src}")
+            exc = RuntimeError(f"无法打开视频输入文件: {src}")
+            cap.release()
+            _write_initialization_failure(exc)
+            raise exc
 
         # ExitStack 统一登记资源生命周期：初始化阶段（模型加载、编码器、
         # 文件打开）与主循环异常都保证释放，不存在半初始化泄漏路径
@@ -203,16 +236,11 @@ class ConflictPerceptionPipeline:
                 device=self.device,
             )
 
-            out_video_path = out_dir / "annotated_conflict.mp4"
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(str(out_video_path), fourcc, fps, (width, height))
             resources.callback(writer.release)
             if not writer.isOpened():
                 raise RuntimeError(f"无法创建渲染输出视频，请检查编码器与路径: {out_video_path}")
-
-            jsonl_path = out_dir / "conflicts.jsonl"
-            events_path = out_dir / "events.jsonl"
-            csv_path = out_dir / "speeds.csv"
 
             jsonl_file = resources.enter_context(open(jsonl_path, "w", encoding="utf-8"))
             events_file = resources.enter_context(open(events_path, "w", encoding="utf-8"))
@@ -225,9 +253,13 @@ class ConflictPerceptionPipeline:
                 "x_m", "y_m", "speed_kmh", "is_speeding", "risk_level", "ttc_s",
                 "event_id", "is_reliable", "is_stationary"
             ])
-        except BaseException:
+        except BaseException as exc:
             # 初始化任何一步失败：释放已登记的 cap/writer/已开文件
-            resources.close()
+            try:
+                resources.close()
+            except Exception:
+                pass
+            _write_initialization_failure(exc)
             raise
 
         total_critical_events = 0

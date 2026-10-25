@@ -2,6 +2,7 @@
 """分析模块 (标定、测速、冲突预测与 TTC 评估) 单元测试。"""
 
 import math
+import json
 import os
 import tempfile
 import unittest
@@ -1443,6 +1444,11 @@ class TestPipelineIO(unittest.TestCase):
                  self.assertRaises(RuntimeError):
                 pipe.process_video("v.mp4", Path(d) / "out")
             fake_cap.release.assert_called_once()
+            summary = json.loads((Path(d) / "out/summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["stop_reason"], "initialization")
+            self.assertEqual(summary["frames_processed"], 0)
+            self.assertIn("RuntimeError", summary["error"])
 
     def test_output_file_failure_releases_resources(self):
         # 第三个输出文件打开失败：cap/writer/已开文件全部释放
@@ -1480,6 +1486,10 @@ class TestPipelineIO(unittest.TestCase):
                 pipe.process_video("v.mp4", Path(d) / "out")
             fake_cap.release.assert_called_once()
             fake_writer.release.assert_called_once()
+            summary = json.loads((Path(d) / "out/summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["stop_reason"], "initialization")
+            self.assertIn("OSError", summary["error"])
 
     def test_csv_header_failure_releases_resources(self):
         # 表头写入（文件打开之后）磁盘失败同样触发完整释放
