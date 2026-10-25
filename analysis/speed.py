@@ -14,6 +14,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+from .policy import object_policy
+
 
 @dataclass
 class SpeedReading:
@@ -30,6 +32,11 @@ class SpeedReading:
     heading_deg: float         # 运动方向角 (0~360度)
     is_reliable: bool          # 速度估计是否已收敛可信 (需要足够的连续观测点)
     is_stationary: bool = False  # 是否持续静止（泊车/停靠），需连续多帧低速确认
+    object_kind: str = ""      # pedestrian | bicycle | motorcycle | car | bus | truck | motor_vehicle
+
+    def __post_init__(self):
+        if not self.object_kind:
+            self.object_kind = object_policy(None, self.category).kind
 
 
 class TrackMotionTracker:
@@ -45,6 +52,7 @@ class TrackMotionTracker:
         stationary_speed_ms: float = 0.1,
         stationary_min_frames: int = 8,
         reliable_min_span_s: float = 0.2,
+        object_kind: str | None = None,
     ):
         if type(window_size) is not int or window_size < 3:
             raise ValueError("window_size 必须是 >= 3 的整数帧数")
@@ -67,6 +75,7 @@ class TrackMotionTracker:
         self.stationary_speed_ms = stationary_speed_ms
         self.stationary_min_frames = stationary_min_frames
         self.reliable_min_span_s = reliable_min_span_s
+        self.object_kind = object_policy(object_kind, category).kind
 
         # 历史物理轨迹窗口: deque of (timestamp_s, x_m, y_m)
         self.history: deque[Tuple[float, float, float]] = deque(maxlen=window_size)
@@ -118,6 +127,7 @@ class TrackMotionTracker:
                 heading_deg=0.0,
                 is_reliable=False,
                 is_stationary=self._stationary_streak >= self.stationary_min_frames,
+                object_kind=self.object_kind,
             )
 
         # 时间戳必须严格递增：回退/重复观测会让窗口差分 dt <= 0，
@@ -142,6 +152,7 @@ class TrackMotionTracker:
                 is_speeding=False,
                 heading_deg=0.0,
                 is_reliable=False,
+                object_kind=self.object_kind,
             )
 
         # 采用窗口两端平滑区间求导，抵御单帧目标框边缘抖动
@@ -221,6 +232,7 @@ class TrackMotionTracker:
             heading_deg=heading,
             is_reliable=is_reliable,
             is_stationary=is_stationary,
+            object_kind=self.object_kind,
         )
 
 
@@ -261,7 +273,8 @@ class SpeedEstimator:
         self.tracks: Dict[int, TrackMotionTracker] = {}
 
     def update(
-        self, track_id: int, category: str, timestamp_s: float, x_m: float, y_m: float
+        self, track_id: int, category: str, timestamp_s: float, x_m: float, y_m: float,
+        object_kind: str | None = None,
     ) -> SpeedReading:
         """更新单个目标并输出速度测算"""
         if track_id not in self.tracks:
@@ -274,6 +287,7 @@ class SpeedEstimator:
                 stationary_speed_ms=self.stationary_speed_ms,
                 stationary_min_frames=self.stationary_min_frames,
                 reliable_min_span_s=self.reliable_min_span_s,
+                object_kind=object_kind,
             )
         else:
             tracker = self.tracks[track_id]
@@ -288,6 +302,10 @@ class SpeedEstimator:
                 # 跟踪 ID 沿用期间检测类别可能被纠正（如 person -> car），
                 # 但每帧观测可能抖动，需连续确认后才切换类别
                 tracker.observe_category(category, self.category_confirm_frames)
+                if tracker.category in ("pedestrian", "person"):
+                    tracker.object_kind = "pedestrian"
+                elif object_kind is not None or tracker.object_kind == "pedestrian":
+                    tracker.object_kind = object_policy(object_kind, tracker.category).kind
         return self.tracks[track_id].update(timestamp_s, x_m, y_m)
 
     def prune_stale_tracks(self, live_track_ids: set[int]):

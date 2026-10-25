@@ -13,6 +13,7 @@ import numpy as np
 from analysis.calibration import RoadCalibrator
 from analysis.conflict import ConflictAnalyzer, ConflictAssessment, RiskLevel
 from analysis.events import ConflictEventTracker
+from analysis.policy import object_policy
 from analysis.speed import SpeedEstimator, SpeedReading, TrackMotionTracker
 from analysis.visualization import EnhancedConflictVisualizer
 
@@ -114,6 +115,14 @@ class TestRoadCalibrator(unittest.TestCase):
 
 
 class TestSpeedEstimator(unittest.TestCase):
+    def test_object_kind_policy_is_preserved(self):
+        estimator = SpeedEstimator()
+        bicycle = estimator.update(1, "vehicle", 0.0, 3.0, 0.0, object_kind="bicycle")
+        self.assertEqual(bicycle.object_kind, "bicycle")
+        self.assertEqual(object_policy("person", "pedestrian").kind, "pedestrian")
+        self.assertEqual(object_policy("unknown", "vehicle").kind, "motor_vehicle")
+        self.assertEqual(object_policy("bus", "vehicle").safe_radius_veh_m, 2.8)
+
     def test_warmup_requires_sufficient_points(self):
         tracker = TrackMotionTracker(track_id=1, category="vehicle")
         r1 = tracker.update(timestamp_s=0.0, x_m=3.0, y_m=0.0)
@@ -427,6 +436,25 @@ class TestConflictAnalyzer(unittest.TestCase):
         assessments = analyzer.analyze_frame([r])
         self.assertEqual(len(assessments), 1)
         self.assertEqual(assessments[0].risk_level, RiskLevel.LEVEL_1_SPEEDING)
+
+    def test_non_motorized_policy_uses_smaller_vehicle_radius(self):
+        analyzer = self.analyzer
+        bicycle = SpeedReading(
+            track_id=1, category="vehicle", object_kind="bicycle",
+            x_m=3.0, y_m=0.0, vx_ms=0.0, vy_ms=6.0,
+            speed_ms=6.0, speed_kmh=21.6, is_speeding=False,
+            heading_deg=90.0, is_reliable=True,
+        )
+        pedestrian = SpeedReading(
+            track_id=2, category="pedestrian", object_kind="pedestrian",
+            x_m=5.5, y_m=6.0, vx_ms=0.0, vy_ms=0.0,
+            speed_ms=0.0, speed_kmh=0.0, is_speeding=False,
+            heading_deg=0.0, is_reliable=True,
+        )
+        assessment = analyzer.evaluate_pair(bicycle, pedestrian)
+        self.assertIsNotNone(assessment)
+        self.assertEqual(assessment.vehicle_kind, "bicycle")
+        self.assertEqual(assessment.risk_level, RiskLevel.LEVEL_2_CAUTION)
 
     def test_caution_warning_when_ttc_moderate(self):
         # 场景：机动车 (3, 0), vy=6 m/s (21.6 km/h)
@@ -1207,6 +1235,17 @@ class TestPipelineIO(unittest.TestCase):
             self.assertIn("is_reliable", rows[0])
             self.assertIn("is_stationary", rows[0])
             self.assertTrue(any(r["event_id"] == "1" for r in rows))
+
+            configuration = jsonlib.loads(
+                (out_dir / "configuration.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(configuration["fps_used"], 25.0)
+            self.assertEqual(configuration["speed_limit_kmh"], 30.0)
+            self.assertEqual(
+                Path(summary["configuration_json"]),
+                (out_dir / "configuration.json").resolve(),
+            )
+            self.assertEqual(summary["configuration"]["schema_version"], 1)
 
     def test_missing_fps_rejected_without_override(self):
         # 与 tracking 模块同策略：源 FPS 缺失且未显式 --fps 时拒绝运行，

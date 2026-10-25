@@ -2,7 +2,7 @@
 
 面向校园道路固定路侧摄像头，研究车辆与行人的视觉感知、连续跟踪、实际速度估计和冲突风险预警。系统以 YOLOv8 + ByteTrack 提供检测与连续轨迹，`analysis` 模块完成道路标定、物理测速、TTC 冲突研判、事件去抖与四级预警，形成从视频输入到风险提示和事件记录的完整技术链路。
 
-**当前阶段：全链路已实现**（检测 → 跟踪 → 标定测速 → 冲突分析 → 预警）。CPU 环境下 126 项测试全部通过；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
+**当前阶段：全链路已实现**（检测 → 跟踪 → 标定测速 → 冲突分析 → 预警）。CPU 环境下 131 项测试全部通过；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
 
 ## 技术链路
 
@@ -27,6 +27,7 @@ flowchart TD
 | 多目标跟踪 | ByteTrack：Kalman 预测 + 高/低分检测分阶段关联 | 已实现；校园场景待验证 |
 | 图像轨迹与运动记录 | 时间自适应位置/速度 EMA、像素位移、方向、px/s | 已实现；独立配置、有界缓存、漏检分段 |
 | 标定与测速 | 4 点单应性标定、滑窗两端微分、EMA 滤波 | 已实现；精度待实景验证 |
+| 类别策略 | bicycle/motorcycle/car/bus/truck 分型与安全半径策略 | 已实现；参数可在策略模块调整 |
 | 冲突分析与 TTC | CVM 匀速外推、t_cpa/D_min 闭式解、四级风险 | 已实现；阈值待实景调优 |
 | 告警事件去抖 | N 帧确认 + 等级滞回 + 冷却合并 | 已实现；confirmed/provisional 分流 |
 | 实验评价 | 检测/跟踪/测速/事件级指标 | 框架已备；校园数据与标注待开展 |
@@ -51,6 +52,10 @@ python -m analysis --source path/to/video.mp4 --device cpu --show
 
 # 无实测标定时的流程演示（内存合成标定，物理量不可信）
 python -m analysis --source path/to/video.mp4 --demo
+
+# 无视频的合成轨迹参数消融与运行产物评价
+python -m analysis.ablation --output runs/analysis/ablation.json
+python -m analysis.evaluate --run runs/analysis/run-<timestamp> --markdown --output runs/analysis/evaluation.md
 ```
 
 本次 CPU 验证环境：Python 3.12、PyTorch 2.11.0+cpu、torchvision 0.26.0、Ultralytics 8.4.182、opencv-python 5.0.0.93、lap 0.5.12。依赖中不存在的 lap 0.10.0 已修正。
@@ -69,6 +74,7 @@ python -m analysis --source path/to/video.mp4 --demo
 | `conflicts.jsonl` | 逐帧原始冲突评估（确认后回填 `event_id`） |
 | `events.jsonl` | 生命周期告警事件：首末帧/时间戳、峰值等级、最小 TTC、结束原因 |
 | `speeds.csv` | 逐目标位置、速度、风险、事件关联与可靠度标记 |
+| `configuration.json` | 本次实际 FPS、标定来源、阈值、窗口、策略和事件参数快照 |
 | `summary.json` | 事件计数与运行摘要；异常退出同样落盘并带 `status`/`stop_reason`/`error` |
 
 ## 已知边界
@@ -85,7 +91,7 @@ detection/   YOLOv8 检测、训练与评估入口
 tracking/    ByteTrack 会话、轨迹与 px/s 运动记录、平滑、可视化、批处理
 analysis/    标定 · 测速 · 冲突研判 · 事件去抖 · 渲染 · 端到端管线
 configs/     bytetrack.yaml、motion.yaml、calibration.yaml、数据配置模板
-tests/       单元、集成与异常路径测试（126 项）
+tests/       单元、集成与异常路径测试（131 项）
 docs/        课题需求、研究蓝图（含数学推导）与模块解释文档
 ```
 

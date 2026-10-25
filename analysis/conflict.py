@@ -15,6 +15,7 @@ from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
 
 from .speed import SpeedReading
+from .policy import object_policy
 
 
 class RiskLevel(IntEnum):
@@ -38,6 +39,7 @@ class ConflictAssessment:
     min_distance_m: float          # 预测未来最小距离 D_min (米)
     ttc_seconds: Optional[float]   # 碰撞时间 TTC (秒)
     conflict_ground_xy: Optional[Tuple[float, float]]  # 预测冲突点地面坐标 (米)
+    vehicle_kind: str = "motor_vehicle"
 
 
 def _conflict_sort_key(c: ConflictAssessment):
@@ -83,7 +85,9 @@ class ConflictAnalyzer:
                 and 0 < ttc_critical_s <= ttc_caution_s <= horizon_s):
             raise ValueError("TTC 阈值需满足 0 < ttc_critical <= ttc_caution <= horizon")
         self.speed_limit_kmh = speed_limit_kmh
-        self.critical_dist_m = safe_radius_veh_m + safe_radius_ped_m  # 3.0 米
+        self.safe_radius_veh_m = safe_radius_veh_m
+        self.safe_radius_ped_m = safe_radius_ped_m
+        self.critical_dist_m = safe_radius_veh_m + safe_radius_ped_m  # 默认机动车 3.0 米
         self.ttc_critical_s = ttc_critical_s
         self.ttc_caution_s = ttc_caution_s
         self.horizon_s = horizon_s
@@ -107,6 +111,14 @@ class ConflictAnalyzer:
         # 收敛前置位，未收敛目标一律保守参与研判，不做豁免
         if veh.is_stationary and veh.is_reliable:
             return None
+
+        vehicle_policy = object_policy(veh.object_kind, veh.category)
+        veh_radius_m = (
+            self.safe_radius_veh_m
+            if vehicle_policy.kind == "motor_vehicle"
+            else vehicle_policy.safe_radius_veh_m
+        )
+        critical_dist_m = veh_radius_m + self.safe_radius_ped_m
 
         # 相对速度矢量：v_rel = v_ped - v_veh
         dvx = ped.vx_ms - veh.vx_ms
@@ -140,14 +152,14 @@ class ConflictAnalyzer:
         conflict_y = veh.y_m + veh.vy_ms * t_cpa
 
         # 分级风险研判
-        if min_dist <= self.critical_dist_m:
+        if min_dist <= critical_dist_m:
             if t_cpa <= self.ttc_critical_s:
                 level = RiskLevel.LEVEL_3_CRITICAL
                 desc = f"紧急碰撞危险! (TTC={t_cpa:.1f}s, 预计间距={min_dist:.1f}m)"
             else:
                 level = RiskLevel.LEVEL_2_CAUTION
                 desc = f"注意减速礼让行人 (TTC={t_cpa:.1f}s, 轨迹汇聚)"
-        elif min_dist <= self.critical_dist_m * 1.5 and t_cpa <= self.ttc_caution_s:
+        elif min_dist <= critical_dist_m * 1.5 and t_cpa <= self.ttc_caution_s:
             level = RiskLevel.LEVEL_2_CAUTION
             desc = f"注意横穿行人 (预计间距={min_dist:.1f}m)"
         else:
@@ -164,6 +176,7 @@ class ConflictAnalyzer:
             min_distance_m=min_dist,
             ttc_seconds=t_cpa,
             conflict_ground_xy=(conflict_x, conflict_y),
+            vehicle_kind=vehicle_policy.kind,
         )
 
     def analyze_frame(
@@ -193,6 +206,7 @@ class ConflictAnalyzer:
                     ):
                         highest_conflict = conflict
 
+            veh_kind = object_policy(veh.object_kind, veh.category).kind
             if highest_conflict is not None:
                 assessments.append(highest_conflict)
             elif veh.category == "vehicle" and veh.speed_kmh > self.speed_limit_kmh:
@@ -211,6 +225,7 @@ class ConflictAnalyzer:
                         min_distance_m=0.0,
                         ttc_seconds=None,
                         conflict_ground_xy=None,
+                        vehicle_kind=veh_kind,
                     )
                 )
             else:
@@ -227,6 +242,7 @@ class ConflictAnalyzer:
                         min_distance_m=0.0,
                         ttc_seconds=None,
                         conflict_ground_xy=None,
+                        vehicle_kind=veh_kind,
                     )
                 )
 

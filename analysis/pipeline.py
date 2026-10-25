@@ -30,6 +30,7 @@ from .conflict import (
     build_conflict_maps,
 )
 from .events import ConflictEventTracker
+from .policy import POLICIES
 from .speed import SpeedEstimator, SpeedReading
 from .visualization import EnhancedConflictVisualizer, trajectory_color
 
@@ -106,6 +107,15 @@ class ConflictPerceptionPipeline:
         self.alert_cooldown_frames = alert_cooldown_frames
         self.alert_cooldown_seconds = alert_cooldown_seconds
         self.fps = fps
+        self.window_size = window_size
+        self.ema_alpha = ema_alpha
+        self.ttc_critical_s = ttc_critical_s
+        self.ttc_caution_s = ttc_caution_s
+        self.horizon_s = horizon_s
+        self.stationary_speed_ms = stationary_speed_ms
+        self.stationary_min_frames = stationary_min_frames
+        self.category_confirm_frames = category_confirm_frames
+        self.reliable_min_span_s = reliable_min_span_s
 
         # 每次 process_video 按实际 FPS 重建 estimator，跨视频不串状态
         self._estimator_kwargs = dict(
@@ -131,6 +141,50 @@ class ConflictPerceptionPipeline:
         self.visualizer = EnhancedConflictVisualizer(
             calibrator=calibrator, speed_limit_kmh=speed_limit_kmh
         )
+
+    def _configuration_snapshot(self, fps: float) -> dict:
+        """返回可复现实验所需的实际运行配置，而不依赖命令行现场。"""
+        return {
+            "schema_version": 1,
+            "weights": str(Path(self.weights).expanduser().resolve()),
+            "tracker_config": str(Path(self.tracker_config).expanduser().resolve()),
+            "device": self.device,
+            "conf": self.conf,
+            "iou": self.iou,
+            "imgsz": self.imgsz,
+            "calibration": {
+                "name": self.calibrator.name,
+                "synthetic": self.calibrator.synthetic,
+                "width_m": self.calibrator.width_m,
+                "length_m": self.calibrator.length_m,
+            },
+            "object_policies": {
+                name: {
+                    "kind": policy.kind,
+                    "safe_radius_veh_m": policy.safe_radius_veh_m,
+                    "label": policy.label,
+                }
+                for name, policy in POLICIES.items()
+            },
+            "fps_used": fps,
+            "speed_limit_kmh": self.speed_limit_kmh,
+            "ema_alpha": self.ema_alpha,
+            "window_size_frames": self.speed_estimator.window_size,
+            "window_seconds": self.window_seconds,
+            "zone_margin_m": self.zone_margin_m,
+            "ttc_critical_s": self.ttc_critical_s,
+            "ttc_caution_s": self.ttc_caution_s,
+            "horizon_s": self.horizon_s,
+            "stationary_speed_ms": self.stationary_speed_ms,
+            "stationary_min_frames": self.speed_estimator.stationary_min_frames,
+            "stationary_seconds": self.stationary_seconds,
+            "category_confirm_frames": self.category_confirm_frames,
+            "reliable_min_span_s": self.reliable_min_span_s,
+            "alert_confirm_frames": self.event_tracker.confirm_frames,
+            "alert_confirm_seconds": self.alert_confirm_seconds,
+            "alert_cooldown_frames": self.event_tracker.cooldown_frames,
+            "alert_cooldown_seconds": self.alert_cooldown_seconds,
+        }
 
     def _configure_speed_estimator(self, fps: float):
         """按视频实际 FPS 重建速度估计器：换算秒级窗口，且不继承上一视频状态"""
@@ -175,6 +229,7 @@ class ConflictPerceptionPipeline:
         jsonl_path = out_dir / "conflicts.jsonl"
         events_path = out_dir / "events.jsonl"
         csv_path = out_dir / "speeds.csv"
+        configuration_path = out_dir / "configuration.json"
 
         def _write_initialization_failure(exc: BaseException):
             """初始化阶段失败时留下最小可消费摘要，不掩盖原始异常。"""
@@ -191,6 +246,7 @@ class ConflictPerceptionPipeline:
                         "conflicts_jsonl": str(jsonl_path),
                         "events_jsonl": str(events_path),
                         "speeds_csv": str(csv_path),
+                        "configuration_json": str(configuration_path),
                     }, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
@@ -226,6 +282,10 @@ class ConflictPerceptionPipeline:
             video_clock = VideoClock(fps=fps, force_fps=self.fps is not None)
             self._configure_speed_estimator(fps)
             self._configure_event_tracker(fps)
+            configuration = self._configuration_snapshot(fps)
+            configuration_path.write_text(
+                json.dumps(configuration, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
             session = TrackingSession(
                 source=str(src),
                 weights=self.weights,
@@ -337,6 +397,7 @@ class ConflictPerceptionPipeline:
                         timestamp_s=timestamp_s,
                         x_m=x_m,
                         y_m=y_m,
+                        object_kind=t.class_name,
                     )
                     reading_map[t.track_id] = reading
                     speed_readings.append(reading)
@@ -473,6 +534,8 @@ class ConflictPerceptionPipeline:
                             "elapsed_seconds": round(time.time() - t_start, 2),
                             "max_observed_speed_kmh": round(max_observed_speed_kmh, 1),
                             "events_jsonl": str(events_path.resolve()),
+                            "configuration_json": str(configuration_path),
+                            "configuration": configuration,
                         }, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
@@ -493,6 +556,8 @@ class ConflictPerceptionPipeline:
             "conflicts_jsonl": str(jsonl_path),
             "events_jsonl": str(events_path),
             "speeds_csv": str(csv_path),
+            "configuration_json": str(configuration_path),
+            "configuration": configuration,
             "frames_processed": frame_idx,
             "elapsed_seconds": round(elapsed, 2),
             "average_fps": round(proc_fps, 1),
