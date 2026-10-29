@@ -161,7 +161,13 @@ class SchemaTests(unittest.TestCase):
                                "vehicle_kind": "car"},
             }
             (root / "conflicts.jsonl").write_text(json.dumps(conflict) + "\n", encoding="utf-8")
-            (root / "events.jsonl").write_text("", encoding="utf-8")
+            event = {
+                "schema_version": 1, "event_id": 1, "kind": "conflict",
+                "veh_track_id": 1, "ped_track_id": 2, "start_frame": 0, "end_frame": 2,
+                "start_timestamp_s": 0.0, "end_timestamp_s": 0.08,
+                "peak_risk_level": 3, "min_ttc_seconds": 1.2, "end_reason": "eof",
+            }
+            (root / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
             with (root / "speeds.csv").open("w", newline="", encoding="utf-8") as stream:
                 writer = csv.DictWriter(stream, fieldnames=sorted({
                     "schema_version", "frame_idx", "timestamp_s", "track_id", "category", "speed_kmh",
@@ -175,6 +181,14 @@ class SchemaTests(unittest.TestCase):
             result = validate_run(root)
             self.assertTrue(result["valid"])
             self.assertEqual(result["counts"]["speed_rows"], 1)
+            self.assertEqual(result["counts"]["events"], 1)
+
+            missing_ver_event = dict(event)
+            del missing_ver_event["schema_version"]
+            (root / "events.jsonl").write_text(json.dumps(missing_ver_event) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(SchemaValidationError, "schema_version"):
+                validate_run(root)
+            (root / "events.jsonl").write_text(json.dumps(event) + "\n", encoding="utf-8")
 
             bad_conflict = dict(conflict)
             bad_conflict["frame_index"] = -1

@@ -92,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
         "description": "合成规则场景，不代表真实校园检测或测速准确率。",
         "results": run_scenarios(),
     }
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
     if args.output:
         path = Path(args.output).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)

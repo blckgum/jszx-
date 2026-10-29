@@ -165,7 +165,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validate", action="store_true", help="评价前严格校验当前输出契约")
     args = parser.parse_args(argv)
     result = evaluate_run(args.run, validate=args.validate)
-    content = to_markdown(result) if args.markdown else json.dumps(result, ensure_ascii=False, indent=2)
+    content = (
+        to_markdown(result)
+        if args.markdown
+        else json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
+    )
     if args.output:
         path = Path(args.output).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)

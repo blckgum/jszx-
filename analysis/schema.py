@@ -215,12 +215,11 @@ def validate_event_record(data):
     data = _mapping(data, "event record")
     _reject_non_finite_tree(data, "event")
     _required(data, (
-        "event_id", "kind", "veh_track_id", "ped_track_id", "start_frame", "end_frame",
-        "start_timestamp_s", "end_timestamp_s", "peak_risk_level", "min_ttc_seconds",
-        "end_reason",
+        "schema_version", "event_id", "kind", "veh_track_id", "ped_track_id",
+        "start_frame", "end_frame", "start_timestamp_s", "end_timestamp_s",
+        "peak_risk_level", "min_ttc_seconds", "end_reason",
     ), "event record")
-    if "schema_version" in data:
-        _schema_version(data, "event")
+    _schema_version(data, "event")
     if data["kind"] not in {"conflict", "speeding"}:
         raise SchemaValidationError("event.kind 必须是 conflict 或 speeding")
     for key in ("event_id", "veh_track_id"):

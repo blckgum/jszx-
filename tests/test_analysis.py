@@ -43,6 +43,70 @@ class TestRoadCalibrator(unittest.TestCase):
             RoadCalibrator(self.image_points, -1.0, 20.0)
         with self.assertRaises(ValueError):
             RoadCalibrator(self.image_points, 6.0, 0.0)
+        for bad_dim in (float("nan"), float("inf"), True):
+            with self.assertRaises(ValueError):
+                RoadCalibrator(self.image_points, bad_dim, 20.0)
+            with self.assertRaises(ValueError):
+                RoadCalibrator(self.image_points, 6.0, bad_dim)
+        with self.assertRaises(ValueError):
+            RoadCalibrator([(float("nan"), 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], 6.0, 20.0)
+        with self.assertRaises(ValueError):
+            RoadCalibrator([(0.0,), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)], 6.0, 20.0)
+        with self.assertRaises(ValueError):
+            RoadCalibrator(self.image_points, 6.0, 20.0, synthetic="false")
+
+    def test_malformed_yaml_and_interactive_calibrator_contracts(self):
+        import cv2
+        from analysis.interactive_calibrator import main as calib_main, run_interactive_calibration
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for idx, content in enumerate(("not: [valid", "just_a_string\n", "width_m: 6.0\n")):
+                bad_yaml = root / f"bad_{idx}.yaml"
+                bad_yaml.write_text(content, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    RoadCalibrator.from_yaml(bad_yaml)
+
+            # 损坏图片文件在标定入口即被拦截，不会等到交互复制帧时崩溃
+            bad_img = root / "broken.jpg"
+            bad_img.write_bytes(b"not-an-image")
+            with self.assertRaises(RuntimeError):
+                run_interactive_calibration(
+                    bad_img, 6.0, 15.0, output_path=root / "out.yaml",
+                    predefined_points=self.image_points,
+                )
+
+            # 中文目录与文件名下的图片可正常解码并生成实测标定 YAML
+            cn_dir = root / "校园实测路段"
+            cn_dir.mkdir(parents=True, exist_ok=True)
+            cn_img = cn_dir / "路面首帧.png"
+            ok, encoded = cv2.imencode(".png", np.zeros((600, 800, 3), dtype=np.uint8))
+            self.assertTrue(ok)
+            encoded.tofile(str(cn_img))
+            out_yaml = cn_dir / "calib.yaml"
+            pts_arg = ",".join(f"{u},{v}" for u, v in self.image_points)
+            self.assertEqual(
+                calib_main([
+                    "--source", str(cn_img),
+                    "--width", "6.0",
+                    "--length", "20.0",
+                    "--points", pts_arg,
+                    "--output", str(out_yaml),
+                ]),
+                0,
+            )
+            loaded = RoadCalibrator.from_yaml(out_yaml)
+            self.assertFalse(loaded.synthetic)
+            self.assertEqual(loaded.width_m, 6.0)
+
+            for bad_args in (
+                ["--source", str(cn_img), "--width", "0"],
+                ["--source", str(cn_img), "--length", "nan"],
+                ["--source", str(cn_img), "--points", "1,2,3"],
+                ["--source", str(cn_img), "--points", "1,2,3,4,5,6,7,nan"],
+            ):
+                with self.assertRaises(SystemExit):
+                    calib_main(bad_args)
 
     def test_corner_projection_accuracy(self):
         # 4 个角点经变换后应严格对应 (0,0), (6,0), (6,20), (0,20)

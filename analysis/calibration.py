@@ -50,10 +50,31 @@ class RoadCalibrator:
         name: str = "campus_road",
         synthetic: bool = False,
     ):
+        if type(synthetic) is not bool:
+            raise ValueError("synthetic 必须是布尔值")
         if len(image_points) != 4:
             raise ValueError(f"地面标定必须严格提供 4 个角点，当前提供了 {len(image_points)} 个")
-        if width_m <= 0 or length_m <= 0:
-            raise ValueError("道路的实际物理宽度和长度必须为大于 0 的正数（单位：米）")
+        if (
+            type(width_m) not in (int, float)
+            or type(length_m) not in (int, float)
+            or not (math.isfinite(width_m) and math.isfinite(length_m))
+            or width_m <= 0
+            or length_m <= 0
+        ):
+            raise ValueError("道路的实际物理宽度和长度必须为大于 0 的有限正数（单位：米）")
+
+        parsed_points: List[Tuple[float, float]] = []
+        for idx, pt in enumerate(image_points):
+            if not isinstance(pt, (list, tuple)) or len(pt) != 2:
+                raise ValueError(f"第 {idx + 1} 个标定角点必须是长度为 2 的坐标对")
+            u, v = pt
+            if (
+                type(u) not in (int, float)
+                or type(v) not in (int, float)
+                or not (math.isfinite(u) and math.isfinite(v))
+            ):
+                raise ValueError(f"第 {idx + 1} 个标定角点坐标必须为有限数值")
+            parsed_points.append((float(u), float(v)))
 
         self.name = name
         # 合成占位标定标记：非 --demo 模式下拒绝加载，防止演示参数被当真实标定
@@ -63,7 +84,7 @@ class RoadCalibrator:
         self.source_path: Optional[str] = None
         self.width_m = float(width_m)
         self.length_m = float(length_m)
-        self.image_points = [(float(pt[0]), float(pt[1])) for pt in image_points]
+        self.image_points = parsed_points
 
         # 定义地面标准矩形（顺时针：左上 -> 右上 -> 右下 -> 左下）
         self.ground_points = [
@@ -96,10 +117,24 @@ class RoadCalibrator:
         if not path.exists():
             raise FileNotFoundError(f"未找到标定配置文件: {path}")
 
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"标定文件 {path} YAML 格式错误: {exc}") from None
 
-        img_pts = [tuple(p) for p in data["image_points"]]
+        if not isinstance(data, dict):
+            raise ValueError(f"标定文件 {path} 内容必须是键值映射")
+        for req_key in ("image_points", "width_m", "length_m"):
+            if req_key not in data:
+                raise ValueError(f"标定文件 {path} 缺少必需字段: {req_key}")
+        if not isinstance(data["image_points"], (list, tuple)):
+            raise ValueError(f"标定文件 {path} 的 image_points 必须是列表")
+
+        img_pts = [
+            tuple(p) if isinstance(p, (list, tuple)) else p
+            for p in data["image_points"]
+        ]
 
         # synthetic 是布尔溯源字段而非可选字符串：
         # bool("false") == True 会把误写字符串的文件错判为占位标定；

@@ -10,30 +10,56 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 from .calibration import RoadCalibrator
 
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def _read_calibration_image(src: Path) -> np.ndarray:
+    """读取标定图片，兼容 Windows 含中文路径并校验解码结果。"""
+    try:
+        raw = np.fromfile(str(src), dtype=np.uint8)
+        image = cv2.imdecode(raw, cv2.IMREAD_COLOR) if raw.size > 0 else None
+    except Exception:
+        image = None
+    if image is None:
+        image = cv2.imread(str(src))
+    if image is None:
+        raise RuntimeError(f"无法解码读取标定图片文件: {src}")
+    return image
+
 
 def run_interactive_calibration(
-    source_path: str,
+    source_path: str | Path,
     width_m: float,
     length_m: float,
-    output_path: str = "configs/calibration.yaml",
-    predefined_points: List[Tuple[float, float]] = None,
+    output_path: str | Path = "configs/calibration.yaml",
+    predefined_points: Optional[List[Tuple[float, float]]] = None,
 ) -> RoadCalibrator:
     """执行交互式或参数化标定流程"""
+    if (
+        type(width_m) not in (int, float)
+        or type(length_m) not in (int, float)
+        or not (math.isfinite(width_m) and math.isfinite(length_m))
+        or width_m <= 0
+        or length_m <= 0
+    ):
+        raise ValueError("道路的实际物理宽度和长度必须为大于 0 的有限正数（单位：米）")
+
     src = Path(source_path).expanduser().resolve()
-    if not src.exists():
+    if not src.is_file():
         raise FileNotFoundError(f"未找到标定底图或视频文件: {src}")
 
     # 支持直接从图像或视频中抓取第 1 帧
-    if src.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]:
-        image = cv2.imread(str(src))
+    if src.suffix.lower() in IMAGE_SUFFIXES:
+        image = _read_calibration_image(src)
     else:
         cap = cv2.VideoCapture(str(src))
         ok, image = cap.read()
@@ -41,8 +67,10 @@ def run_interactive_calibration(
         if not ok or image is None:
             raise RuntimeError(f"无法从视频中解码读取首帧用于标定: {src}")
 
-    if predefined_points and len(predefined_points) == 4:
-        points = predefined_points
+    if predefined_points is not None:
+        if len(predefined_points) != 4:
+            raise ValueError(f"地面标定必须严格提供 4 个角点，当前提供了 {len(predefined_points)} 个")
+        points = list(predefined_points)
         print(f"[*] 使用预设参数标定 4 点: {points}")
     else:
         # 交互式窗口标定
@@ -123,7 +151,7 @@ def run_interactive_calibration(
     return calibrator
 
 
-if __name__ == "__main__":
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="校园道路 4 点空间单应性标定工具")
     parser.add_argument("--source", type=str, required=True, help="校园道路空镜照片或视频路径")
     parser.add_argument("--width", type=float, default=6.0, help="道路实际物理宽度 (米)，默认 6.0m")
@@ -135,13 +163,21 @@ if __name__ == "__main__":
         default=None,
         help="非交互模式直接传入 4 点像素坐标: u1,v1,u2,v2,u3,v3,u4,v4",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    if not (math.isfinite(args.width) and args.width > 0):
+        parser.error("--width 必须为有限正数")
+    if not (math.isfinite(args.length) and args.length > 0):
+        parser.error("--length 必须为有限正数")
 
     pts = None
-    if args.points:
-        raw_nums = [float(x.strip()) for x in args.points.split(",")]
-        if len(raw_nums) != 8:
-            raise ValueError("--points 必须提供 8 个数字构成 4 对坐标 (u1,v1,u2,v2,u3,v3,u4,v4)")
+    if args.points is not None:
+        try:
+            raw_nums = [float(x.strip()) for x in args.points.split(",")]
+        except ValueError:
+            parser.error("--points 格式错误，必须提供 8 个有限数字: u1,v1,u2,v2,u3,v3,u4,v4")
+        if len(raw_nums) != 8 or not all(math.isfinite(x) for x in raw_nums):
+            parser.error("--points 必须提供 8 个有限数字构成 4 对坐标 (u1,v1,u2,v2,u3,v3,u4,v4)")
         pts = [(raw_nums[i], raw_nums[i + 1]) for i in range(0, 8, 2)]
 
     run_interactive_calibration(
@@ -151,3 +187,8 @@ if __name__ == "__main__":
         output_path=args.output,
         predefined_points=pts,
     )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

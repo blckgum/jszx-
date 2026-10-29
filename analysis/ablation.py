@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", help="输出 JSON 文件；不指定则打印")
     args = parser.parse_args(argv)
     result = run_default_ablation()
-    text = json.dumps(result, ensure_ascii=False, indent=2)
+    text = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
     if args.output:
         path = Path(args.output).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
