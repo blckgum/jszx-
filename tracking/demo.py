@@ -2,6 +2,7 @@
 
 import argparse
 import importlib.util
+import os
 import shutil
 from pathlib import Path
 
@@ -13,6 +14,13 @@ BUS_IMAGE = ULTRALYTICS_ROOT / "assets" / "bus.jpg"
 
 
 def make_sample_video(destination, frames=18):
+    # 拒绝空白输出视频路径（含 Path("   ")），防止向工作区写出空白文件名。
+    if (isinstance(destination, str) and not destination.strip()) or (
+        isinstance(destination, os.PathLike)
+        and isinstance(os.fspath(destination), str)
+        and not os.fspath(destination).strip()
+    ):
+        raise ValueError("输出视频路径不能为空")
     if type(frames) is not int or frames <= 0:
         raise ValueError("frames 必须为正整数")
     image = cv2.imread(str(BUS_IMAGE))

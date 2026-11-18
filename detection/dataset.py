@@ -11,14 +11,14 @@ from pathlib import Path
 
 import yaml
 
-from .core import IMAGE_SUFFIXES, TARGET_CLASSES
+from .core import IMAGE_SUFFIXES, TARGET_CLASSES, is_blank_path
 
 
 def audit_dataset(config: str | Path, required_splits: tuple[str, ...]):
     # 返回两部分：可交给 Ultralytics 的统一配置，以及每个划分的图片数和目标数。
     # required_splits 指定本次必须检查的集合：训练时检查 train/val，评估时检查所选集合。
-    # 拒绝空白配置路径字符串，防止 Path("") 解析为当前工作目录 '.'。
-    if isinstance(config, str) and not config.strip():
+    # 拒绝空白配置路径（含 Path("   ")），防止 Path("") 解析为当前工作目录 '.'。
+    if is_blank_path(config):
         raise ValueError("数据集配置路径不能为空")
     config = Path(config).expanduser().resolve()
     try:
@@ -50,8 +50,9 @@ def audit_dataset(config: str | Path, required_splits: tuple[str, ...]):
     report, split_files = {}, {}
     for split in required_splits:
         relative = data.get(split)
-        if not isinstance(relative, str):
-            raise ValueError(f"{split} 需要指向本地图片目录，本入口不接受下载脚本或列表文件。")
+        # 拒绝空白集合路径，防止 (root / "") 退化为数据集根目录本身并误扫全局图片。
+        if not isinstance(relative, str) or not relative.strip():
+            raise ValueError(f"{split} 需要指向非空的本地图片目录，本入口不接受下载脚本或列表文件。")
         folder = (root / relative).resolve()
         if not folder.is_dir() or "images" not in folder.parts:
             raise ValueError(f"{split} 图片目录不存在或不符合 images/ 目录结构：{folder}")

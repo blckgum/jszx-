@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from collections import Counter
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -47,6 +48,13 @@ class RunExports:
     )
 
     def __init__(self, output):
+        # 拒绝空白输出目录（含 Path("   ")），防止把轨迹与运动文件误写进当前工作目录。
+        if (isinstance(output, str) and not output.strip()) or (
+            isinstance(output, os.PathLike)
+            and isinstance(os.fspath(output), str)
+            and not os.fspath(output).strip()
+        ):
+            raise ValueError("输出目录不能为空")
         self.resources = ExitStack()
         try:
             self.frames = self.resources.enter_context((output / "tracks.jsonl").open("w", encoding="utf-8"))

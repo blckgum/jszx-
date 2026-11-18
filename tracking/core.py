@@ -17,7 +17,7 @@ from uuid import uuid4
 import yaml
 import numpy as np
 
-from detection.core import DEFAULT_WEIGHTS, ROOT, VIDEO_SUFFIXES, load_model, new_run, prepare_runtime, select_classes, write_json
+from detection.core import DEFAULT_WEIGHTS, ROOT, VIDEO_SUFFIXES, is_blank_path, load_model, new_run, prepare_runtime, select_classes, write_json
 from .records import FrameRecord, extract_tracks
 from .visualization import PlaybackController, annotate
 from .export import RunExports
@@ -160,6 +160,9 @@ def normalize_session_source(source: str | int | Path) -> str:
             if not (idx_part.isascii() and idx_part.isdigit()):
                 raise ValueError(f"无效的摄像头标识: {source}")
             return f"camera:{int(idx_part)}"
+    # 拦截纯空白 PathLike（如 Path("   ")），防止 Windows 下退化为当前目录 '.'。
+    if is_blank_path(source):
+        raise ValueError("输入源不能为空")
     return str(Path(source).expanduser().resolve())
 
 
@@ -171,8 +174,8 @@ def resolve_conf(config, conf):
 
 
 def read_tracker_config(path):
-    # 拒绝空白路径字符串，防止 Path("") 解析为当前工作目录 '.'。
-    if isinstance(path, str) and not path.strip():
+    # 拒绝空白路径（含 Path("   ")），防止 Path("") 解析为当前工作目录 '.'。
+    if is_blank_path(path):
         raise ValueError("跟踪配置路径不能为空")
     path = Path(path).expanduser().resolve()
     try:
@@ -223,12 +226,13 @@ class TrackingSession:
                  iou=0.7, device=None):
         config = read_tracker_config(tracker_path)
         self.conf = resolve_conf(config, conf)
+        # 在加载 PyTorch 模型前先归一化并校验输入源，避免空白/非法 source 触发耗时模型加载。
+        self.source = normalize_session_source(source)
         # 每个视频创建新的 YOLO 包装实例，避免继承上一段视频的 predictor/trackers。
         # 权重只读取，不训练或修改；该实例在本视频的所有帧之间持续使用。
         self.model = load_model(weights)
         self.class_ids = select_classes(self.model.names, classes)
         self.class_names = [self.model.names[index] for index in self.class_ids]
-        self.source = normalize_session_source(source)
         self.session_id = uuid4().hex
         self.frame_index = 0
         self.tracker_path = str(Path(tracker_path).resolve())
@@ -282,14 +286,18 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
                 classes=None, conf=None, imgsz=640, iou=0.7, device=None,
                 trail_length=None, max_frames=None, fps=None, show=False,
                 motion_config=DEFAULT_MOTION_CONFIG):
-    # 必须在 Path(source) 与 new_run(output, "track") 之前拦截空白字符串，
-    # 防止 Path("") 解析为当前工作目录 '.' 或误在工作区创建空白名称目录。
-    if isinstance(source, str) and not source.strip():
+    # 必须在 Path(source)、new_run(output, "track") 与 prepare_runtime() 之前拦截空白路径（含 Path("   ")），
+    # 防止 Path("") 解析为当前工作目录 '.'、在工作区误建空白目录或先生成运行缓存。
+    if is_blank_path(source):
         raise ValueError("输入视频路径不能为空")
-    if isinstance(output, str) and not output.strip():
+    if is_blank_path(output):
         raise ValueError("输出目录不能为空")
-    if isinstance(weights, str) and not weights.strip():
+    if is_blank_path(weights):
         raise ValueError("模型权重路径不能为空")
+    if is_blank_path(tracker):
+        raise ValueError("跟踪配置路径不能为空")
+    if is_blank_path(motion_config):
+        raise ValueError("运动配置路径不能为空")
     import cv2
 
     prepare_runtime()

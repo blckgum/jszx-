@@ -29,6 +29,18 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
 
+def is_blank_path(value) -> bool:
+    # 同时拦截空白 str 与纯空白 PathLike（如 Path("   ")）：
+    # Windows 下 Path("   ").resolve() 会退化为当前目录 '.'，Linux 下则会误建空白名称目录；
+    # Path(".") 本身 os.fspath 为 "."，不受此检查误伤。
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, os.PathLike):
+        fspath = os.fspath(value)
+        return isinstance(fspath, str) and not fspath.strip()
+    return False
+
+
 def prepare_runtime() -> None:
     # 默认缓存位于已忽略的 runs/，同时尊重用户设置的路径。
     # Ultralytics 保存配置，Matplotlib 保存字体等缓存；云机器的用户目录可能只读。
@@ -40,8 +52,8 @@ def prepare_runtime() -> None:
 
 
 def load_model(weights: str | Path):
-    # 拒绝空白权重路径字符串，防止 Path("") 解析为当前工作目录 '.'。
-    if isinstance(weights, str) and not weights.strip():
+    # 拒绝空白权重路径，防止 Path("") / Path("   ") 解析为当前工作目录 '.'。
+    if is_blank_path(weights):
         raise ValueError("模型权重路径不能为空")
     prepare_runtime()
     # 在真正需要模型时再导入，查看命令帮助和进行数据审计无需先加载 PyTorch 模型。
@@ -88,8 +100,8 @@ def new_run(output: str | Path | None, task: str) -> Path:
         parent = ROOT / "runs" / "yolo" / task
         parent.mkdir(parents=True, exist_ok=True)
         return Path(tempfile.mkdtemp(prefix="run-", dir=parent))
-    # 拒绝空白输出目录字符串，防止 Path("") 解析为当前工作目录 '.' 或误建空白目录。
-    if isinstance(output, str) and not output.strip():
+    # 拒绝空白输出目录路径，防止 Path("") / Path("   ") 解析为当前工作目录 '.' 或误建空白目录。
+    if is_blank_path(output):
         raise ValueError("输出目录不能为空")
     path = Path(output).expanduser().resolve()
     # 每次运行必须使用新目录，避免覆盖已有训练或推理结果。
@@ -105,9 +117,13 @@ def write_json(path: Path, value) -> None:
 def detect(args) -> Path:
     import cv2
 
-    # 拒绝空白输入源字符串，防止 Path("") 解析为当前工作目录 '.'。
-    if isinstance(args.source, str) and not args.source.strip():
+    # 拒绝空白输入源与输出/权重路径，防止 Path("") 解析为 '.' 或在报错前先加载 YOLO 模型。
+    if is_blank_path(args.source):
         raise ValueError("--source 不能为空")
+    if is_blank_path(getattr(args, "output", None)):
+        raise ValueError("输出目录不能为空")
+    if hasattr(args, "weights") and is_blank_path(args.weights):
+        raise ValueError("模型权重路径不能为空")
     # 图片目录视为一组独立图片；只有视频文件才具有连续帧与时间轴。
     source = Path(args.source).expanduser().resolve()
     if source.is_dir():

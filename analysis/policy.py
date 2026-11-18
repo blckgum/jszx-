@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from pathlib import Path
 
 import yaml
@@ -37,8 +38,12 @@ DEFAULT_OBJECT_POLICY_CONFIG = Path(__file__).resolve().parents[1] / "configs" /
 
 def read_object_policy_config(path: str | Path = DEFAULT_OBJECT_POLICY_CONFIG) -> dict[str, ObjectPolicy]:
     """读取策略 YAML；策略值是默认先验，不等同于现场测量值。"""
-    # 拒绝空白路径字符串，防止 Path("") 解析为当前工作目录 '.'。
-    if isinstance(path, str) and not path.strip():
+    # 拒绝空白路径（含 Path("   ")），防止 Path("") 解析为当前工作目录 '.'。
+    if (isinstance(path, str) and not path.strip()) or (
+        isinstance(path, os.PathLike)
+        and isinstance(os.fspath(path), str)
+        and not os.fspath(path).strip()
+    ):
         raise ValueError("对象策略配置路径不能为空")
     config_path = Path(path).expanduser().resolve()
     if not config_path.is_file():

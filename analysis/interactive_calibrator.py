@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -56,9 +57,21 @@ def run_interactive_calibration(
         or length_m <= 0
     ):
         raise ValueError("道路的实际物理宽度和长度必须为大于 0 的有限正数（单位：米）")
-    if isinstance(source_path, str) and not source_path.strip():
+    # 必须在 Path() 解析前拦截空白路径（含 Path("   ")），防止退化为当前目录 '.' 或误写空白文件。
+    if (isinstance(source_path, str) and not source_path.strip()) or (
+        isinstance(source_path, os.PathLike)
+        and isinstance(os.fspath(source_path), str)
+        and not os.fspath(source_path).strip()
+    ):
         raise ValueError("标定输入源路径不能为空")
-    if save_output and isinstance(output_path, str) and not output_path.strip():
+    if save_output and (
+        (isinstance(output_path, str) and not output_path.strip())
+        or (
+            isinstance(output_path, os.PathLike)
+            and isinstance(os.fspath(output_path), str)
+            and not os.fspath(output_path).strip()
+        )
+    ):
         raise ValueError("标定输出路径不能为空")
 
     src = Path(source_path).expanduser().resolve()
@@ -212,6 +225,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # 在 Path() 解析与 GUI/写盘前拦截空白 CLI 路径参数，防止退化为当前目录 '.'。
     if not args.source.strip():
         parser.error("--source 不能为空")
     if not args.output.strip():

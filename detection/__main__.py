@@ -12,7 +12,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .core import DEFAULT_WEIGHTS, detect, load_model, new_run, prepare_runtime, write_json
+from .core import DEFAULT_WEIGHTS, detect, is_blank_path, load_model, new_run, prepare_runtime, write_json
 
 
 def positive_int(value):
@@ -39,6 +39,9 @@ def run_training_or_validation(args):
     # train 用于学习参数，val 用于选模型和调参，test 留给最终评估。
     # 训练时同时检查 train/val；独立评估时只要求所选集合可用。
     splits = ("train", "val") if args.command == "train" else (args.split,)
+    # 在审计数据与加载模型之前拦截空白输出目录，避免先耗费时间加载权重再在 new_run 失败。
+    if is_blank_path(args.output):
+        raise ValueError("输出目录不能为空")
     # 先审计数据再加载模型，文件缺失或标注有误时可尽早结束。
     data, audit = audit_dataset(args.data, splits)
     model = load_model(args.weights)
@@ -130,6 +133,15 @@ def main(argv=None):
             else:
                 sub.add_argument("--split", choices=("val", "test"), default="val")
     args = parser.parse_args(argv)
+    # 提前拦截空白 CLI 路径参数，防止 Path("") 解析为 '.' 或先触发 prepare_runtime() / 模型加载。
+    if not args.weights.strip():
+        parser.error("--weights 不能为空")
+    if args.output is not None and not args.output.strip():
+        parser.error("--output 不能为空")
+    if args.command == "detect" and not args.source.strip():
+        parser.error("--source 不能为空")
+    if args.command != "detect" and not args.data.strip():
+        parser.error("--data 不能为空")
     if args.command == "detect" and args.fps is not None:
         import math
         if not math.isfinite(args.fps) or args.fps <= 0:

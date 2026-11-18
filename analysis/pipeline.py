@@ -22,7 +22,7 @@ from typing import Dict, Iterable, List, Optional
 
 import cv2
 
-from detection.core import DEFAULT_WEIGHTS
+from detection.core import DEFAULT_WEIGHTS, is_blank_path
 from tracking.core import (
     DEFAULT_TRACKER,
     LIVE_STREAM_PREFIXES,
@@ -94,6 +94,9 @@ def parse_video_source(video_path: str | int | Path) -> tuple[int | str, str, bo
         if lower.startswith(LIVE_STREAM_PREFIXES):
             # 传给 VideoCapture 的保留原始认证 URL 以便拉流；写入摘要与日志的则脱敏账号密码。
             return stripped, redact_stream_url(stripped), True
+    # 拦截纯空白 PathLike（如 Path("   ")），防止 Windows 下退化为当前目录 '.'。
+    if is_blank_path(video_path):
+        raise ValueError("视频输入源不能为空")
     resolved = Path(video_path).expanduser().resolve()
     return str(resolved), str(resolved), False
 
@@ -224,12 +227,12 @@ class ConflictPerceptionPipeline:
             or parking_zone_max_speed_kmh < 0
         ):
             raise ValueError("parking_zone_max_speed_kmh 必须为有限非负数")
-        # 拒绝空白路径字符串，防止后续 Path("") 解析为当前工作目录 '.'。
-        if isinstance(weights, str) and not weights.strip():
+        # 拒绝空白路径（含 Path("   ")），防止后续 Path("") 解析为当前工作目录 '.'。
+        if is_blank_path(weights):
             raise ValueError("模型权重路径不能为空")
-        if isinstance(tracker_config, str) and not tracker_config.strip():
+        if is_blank_path(tracker_config):
             raise ValueError("跟踪配置路径不能为空")
-        if isinstance(object_policy_config, str) and not object_policy_config.strip():
+        if is_blank_path(object_policy_config):
             raise ValueError("对象策略配置路径不能为空")
 
         self.calibrator = calibrator
@@ -618,8 +621,8 @@ class ConflictPerceptionPipeline:
         """端到端处理本地视频、USB 摄像头或 RTSP/HTTP 实时流，输出渲染视频与告警日志"""
         if max_frames is not None and (type(max_frames) is not int or max_frames < 0):
             raise ValueError("max_frames 必须是 >= 0 的整数")
-        # 拒绝空白输出目录字符串，防止 Path("") 解析为当前工作目录 '.' 并污染工作区。
-        if isinstance(output_dir, str) and not output_dir.strip():
+        # 拒绝空白输出目录（含 Path("   ")），防止 Path("") 解析为当前工作目录 '.' 并污染工作区。
+        if is_blank_path(output_dir):
             raise ValueError("输出目录不能为空")
 
         capture_arg, src_label, is_live_stream = parse_video_source(video_path)
@@ -924,16 +927,16 @@ class ConflictPerceptionPipeline:
         """从已有 tracks.jsonl 离线复盘测速、TTC 与事件去抖（无需重跑检测与跟踪）。"""
         if max_frames is not None and (type(max_frames) is not int or max_frames < 0):
             raise ValueError("max_frames 必须是 >= 0 的整数")
-        # 拒绝空白输出目录字符串，防止 Path("") 解析为当前工作目录 '.' 并污染工作区。
-        if isinstance(output_dir, str) and not output_dir.strip():
+        # 拒绝空白输出目录（含 Path("   ")），防止 Path("") 解析为当前工作目录 '.' 并污染工作区。
+        if is_blank_path(output_dir):
             raise ValueError("输出目录不能为空")
-        # 拒绝空字符串路径，避免 Path("") 解析成当前工作目录 '.'。
-        if isinstance(tracks_path, str) and not tracks_path.strip():
+        # 拒绝空白轨迹路径（含 Path("   ")），避免 Path("") 解析成当前工作目录 '.'。
+        if is_blank_path(tracks_path):
             raise ValueError("tracks.jsonl 路径不能为空")
         if video_path is not None and (
             type(video_path) is bool
             or is_live_source(video_path)
-            or (isinstance(video_path, str) and not video_path.strip())
+            or is_blank_path(video_path)
         ):
             raise ValueError("离线轨迹复盘仅支持非空本地视频文件同步渲染，不支持摄像头索引或实时推流")
 

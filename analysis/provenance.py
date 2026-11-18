@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import platform
 import subprocess
 import sys
@@ -21,8 +22,22 @@ PACKAGE_NAMES = {
 }
 
 
+def _is_blank_path(value) -> bool:
+    # 同时拦截空白 str 与纯空白 PathLike（如 Path("   ")），
+    # 防止 Windows 下 Path("   ").resolve() 退化为当前目录 '.' 或 Linux 误建空白文件。
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, os.PathLike):
+        fspath = os.fspath(value)
+        return isinstance(fspath, str) and not fspath.strip()
+    return False
+
+
 def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
     """分块计算文件 SHA256，避免把模型权重整体读入内存。"""
+    # 拒绝空白路径（含 Path("   ")），防止 Path("") 解析成当前目录 '.'。
+    if _is_blank_path(path):
+        raise ValueError("文件路径不能为空")
     # 拒绝 bool（如 True 当 1 字节）及非正分块大小，防止极低效或异常读取。
     if type(chunk_size) is not int or chunk_size <= 0:
         raise ValueError("chunk_size 必须是正整数")
@@ -34,8 +49,8 @@ def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def file_fingerprint(path: str | Path | None) -> dict:
-    # 文件缺失、权限受限或路径未提供/为空白时仅标注 unavailable，防止 Path("") 解析成当前目录 '.'。
-    if path is None or (isinstance(path, str) and not path.strip()):
+    # 文件缺失、权限受限或路径未提供/为空白（含 Path("   ")）时仅标注 unavailable，防止 Path("") 解析成当前目录 '.'。
+    if path is None or _is_blank_path(path):
         return {"path": None, "status": "unavailable", "sha256": None, "size_bytes": None}
     try:
         resolved = Path(path).expanduser().resolve()
@@ -65,6 +80,9 @@ def package_versions() -> dict[str, str | None]:
 
 
 def git_state(repo_root: str | Path) -> dict:
+    # 拒绝空白仓库路径（含 Path("   ")），防止 Path("") 误探测当前工作目录；显式传入 "." 仍合法。
+    if repo_root is None or _is_blank_path(repo_root):
+        return {"commit": None, "dirty": None, "status": "unavailable"}
     # 即使运行目录脱离 Git 仓库、缺少 git 命令或超时，也降级返回 unavailable，确保不阻断分析主流程。
     try:
         root = Path(repo_root).resolve()

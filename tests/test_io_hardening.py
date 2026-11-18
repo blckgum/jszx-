@@ -1060,20 +1060,73 @@ class CliSchemaEvaluateHardeningTests(unittest.TestCase):
                         self.assertEqual(out_buf.getvalue(), "")
                         self.assertIn("--run", err_buf.getvalue())
 
-                os.chdir(run_dir)
-                for cli_arg in ("", "   "):
-                    proc = subprocess.run(
-                        [sys.executable, "-m", "analysis.schema", "--run", cli_arg],
+                repo_root = str(Path(__file__).resolve().parents[1])
+                sub_env = dict(os.environ)
+                sub_env["PYTHONPATH"] = (
+                    repo_root + os.pathsep + sub_env["PYTHONPATH"]
+                    if sub_env.get("PYTHONPATH")
+                    else repo_root
+                )
+                for valid_dir in (run_dir, batch_dir):
+                    os.chdir(valid_dir)
+                    # 显式传入 PYTHONPATH 并在同一目录做正向对照，确认子进程确实载入了 analysis.schema
+                    ok_proc = subprocess.run(
+                        [sys.executable, "-m", "analysis.schema", "--run", "."],
                         capture_output=True,
                         text=True,
-                        cwd=str(run_dir),
+                        cwd=str(valid_dir),
+                        env=sub_env,
                     )
-                    self.assertNotEqual(proc.returncode, 0, msg=proc.stdout)
-                    self.assertNotIn('"valid": true', proc.stdout)
+                    self.assertEqual(ok_proc.returncode, 0, msg=ok_proc.stderr)
+                    self.assertIn('"valid": true', ok_proc.stdout)
+                    for cli_arg in ("", "   "):
+                        proc = subprocess.run(
+                            [sys.executable, "-m", "analysis.schema", "--run", cli_arg],
+                            capture_output=True,
+                            text=True,
+                            cwd=str(valid_dir),
+                            env=sub_env,
+                        )
+                        self.assertNotEqual(proc.returncode, 0, msg=proc.stdout)
+                        self.assertNotIn("ModuleNotFoundError", proc.stderr)
+                        self.assertNotIn('"valid": true', proc.stdout)
+                        self.assertIn("--run", proc.stderr)
+
+                # Windows 下 Path("   ").resolve() 会退化为 CWD；必须直接拦截 Path("   ")
+                os.chdir(run_dir)
+                with self.assertRaises(SchemaValidationError):
+                    validate_run(Path("   "))
+                os.chdir(batch_dir)
+                with self.assertRaises(SchemaValidationError):
+                    validate_batch_run(Path("   "))
+
+                # batch_summary.results[].output 为纯空白时必须抛 SchemaValidationError 而非 FileNotFoundError
+                bad_batch = root / "blank_child_batch"
+                bad_batch.mkdir()
+                (bad_batch / "batch_summary.json").write_text(
+                    json.dumps({
+                        "schema_version": 1,
+                        "kind": "analysis_batch",
+                        "source_dir": str(root),
+                        "output_dir": str(bad_batch),
+                        "status": "completed",
+                        "videos_discovered": 1,
+                        "videos_not_processed": 0,
+                        "total_alert_events": 0,
+                        "total_speeding_alerts": 0,
+                        "total_caution_events": 0,
+                        "total_critical_conflicts": 0,
+                        "results": [{"source": str(vpath), "output": "   ", "status": "ok"}],
+                    }),
+                    encoding="utf-8",
+                )
+                os.chdir(run_dir)
+                with self.assertRaises(SchemaValidationError):
+                    validate_batch_run(bad_batch)
             finally:
                 os.chdir(prev_cwd)
 
-            for bad_file in ("", "   "):
+            for bad_file in ("", "   ", Path("   ")):
                 with self.subTest(bad_file=bad_file):
                     with self.assertRaises(SchemaValidationError):
                         load_json_strict(bad_file)
@@ -1190,6 +1243,122 @@ class CliSchemaEvaluateHardeningTests(unittest.TestCase):
                         self.assertNotEqual(ctx.exception.code, 0)
                         self.assertEqual(out_buf.getvalue(), "")
                         self.assertIn("--output", err_buf.getvalue())
+                self.assertEqual(list(clean_cwd.iterdir()), [])
+            finally:
+                os.chdir(prev_cwd)
+
+    def test_pathlike_whitespace_and_pre_side_effect_guards(self):
+        import yaml
+        from analysis.batch import analyze_directory
+        from analysis.evaluate import load_ground_truth
+        from analysis.interactive_calibrator import run_interactive_calibration
+        from analysis.policy import read_object_policy_config
+        from analysis.provenance import file_fingerprint, git_state, sha256_file
+        from detection.__main__ import main as detection_main
+        from detection.core import DEFAULT_WEIGHTS, detect, load_model, new_run
+        from detection.dataset import audit_dataset
+        from tracking.batch import track_directory
+        from tracking.core import track_video
+        from tracking.demo import make_sample_video
+        from tracking.export import RunExports
+        from tracking.motion import read_motion_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src_dir = root / "videos"
+            src_dir.mkdir()
+            vpath = src_dir / "clip.mp4"
+            _write_dummy_video(vpath, n_frames=2)
+            tracks_path = root / "tracks.jsonl"
+            _write_tracks_jsonl(tracks_path, [_make_track_row(0, 0.0, [], width=64, height=64)])
+            pipe = ConflictPerceptionPipeline(calibrator=_sample_calibrator(), fps=10.0)
+
+            clean_cwd = root / "clean_cwd"
+            clean_cwd.mkdir()
+            prev_cwd = Path.cwd()
+            try:
+                os.chdir(clean_cwd)
+                ws = Path("   ")
+                for fn in (
+                    lambda: track_video(ws),
+                    lambda: track_video(vpath, output=ws),
+                    lambda: track_directory(ws),
+                    lambda: track_directory(src_dir, output=ws),
+                    lambda: track_directory(src_dir, weights=ws),
+                    lambda: RunExports(ws),
+                    lambda: make_sample_video(ws, frames=2),
+                    lambda: read_tracker_config(ws),
+                    lambda: read_motion_config(ws),
+                    lambda: new_run(ws, "track"),
+                    lambda: load_model(ws),
+                    lambda: detect(SimpleNamespace(source=ws)),
+                    lambda: audit_dataset(ws, ("train",)),
+                    lambda: read_object_policy_config(ws),
+                    lambda: RoadCalibrator.from_yaml(ws),
+                    lambda: _sample_calibrator().to_yaml(ws),
+                    lambda: evaluate_run(ws),
+                    lambda: evaluate_run(root, ground_truth=ws),
+                    lambda: load_ground_truth(ws),
+                    lambda: run_interactive_calibration(ws, 6.0, 15.0, save_output=False),
+                    lambda: pipe.process_video(vpath, ws),
+                    lambda: pipe.process_tracks(tracks_path, ws),
+                    lambda: analyze_directory(src_dir, calibrator=_sample_calibrator(), output_dir=ws),
+                    lambda: sha256_file(ws),
+                ):
+                    with self.assertRaises(ValueError):
+                        fn()
+                self.assertEqual(file_fingerprint(ws)["status"], "unavailable")
+                self.assertEqual(git_state(ws)["status"], "unavailable")
+                self.assertEqual(git_state("")["status"], "unavailable")
+
+                # track_video 与 TrackingSession 必须在 prepare_runtime / load_model 之前拦截空白参数
+                with mock.patch("tracking.core.prepare_runtime") as m_prep:
+                    for bad_kw in ({"tracker": "   "}, {"motion_config": ""}, {"output": ws}):
+                        with self.assertRaises(ValueError):
+                            track_video(vpath, **bad_kw)
+                    m_prep.assert_not_called()
+                with mock.patch("tracking.core.load_model") as m_load:
+                    with self.assertRaises(ValueError):
+                        TrackingSession("", str(DEFAULT_WEIGHTS), DEFAULT_TRACKER)
+                    m_load.assert_not_called()
+
+                # detection CLI 与 detect() 在 prepare_runtime / load_model 之前拦截空白参数
+                with mock.patch("detection.__main__.prepare_runtime") as m_det_prep:
+                    for bad_det_cli in (
+                        ["detect", "--source", "", "--output", str(root / "o1")],
+                        ["detect", "--source", str(vpath), "--output", "   "],
+                        ["detect", "--source", str(vpath), "--weights", "   "],
+                        ["train", "--data", "   "],
+                        ["val", "--data", str(root / "data.yaml"), "--output", ""],
+                    ):
+                        with self.subTest(bad_det_cli=bad_det_cli), \
+                                contextlib.redirect_stderr(io.StringIO()), \
+                                self.assertRaises(SystemExit) as det_ctx:
+                            detection_main(bad_det_cli)
+                        self.assertNotEqual(det_ctx.exception.code, 0)
+                    m_det_prep.assert_not_called()
+                with mock.patch("detection.core.load_model") as m_det_load:
+                    with self.assertRaises(ValueError):
+                        detect(SimpleNamespace(source=vpath, output="   ", weights=DEFAULT_WEIGHTS))
+                    m_det_load.assert_not_called()
+
+                # audit_dataset 拒绝 YAML 中空白 train/val 划分路径
+                img_dir = root / "images" / "val"
+                img_dir.mkdir(parents=True)
+                bad_yaml = root / "blank_split.yaml"
+                bad_yaml.write_text(
+                    yaml.safe_dump({"path": ".", "train": "   ", "val": "images/val", "names": ["person"]}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ValueError):
+                    audit_dataset(bad_yaml, ("train",))
+
+                # analyze_directory 在无效配置下不得先创建 output_dir
+                bad_batch_out = root / "never_created_batch"
+                for bad_kw in ({"weights": "   "}, {"tracker_config": ""}, {"object_policy_config": "   "}):
+                    with self.assertRaises(ValueError):
+                        analyze_directory(src_dir, calibrator=_sample_calibrator(), output_dir=bad_batch_out, **bad_kw)
+                self.assertFalse(bad_batch_out.exists())
                 self.assertEqual(list(clean_cwd.iterdir()), [])
             finally:
                 os.chdir(prev_cwd)

@@ -13,7 +13,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from detection.core import VIDEO_SUFFIXES
+from detection.core import VIDEO_SUFFIXES, is_blank_path
+from tracking.core import DEFAULT_TRACKER, read_tracker_config
 from .calibration import RoadCalibrator
 from .pipeline import ConflictPerceptionPipeline
 
@@ -35,11 +36,11 @@ def analyze_directory(
     **pipeline_kwargs,
 ) -> dict:
     """顺序分析目录下所有支持的视频文件，各自隔离状态并在异常视频处容错继续。"""
-    # 拒绝空字符串目录，防止 Path("") 解析为当前工作目录 '.'。
-    if isinstance(source_dir, str) and not source_dir.strip():
+    # 拒绝空白目录（含 Path("   ")），防止 Path("") 解析为当前工作目录 '.'。
+    if is_blank_path(source_dir):
         raise ValueError("批量分析输入目录不能为空")
-    # 同样拦截空白输出目录字符串，防止 Path("") 解析为 '.' 而把 batch_summary.json 写进当前工作目录。
-    if isinstance(output_dir, str) and not output_dir.strip():
+    # 同样拦截空白输出目录（含 Path("   ")），防止 Path("") 解析为 '.' 而把 batch_summary.json 写进当前工作目录。
+    if is_blank_path(output_dir):
         raise ValueError("批量分析输出目录不能为空")
     src_dir = Path(source_dir).expanduser().resolve()
     if not src_dir.is_dir():
@@ -53,6 +54,12 @@ def analyze_directory(
     )
     if not videos:
         raise ValueError(f"目录中没有支持的视频文件: {src_dir}")
+    if max_frames is not None and (type(max_frames) is not int or max_frames < 0):
+        raise ValueError("max_frames 必须是 >= 0 的整数")
+    # 在创建 batch-* 目录与 batch_summary.json 前预校验管线配置和跟踪器 YAML，
+    # 避免空白/无效的 weights、tracker_config 或 object_policy_config 在磁盘留下空批次目录。
+    ConflictPerceptionPipeline(calibrator=calibrator, **pipeline_kwargs)
+    read_tracker_config(pipeline_kwargs.get("tracker_config", DEFAULT_TRACKER))
 
     if output_dir is not None:
         out_root = Path(output_dir).expanduser().resolve()

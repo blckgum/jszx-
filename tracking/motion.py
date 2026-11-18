@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections import deque
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -47,8 +48,10 @@ class MotionConfig:
 
 
 def read_motion_config(path=DEFAULT_MOTION_CONFIG):
-    # 拒绝空白路径字符串，防止 Path("") 解析为当前工作目录 '.'。
-    if isinstance(path, str) and not path.strip():
+    # 拒绝空白路径（含 Path("   ")），防止 Path("") 解析为当前工作目录 '.'。
+    if (isinstance(path, str) and not path.strip()) or (
+        isinstance(path, os.PathLike) and isinstance(os.fspath(path), str) and not os.fspath(path).strip()
+    ):
         raise ValueError("运动配置路径不能为空")
     try:
         values = yaml.safe_load(Path(path).expanduser().read_text(encoding="utf-8"))

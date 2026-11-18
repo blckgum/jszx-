@@ -6,11 +6,23 @@ import argparse
 import csv
 import json
 import math
+import os
 from collections import Counter
 from pathlib import Path
 from statistics import fmean
 
 import yaml
+
+
+def _is_blank_path(value) -> bool:
+    # 同时拦截空白 str 与纯空白 PathLike（如 Path("   ")），
+    # 防止 Windows 下 Path("   ").resolve() 退化为当前目录 '.' 或 Linux 误建空白文件。
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, os.PathLike):
+        fspath = os.fspath(value)
+        return isinstance(fspath, str) and not fspath.strip()
+    return False
 
 
 def _reject_non_finite_constant(value: str):
@@ -173,7 +185,8 @@ def _validate_ground_truth(data) -> dict:
 
 def load_ground_truth(path: str | Path) -> dict:
     """加载并校验 JSON/YAML 格式的速度与事件人工真值文件。"""
-    if isinstance(path, str) and not path.strip():
+    # 拒绝空白真值路径（含 Path("   ")），防止 Path("") 解析为当前工作目录 '.'。
+    if _is_blank_path(path):
         raise ValueError("真值文件路径不能为空")
     gt_path = Path(path).expanduser().resolve()
     if not gt_path.is_file():
@@ -372,10 +385,10 @@ def evaluate_run(
     ground_truth: str | Path | dict | None = None,
 ) -> dict:
     """读取运行产物，返回描述性指标；提供人工真值时同时计算准确率与测速误差。"""
-    # 拒绝空字符串目录，防止 Path("") 解析成当前工作目录 '.'。
-    if isinstance(run_dir, str) and not run_dir.strip():
+    # 拒绝空白目录或真值路径（含 Path("   ")），防止 Path("") 解析成当前工作目录 '.'。
+    if _is_blank_path(run_dir):
         raise ValueError("运行输出目录不能为空")
-    if isinstance(ground_truth, str) and not ground_truth.strip():
+    if _is_blank_path(ground_truth):
         raise ValueError("真值文件路径不能为空")
     root = Path(run_dir).expanduser().resolve()
     if not root.is_dir():
@@ -518,6 +531,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--markdown", action="store_true", help="输出简短 Markdown 而不是 JSON")
     parser.add_argument("--validate", action="store_true", help="评价前严格校验当前输出契约")
     args = parser.parse_args(argv)
+    # 必须在 Path() 解析和写出前拦截空白 CLI 路径参数：
+    # 否则 Path("") 会把 --run / --ground-truth 解析为当前目录 '.'，而空白 --output 会静默回退或误写空白文件。
     if not args.run.strip():
         parser.error("--run 不能为空")
     if args.ground_truth is not None and not args.ground_truth.strip():
