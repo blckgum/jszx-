@@ -9,6 +9,7 @@ import time
 from collections import Counter, deque
 from dataclasses import asdict, replace
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 import yaml
@@ -21,6 +22,38 @@ from .export import RunExports
 from .motion import DEFAULT_MOTION_CONFIG, MotionEstimator, read_motion_config
 
 DEFAULT_TRACKER = ROOT / "configs" / "bytetrack.yaml"
+LIVE_STREAM_PREFIXES = ("rtsp://", "rtmp://", "http://", "https://")
+
+
+def redact_stream_url(url: str) -> str:
+    """将推流 URL 中的用户名与密码脱敏为 ***@，保留主机、端口与路径。"""
+    split = urlsplit(url)
+    if split.username is None and split.password is None:
+        return url
+    host_port = split.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((split.scheme, f"***@{host_port}", split.path, split.query, split.fragment))
+
+
+def normalize_session_source(source: str | int | Path) -> str:
+    """归一化跟踪输入源标识：兼容摄像头索引、推流 URL 与本地文件路径。"""
+    if type(source) is bool:
+        raise ValueError("输入源不能为布尔值")
+    if type(source) is int:
+        if source < 0:
+            raise ValueError("摄像头设备索引必须是非负整数")
+        return f"camera:{source}"
+    if isinstance(source, str):
+        stripped = source.strip()
+        if not stripped:
+            raise ValueError("输入源不能为空")
+        if stripped.isdigit():
+            return f"camera:{int(stripped)}"
+        lower = stripped.lower()
+        if lower.startswith(LIVE_STREAM_PREFIXES):
+            return redact_stream_url(stripped)
+        if lower.startswith("camera:"):
+            return stripped
+    return str(Path(source).expanduser().resolve())
 
 
 def resolve_conf(config, conf):
@@ -85,7 +118,7 @@ class TrackingSession:
         self.model = load_model(weights)
         self.class_ids = select_classes(self.model.names, classes)
         self.class_names = [self.model.names[index] for index in self.class_ids]
-        self.source = str(Path(source).expanduser().resolve())
+        self.source = normalize_session_source(source)
         self.session_id = uuid4().hex
         self.frame_index = 0
         self.tracker_path = str(Path(tracker_path).resolve())
@@ -102,8 +135,8 @@ class TrackingSession:
             raise ValueError("同一视频内分辨率发生变化，请预处理为固定尺寸后重新跟踪")
         if not math.isfinite(timestamp) or timestamp < 0 or timestamp <= self.previous_time:
             raise ValueError("同一会话的时间戳必须非负且严格递增")
-        if timestamp_source not in {"video_pts", "fps_estimate"}:
-            raise ValueError("timestamp_source 必须为 video_pts 或 fps_estimate")
+        if timestamp_source not in {"video_pts", "fps_estimate", "wall_clock"}:
+            raise ValueError("timestamp_source 必须为 video_pts、fps_estimate 或 wall_clock")
         # persist=True 仅用于同一视频会话；每个输入帧恰好调用一次，包含没有目标的帧。
         # YOLO 检测、Kalman 预测和 LAPJV 关联均由 Ultralytics 内部完成。
         result = self.model.track(

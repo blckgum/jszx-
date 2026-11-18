@@ -12,8 +12,9 @@ from pathlib import Path
 
 from detection.core import DEFAULT_WEIGHTS
 from tracking.core import DEFAULT_TRACKER
+from .batch import analyze_directory
 from .calibration import RoadCalibrator
-from .pipeline import ConflictPerceptionPipeline
+from .pipeline import ConflictPerceptionPipeline, is_live_source
 from .policy import DEFAULT_OBJECT_POLICY_CONFIG
 
 
@@ -21,7 +22,18 @@ def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="校园道路车辆—行人冲突感知与 30 km/h 测速预警系统"
     )
-    parser.add_argument("--source", type=str, required=True, help="输入视频路径 (MP4/AVI)")
+    parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="输入视频路径、视频目录、本地摄像头索引(如 0)或实时流 URL(如 rtsp://...)",
+    )
+    parser.add_argument(
+        "--tracks",
+        type=str,
+        default=None,
+        help="已有 tracks.jsonl 路径（离线复盘测速与 TTC，无需重跑检测跟踪）",
+    )
     parser.add_argument(
         "--calib",
         type=str,
@@ -177,6 +189,12 @@ def main(argv: list[str] | None = None):
         help="允许加载缺少 synthetic 溯源字段的旧版标定文件（默认拒绝，建议重新标定）",
     )
     parser.add_argument(
+        "--parking-speed",
+        type=float,
+        default=5.0,
+        help="停车区多边形内豁免冲突的最大车速 (km/h)，默认 5.0",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="是否开启本地桌面实时播放窗口",
@@ -219,6 +237,10 @@ def main(argv: list[str] | None = None):
         parser.error("--max-frames 必须是 >= 0 的整数")
     if not math.isfinite(args.speed_limit) or args.speed_limit <= 0:
         parser.error("--speed-limit 必须为正数")
+    if not math.isfinite(args.parking_speed) or args.parking_speed < 0:
+        parser.error("--parking-speed 必须为有限非负数")
+    if args.source is None and args.tracks is None:
+        parser.error("必须至少指定 --source 或 --tracks")
 
     calib_path = Path(args.calib).expanduser().resolve()
     synthetic_calib = None
@@ -260,10 +282,17 @@ def main(argv: list[str] | None = None):
         calibrator = synthetic_calib
 
     out_dir = args.output
+    source_is_dir = (
+        args.tracks is None
+        and args.source is not None
+        and not is_live_source(args.source)
+        and Path(args.source).expanduser().is_dir()
+    )
     if not out_dir:
         import datetime
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = Path("runs") / "analysis" / f"run-{timestamp}"
+        prefix = "batch" if source_is_dir else "run"
+        out_dir = Path("runs") / "analysis" / f"{prefix}-{timestamp}"
     if synthetic_calib is not None:
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         synthetic_calib.to_yaml(Path(out_dir) / "calibration.synthetic.yaml")
@@ -281,8 +310,7 @@ def main(argv: list[str] | None = None):
         stationary_min_frames = 8
         stationary_seconds = 3.0
 
-    pipeline = ConflictPerceptionPipeline(
-        calibrator=calibrator,
+    pipeline_kwargs = dict(
         weights=args.weights,
         tracker_config=args.tracker,
         speed_limit_kmh=args.speed_limit,
@@ -304,14 +332,36 @@ def main(argv: list[str] | None = None):
         reliable_min_span_s=args.reliable_span_s,
         fps=args.fps,
         object_policy_config=args.object_policy,
+        parking_zone_max_speed_kmh=args.parking_speed,
     )
 
-    summary = pipeline.process_video(
-        video_path=args.source,
-        output_dir=out_dir,
-        show_window=args.show,
-        max_frames=args.max_frames,
-    )
+    if source_is_dir:
+        batch_summary = analyze_directory(
+            args.source,
+            calibrator=calibrator,
+            output_dir=out_dir,
+            max_frames=args.max_frames,
+            show_window=args.show,
+            **pipeline_kwargs,
+        )
+        return 0 if batch_summary["status"] == "completed" else 1
+
+    pipeline = ConflictPerceptionPipeline(calibrator=calibrator, **pipeline_kwargs)
+    if args.tracks is not None:
+        pipeline.process_tracks(
+            args.tracks,
+            output_dir=out_dir,
+            video_path=args.source,
+            show_window=args.show,
+            max_frames=args.max_frames,
+        )
+    else:
+        pipeline.process_video(
+            video_path=args.source,
+            output_dir=out_dir,
+            show_window=args.show,
+            max_frames=args.max_frames,
+        )
     return 0
 
 

@@ -1,4 +1,4 @@
-"""对一次 analysis 运行产物做无真值的描述性评价。"""
+"""对一次 analysis 运行产物做无真值描述性评价，或结合人工真值计算精度指标。"""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ import math
 from collections import Counter
 from pathlib import Path
 from statistics import fmean
+
+import yaml
 
 
 def _read_json(path: Path, default):
@@ -50,8 +52,259 @@ def _risk_name(value) -> str:
     return f"LEVEL_{int(value)}_SAFE" if int(value) == 0 else f"LEVEL_{int(value)}"
 
 
-def evaluate_run(run_dir: str | Path, *, validate: bool = False) -> dict:
-    """读取运行产物，返回不依赖人工真值的描述性指标。"""
+def _require_non_neg_number(value, name: str) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} 必须为有限非负数")
+    return float(value)
+
+
+def _validate_ground_truth(data) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("真值标注文件顶层必须是键值映射")
+    if type(data.get("schema_version")) is not int or data["schema_version"] != 1:
+        raise ValueError("真值标注必须包含 schema_version: 1")
+    tol = _require_non_neg_number(data.get("tolerance_s", 0.5), "tolerance_s")
+
+    raw_speeds = data.get("speed_references", [])
+    if not isinstance(raw_speeds, list):
+        raise ValueError("speed_references 必须是列表")
+    speed_refs = []
+    for idx, item in enumerate(raw_speeds):
+        if not isinstance(item, dict):
+            raise ValueError(f"speed_references[{idx}] 必须是映射")
+        tid = item.get("track_id")
+        if type(tid) is not int or tid <= 0:
+            raise ValueError(f"speed_references[{idx}].track_id 必须为正整数")
+        ref_kmh = _require_non_neg_number(
+            item.get("reference_speed_kmh"), f"speed_references[{idx}].reference_speed_kmh"
+        )
+        t_start = item.get("start_timestamp_s")
+        t_end = item.get("end_timestamp_s")
+        start_val = _require_non_neg_number(t_start, f"speed_references[{idx}].start_timestamp_s") if t_start is not None else None
+        end_val = _require_non_neg_number(t_end, f"speed_references[{idx}].end_timestamp_s") if t_end is not None else None
+        if start_val is not None and end_val is not None and end_val < start_val:
+            raise ValueError(f"speed_references[{idx}] end_timestamp_s 不能小于 start_timestamp_s")
+        only_reliable = item.get("only_reliable", True)
+        if type(only_reliable) is not bool:
+            raise ValueError(f"speed_references[{idx}].only_reliable 必须是布尔值")
+        speed_refs.append({
+            "track_id": tid,
+            "reference_speed_kmh": ref_kmh,
+            "start_timestamp_s": start_val,
+            "end_timestamp_s": end_val,
+            "only_reliable": only_reliable,
+        })
+
+    raw_events = data.get("expected_events", [])
+    if not isinstance(raw_events, list):
+        raise ValueError("expected_events 必须是列表")
+    expected_events = []
+    for idx, item in enumerate(raw_events):
+        if not isinstance(item, dict):
+            raise ValueError(f"expected_events[{idx}] 必须是映射")
+        kind = item.get("kind")
+        if kind not in {"conflict", "speeding"}:
+            raise ValueError(f"expected_events[{idx}].kind 必须为 conflict 或 speeding")
+        start_val = _require_non_neg_number(item.get("start_timestamp_s"), f"expected_events[{idx}].start_timestamp_s")
+        end_val = _require_non_neg_number(item.get("end_timestamp_s"), f"expected_events[{idx}].end_timestamp_s")
+        if end_val < start_val:
+            raise ValueError(f"expected_events[{idx}] end_timestamp_s 不能小于 start_timestamp_s")
+        veh_id = item.get("veh_track_id")
+        if veh_id is not None and (type(veh_id) is not int or veh_id <= 0):
+            raise ValueError(f"expected_events[{idx}].veh_track_id 必须为正整数或 null")
+        ped_id = item.get("ped_track_id")
+        if ped_id is not None and (type(ped_id) is not int or ped_id <= 0):
+            raise ValueError(f"expected_events[{idx}].ped_track_id 必须为正整数或 null")
+        moment = item.get("conflict_moment_s")
+        moment_val = _require_non_neg_number(moment, f"expected_events[{idx}].conflict_moment_s") if moment is not None else None
+        expected_events.append({
+            "kind": kind,
+            "start_timestamp_s": start_val,
+            "end_timestamp_s": end_val,
+            "veh_track_id": veh_id,
+            "ped_track_id": ped_id,
+            "conflict_moment_s": moment_val,
+        })
+
+    return {
+        "schema_version": 1,
+        "tolerance_s": tol,
+        "speed_references": speed_refs,
+        "expected_events": expected_events,
+    }
+
+
+def load_ground_truth(path: str | Path) -> dict:
+    """加载并校验 JSON/YAML 格式的速度与事件人工真值文件。"""
+    gt_path = Path(path).expanduser().resolve()
+    if not gt_path.is_file():
+        raise FileNotFoundError(f"真值文件不存在: {gt_path}")
+    text = gt_path.read_text(encoding="utf-8")
+    if gt_path.suffix.lower() == ".json":
+        def _reject(val):
+            raise ValueError(f"真值 JSON 不允许非有限常量: {val}")
+        try:
+            raw = json.loads(text, parse_constant=_reject)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"真值 JSON 解析失败: {exc}") from None
+    else:
+        try:
+            raw = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise ValueError(f"真值 YAML 解析失败: {exc}") from None
+    return _validate_ground_truth(raw)
+
+
+def evaluate_ground_truth(
+    gt: dict,
+    *,
+    speeds: list[dict[str, str]],
+    events: list[dict],
+) -> dict:
+    """对照人工真值计算测速误差 (MAE/RMSE) 与事件级 Precision/Recall/F1/预警提前量。"""
+    parsed = _validate_ground_truth(gt)
+    tol = parsed["tolerance_s"]
+
+    speed_items = []
+    signed_errors = []
+    abs_errors = []
+    for ref in parsed["speed_references"]:
+        matched_vals = []
+        for row in speeds:
+            try:
+                tid = int(row.get("track_id", ""))
+                ts = float(row.get("timestamp_s", ""))
+                spd = float(row.get("speed_kmh", ""))
+            except (TypeError, ValueError):
+                continue
+            if tid != ref["track_id"] or not (math.isfinite(ts) and math.isfinite(spd)):
+                continue
+            if ref["only_reliable"] and str(row.get("is_reliable", "")) != "1":
+                continue
+            if ref["start_timestamp_s"] is not None and ts < ref["start_timestamp_s"]:
+                continue
+            if ref["end_timestamp_s"] is not None and ts > ref["end_timestamp_s"]:
+                continue
+            matched_vals.append(spd)
+
+        if matched_vals:
+            measured_mean = fmean(matched_vals)
+            signed_err = measured_mean - ref["reference_speed_kmh"]
+            abs_err = abs(signed_err)
+            signed_errors.append(signed_err)
+            abs_errors.append(abs_err)
+            speed_items.append({
+                "track_id": ref["track_id"],
+                "reference_speed_kmh": ref["reference_speed_kmh"],
+                "sample_count": len(matched_vals),
+                "measured_mean_kmh": round(measured_mean, 4),
+                "signed_error_kmh": round(signed_err, 4),
+                "abs_error_kmh": round(abs_err, 4),
+                "matched": True,
+            })
+        else:
+            speed_items.append({
+                "track_id": ref["track_id"],
+                "reference_speed_kmh": ref["reference_speed_kmh"],
+                "sample_count": 0,
+                "measured_mean_kmh": None,
+                "signed_error_kmh": None,
+                "abs_error_kmh": None,
+                "matched": False,
+            })
+
+    speed_accuracy = {
+        "reference_count": len(parsed["speed_references"]),
+        "matched_count": len(abs_errors),
+        "unmatched_count": len(parsed["speed_references"]) - len(abs_errors),
+        "mae_kmh": round(fmean(abs_errors), 4) if abs_errors else None,
+        "rmse_kmh": round(math.sqrt(fmean(e * e for e in signed_errors)), 4) if signed_errors else None,
+        "max_abs_error_kmh": round(max(abs_errors), 4) if abs_errors else None,
+        "mean_signed_bias_kmh": round(fmean(signed_errors), 4) if signed_errors else None,
+        "items": speed_items,
+    }
+
+    gt_events = parsed["expected_events"]
+    candidates = []
+    for gi, g in enumerate(gt_events):
+        for pi, p in enumerate(events):
+            if p.get("kind") != g["kind"]:
+                continue
+            if g["veh_track_id"] is not None and p.get("veh_track_id") != g["veh_track_id"]:
+                continue
+            if g["ped_track_id"] is not None and p.get("ped_track_id") != g["ped_track_id"]:
+                continue
+            try:
+                p_start = float(p["start_timestamp_s"])
+                p_end = float(p["end_timestamp_s"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (math.isfinite(p_start) and math.isfinite(p_end)):
+                continue
+            ov_start = max(p_start - tol, g["start_timestamp_s"])
+            ov_end = min(p_end + tol, g["end_timestamp_s"])
+            if ov_end >= ov_start:
+                overlap = ov_end - ov_start
+                start_diff = abs(p_start - g["start_timestamp_s"])
+                candidates.append((overlap, -start_diff, gi, pi))
+
+    candidates.sort(reverse=True)
+    matched_gt: set[int] = set()
+    matched_pred: set[int] = set()
+    matched_pairs = []
+    for _, _, gi, pi in candidates:
+        if gi in matched_gt or pi in matched_pred:
+            continue
+        matched_gt.add(gi)
+        matched_pred.add(pi)
+        matched_pairs.append((gt_events[gi], events[pi]))
+
+    tp = len(matched_pairs)
+    fp = len(events) - tp
+    fn = len(gt_events) - tp
+    precision = (tp / (tp + fp)) if (tp + fp) > 0 else None
+    recall = (tp / (tp + fn)) if (tp + fn) > 0 else None
+    if precision is not None and recall is not None:
+        f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+    else:
+        f1 = None
+
+    leads = [
+        float(g["conflict_moment_s"]) - float(p["start_timestamp_s"])
+        for g, p in matched_pairs
+        if g["conflict_moment_s"] is not None
+    ]
+    event_accuracy = {
+        "expected_count": len(gt_events),
+        "predicted_count": len(events),
+        "tolerance_s": tol,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "precision": round(precision, 4) if precision is not None else None,
+        "recall": round(recall, 4) if recall is not None else None,
+        "f1": round(f1, 4) if f1 is not None else None,
+        "lead_time_s": {
+            "count": len(leads),
+            "min": round(min(leads), 4) if leads else None,
+            "mean": round(fmean(leads), 4) if leads else None,
+            "max": round(max(leads), 4) if leads else None,
+        },
+    }
+
+    return {
+        "speed_accuracy": speed_accuracy,
+        "event_accuracy": event_accuracy,
+    }
+
+
+def evaluate_run(
+    run_dir: str | Path,
+    *,
+    validate: bool = False,
+    ground_truth: str | Path | dict | None = None,
+) -> dict:
+    """读取运行产物，返回描述性指标；提供人工真值时同时计算准确率与测速误差。"""
     root = Path(run_dir).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"运行目录不存在: {root}")
@@ -87,12 +340,22 @@ def evaluate_run(run_dir: str | Path, *, validate: bool = False) -> dict:
         1 for row in speeds if str(row.get("event_id", "")).strip() != ""
     )
 
-    return {
+    gt_eval = None
+    has_gt = ground_truth is not None
+    if has_gt:
+        gt_data = ground_truth if isinstance(ground_truth, dict) else load_ground_truth(ground_truth)
+        gt_eval = evaluate_ground_truth(gt_data, speeds=speeds, events=events)
+
+    payload = {
         "schema_version": 1,
         "run_dir": str(root),
-        "has_ground_truth": False,
+        "has_ground_truth": has_gt,
         "schema_validation": schema_result,
-        "note": "描述性运行评价，无人工真值，不声称 Precision/Recall/MAE 等精度指标。",
+        "note": (
+            "已结合人工真值完成测速误差与事件级准确率评价。"
+            if has_gt
+            else "描述性运行评价，无人工真值，不声称 Precision/Recall/MAE 等精度指标。"
+        ),
         "summary": summary,
         "frames": {
             "processed": summary.get("frames_processed", len(frame_ids)),
@@ -128,6 +391,9 @@ def evaluate_run(run_dir: str | Path, *, validate: bool = False) -> dict:
             "stationary_values": dict(sorted(stationary.items())),
         },
     }
+    if gt_eval is not None:
+        payload["ground_truth_evaluation"] = gt_eval
+    return payload
 
 
 def to_markdown(result: dict) -> str:
@@ -136,7 +402,7 @@ def to_markdown(result: dict) -> str:
     events = result["events"]
     speed = result["speed_rows"]["speed_kmh"]
     lines = [
-        f"# Analysis run evaluation\n",
+        "# Analysis run evaluation\n",
         f"- Run: `{result['run_dir']}`",
         f"- Frames processed: {frames['processed']}",
         f"- Assessment rows: {frames['observed_assessment_rows']}",
@@ -149,22 +415,38 @@ def to_markdown(result: dict) -> str:
         "|---|---:|",
     ]
     lines.extend(f"| {key} | {value} |" for key, value in result["risk_counts"].items())
-    lines.extend([
-        "",
-        "> This is descriptive output without ground truth; it is not an accuracy evaluation.",
-        "",
-    ])
+    if result.get("has_ground_truth") and "ground_truth_evaluation" in result:
+        gt_eval = result["ground_truth_evaluation"]
+        sa = gt_eval["speed_accuracy"]
+        ea = gt_eval["event_accuracy"]
+        lt = ea["lead_time_s"]
+        lines.extend([
+            "",
+            "## Ground-truth accuracy",
+            "",
+            f"- Speed matched: {sa['matched_count']}/{sa['reference_count']} | MAE={sa['mae_kmh']} km/h | RMSE={sa['rmse_kmh']} km/h | MaxAbs={sa['max_abs_error_kmh']} km/h",
+            f"- Event matching: TP={ea['tp']}, FP={ea['fp']}, FN={ea['fn']} | Precision={ea['precision']} | Recall={ea['recall']} | F1={ea['f1']}",
+            f"- Lead time (s): count={lt['count']}, min={lt['min']}, mean={lt['mean']}, max={lt['max']}",
+            "",
+        ])
+    else:
+        lines.extend([
+            "",
+            "> This is descriptive output without ground truth; it is not an accuracy evaluation.",
+            "",
+        ])
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="评价一次 analysis 运行产物（不需要视频或人工真值）")
+    parser = argparse.ArgumentParser(description="评价一次 analysis 运行产物（支持可选人工真值）")
     parser.add_argument("--run", required=True, help="runs/analysis/run-* 目录")
+    parser.add_argument("--ground-truth", help="可选人工真值标注文件 (.yaml/.yml/.json)")
     parser.add_argument("--output", help="输出 JSON/Markdown 文件；不指定则打印 JSON")
     parser.add_argument("--markdown", action="store_true", help="输出简短 Markdown 而不是 JSON")
     parser.add_argument("--validate", action="store_true", help="评价前严格校验当前输出契约")
     args = parser.parse_args(argv)
-    result = evaluate_run(args.run, validate=args.validate)
+    result = evaluate_run(args.run, validate=args.validate, ground_truth=args.ground_truth)
     content = (
         to_markdown(result)
         if args.markdown

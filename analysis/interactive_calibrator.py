@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -151,6 +152,18 @@ def run_interactive_calibration(
     return calibrator
 
 
+def _parse_coord_pairs(raw: str, flag_name: str, expected_pairs: Optional[int] = None) -> List[Tuple[float, float]]:
+    try:
+        nums = [float(x.strip()) for x in raw.split(",")]
+    except ValueError:
+        raise ValueError(f"{flag_name} 格式错误，必须由逗号分隔的有限数字组成") from None
+    if len(nums) < 2 or len(nums) % 2 != 0 or not all(math.isfinite(x) for x in nums):
+        raise ValueError(f"{flag_name} 必须包含偶数个有限数字以构成二维坐标对")
+    if expected_pairs is not None and len(nums) != expected_pairs * 2:
+        raise ValueError(f"{flag_name} 必须提供 {expected_pairs * 2} 个有限数字构成 {expected_pairs} 对坐标")
+    return [(nums[i], nums[i + 1]) for i in range(0, len(nums), 2)]
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="校园道路 4 点空间单应性标定工具")
     parser.add_argument("--source", type=str, required=True, help="校园道路空镜照片或视频路径")
@@ -163,30 +176,70 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="非交互模式直接传入 4 点像素坐标: u1,v1,u2,v2,u3,v3,u4,v4",
     )
+    parser.add_argument(
+        "--check-image-points",
+        type=str,
+        default=None,
+        help="可选独立检查点的像素坐标序列: u1,v1,u2,v2,...",
+    )
+    parser.add_argument(
+        "--check-ground-points",
+        type=str,
+        default=None,
+        help="可选独立检查点对应的地面米制坐标序列: x1,y1,x2,y2,...",
+    )
+    parser.add_argument(
+        "--validation-output",
+        type=str,
+        default=None,
+        help="可选将独立检查点误差报告保存为 JSON 文件",
+    )
     args = parser.parse_args(argv)
 
     if not (math.isfinite(args.width) and args.width > 0):
         parser.error("--width 必须为有限正数")
     if not (math.isfinite(args.length) and args.length > 0):
         parser.error("--length 必须为有限正数")
+    if (args.check_image_points is None) != (args.check_ground_points is None):
+        parser.error("--check-image-points 与 --check-ground-points 必须成对提供")
 
     pts = None
     if args.points is not None:
         try:
-            raw_nums = [float(x.strip()) for x in args.points.split(",")]
-        except ValueError:
-            parser.error("--points 格式错误，必须提供 8 个有限数字: u1,v1,u2,v2,u3,v3,u4,v4")
-        if len(raw_nums) != 8 or not all(math.isfinite(x) for x in raw_nums):
-            parser.error("--points 必须提供 8 个有限数字构成 4 对坐标 (u1,v1,u2,v2,u3,v3,u4,v4)")
-        pts = [(raw_nums[i], raw_nums[i + 1]) for i in range(0, 8, 2)]
+            pts = _parse_coord_pairs(args.points, "--points", expected_pairs=4)
+        except ValueError as exc:
+            parser.error(str(exc))
 
-    run_interactive_calibration(
+    check_img_pts = check_gd_pts = None
+    if args.check_image_points is not None:
+        try:
+            check_img_pts = _parse_coord_pairs(args.check_image_points, "--check-image-points")
+            check_gd_pts = _parse_coord_pairs(args.check_ground_points, "--check-ground-points")
+        except ValueError as exc:
+            parser.error(str(exc))
+        if len(check_img_pts) != len(check_gd_pts):
+            parser.error("--check-image-points 与 --check-ground-points 点数必须一致")
+
+    calibrator = run_interactive_calibration(
         source_path=args.source,
         width_m=args.width,
         length_m=args.length,
         output_path=args.output,
         predefined_points=pts,
     )
+    if check_img_pts is not None:
+        report = calibrator.evaluate_check_points(check_img_pts, check_gd_pts)
+        print(
+            f"[OK] 独立检查点验证 ({report['count']} 点): "
+            f"RMSE = {report['rmse_m']:.3f} m | Max = {report['max_error_m']:.3f} m"
+        )
+        if args.validation_output:
+            val_path = Path(args.validation_output).expanduser().resolve()
+            val_path.parent.mkdir(parents=True, exist_ok=True)
+            val_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False),
+                encoding="utf-8",
+            )
     return 0
 
 

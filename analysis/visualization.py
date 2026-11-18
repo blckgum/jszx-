@@ -47,12 +47,25 @@ class EnhancedConflictVisualizer:
         self.COLOR_ZONE = (255, 191, 0)       # 天蓝/深黄色 (标定区域)
 
     def draw_calibrated_ground_zone(self, frame: np.ndarray, alpha: float = 0.25):
-        """在路面上半透明叠加渲染受控标定多边形区域"""
+        """在路面上半透明叠加渲染受控标定多边形区域与路侧停车区"""
         pts = np.array(self.calibrator.image_points, dtype=np.int32)
         overlay = frame.copy()
         cv2.fillPoly(overlay, [pts], (240, 180, 0))
         cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
         cv2.polylines(frame, [pts], isClosed=True, color=(0, 220, 255), thickness=2)
+
+        for zone in getattr(self.calibrator, "parking_zones", ()):
+            px_pts = [self.calibrator.ground_to_pixel(gx, gy) for gx, gy in zone]
+            if any(u < 0 or v < 0 for u, v in px_pts):
+                continue
+            arr = np.array(px_pts, dtype=np.int32)
+            cv2.polylines(frame, [arr], isClosed=True, color=(180, 180, 80), thickness=2)
+            label_x = max(0, min(frame.shape[1] - 60, px_pts[0][0]))
+            label_y = max(16, min(frame.shape[0] - 4, px_pts[0][1] - 4))
+            cv2.putText(
+                frame, "PARKING", (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 80), 1, cv2.LINE_AA,
+            )
 
     def draw_future_trajectory(
         self,

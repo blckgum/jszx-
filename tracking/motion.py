@@ -175,7 +175,7 @@ class MotionEstimator:
         if (type(frame.timestamp_s) not in (int, float) or not math.isfinite(frame.timestamp_s)
                 or frame.timestamp_s < 0):
             raise ValueError("运动时间戳必须非负且有限")
-        if frame.timestamp_source not in {"video_pts", "fps_estimate"}:
+        if frame.timestamp_source not in {"video_pts", "fps_estimate", "wall_clock"}:
             raise ValueError("未知的时间戳来源")
         if any(type(value) is not int or value <= 0 for value in (frame.width, frame.height)):
             raise ValueError("图像宽高必须为正整数")

@@ -3,6 +3,7 @@
 校园道路车辆—行人冲突感知、测速与 TTC 风险预警模块
 """
 
+from .batch import analyze_directory
 from .calibration import CalibrationConfig, RoadCalibrator
 from .conflict import ConflictAnalyzer, ConflictAssessment, RiskLevel
 from .pipeline import ConflictPerceptionPipeline
@@ -20,4 +21,5 @@ __all__ = [
     "TrackMotionTracker",
     "EnhancedConflictVisualizer",
     "ConflictPerceptionPipeline",
+    "analyze_directory",
 ]

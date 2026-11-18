@@ -177,6 +177,68 @@ class TestRoadCalibrator(unittest.TestCase):
                 loaded = RoadCalibrator.from_yaml(yaml_path)
             self.assertFalse(loaded.synthetic)
 
+    def test_parking_zones_and_independent_check_points(self):
+        import cv2
+        from analysis.interactive_calibrator import main as calib_main
+
+        # 仿射矩形映射便于解析验证独立检查点
+        rect = RoadCalibrator(
+            [(0.0, 0.0), (600.0, 0.0), (600.0, 1000.0), (0.0, 1000.0)],
+            width_m=6.0,
+            length_m=10.0,
+            name="parking_check_road",
+        )
+        added = rect.add_parking_zone_pixels([(0.0, 200.0), (150.0, 200.0), (150.0, 800.0), (0.0, 800.0)])
+        self.assertEqual(len(added), 4)
+        self.assertTrue(rect.is_in_parking_zone(0.8, 5.0))
+        self.assertTrue(rect.is_in_parking_zone(0.0, 2.0))
+        self.assertFalse(rect.is_in_parking_zone(3.0, 5.0))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            yaml_path = root / "calib_parking.yaml"
+            rect.to_yaml(yaml_path)
+            reloaded = RoadCalibrator.from_yaml(yaml_path)
+            self.assertEqual(len(reloaded.parking_zones), 1)
+            self.assertTrue(reloaded.is_in_parking_zone(0.8, 5.0))
+            self.assertFalse(reloaded.is_in_parking_zone(3.0, 5.0))
+
+            report = reloaded.evaluate_check_points(
+                [(300.0, 500.0), (150.0, 250.0)],
+                [(3.0, 5.0), (1.5, 2.5)],
+            )
+            self.assertEqual(report["count"], 2)
+            self.assertAlmostEqual(report["rmse_m"], 0.0, delta=1e-4)
+            self.assertAlmostEqual(report["max_error_m"], 0.0, delta=1e-4)
+
+            # 禁止拿标定角点本身充当独立检查点或传入重复点
+            with self.assertRaises(ValueError):
+                reloaded.evaluate_check_points([(0.0, 0.0)], [(0.0, 0.0)])
+            with self.assertRaises(ValueError):
+                reloaded.evaluate_check_points([(300.0, 500.0), (300.0, 500.0)], [(3.0, 5.0), (3.0, 5.0)])
+
+            img_path = root / "road.png"
+            ok, encoded = cv2.imencode(".png", np.zeros((1050, 650, 3), dtype=np.uint8))
+            self.assertTrue(ok)
+            encoded.tofile(str(img_path))
+            val_json = root / "validation.json"
+            self.assertEqual(
+                calib_main([
+                    "--source", str(img_path),
+                    "--width", "6.0",
+                    "--length", "10.0",
+                    "--points", "0,0,600,0,600,1000,0,1000",
+                    "--check-image-points", "300,500,450,750",
+                    "--check-ground-points", "3.0,5.0,4.5,7.5",
+                    "--validation-output", str(val_json),
+                    "--output", str(root / "cli_calib.yaml"),
+                ]),
+                0,
+            )
+            val_report = json.loads(val_json.read_text(encoding="utf-8"))
+            self.assertEqual(val_report["count"], 2)
+            self.assertAlmostEqual(val_report["rmse_m"], 0.0, delta=1e-4)
+
 
 class TestSpeedEstimator(unittest.TestCase):
     def test_object_kind_policy_is_preserved(self):
@@ -797,6 +859,32 @@ class TestConflictAnalyzer(unittest.TestCase):
         assessments = self.analyzer.analyze_frame([veh])
         self.assertEqual(len(assessments), 1)
         self.assertEqual(assessments[0].risk_level, RiskLevel.LEVEL_0_SAFE)
+
+    def test_parking_zone_exempts_slow_vehicle_only(self):
+        # 停靠区内的缓慢挪动车辆豁免碰撞误报，高速驶出仍触发 CRITICAL
+        ped = SpeedReading(
+            track_id=2, category="pedestrian",
+            x_m=1.2, y_m=6.0, vx_ms=0.0, vy_ms=0.0,
+            speed_ms=0.0, speed_kmh=0.0, is_speeding=False,
+            heading_deg=0.0, is_reliable=True,
+        )
+        slow_parked = SpeedReading(
+            track_id=1, category="vehicle",
+            x_m=1.0, y_m=4.0, vx_ms=0.0, vy_ms=0.6,
+            speed_ms=0.6, speed_kmh=2.16, is_speeding=False,
+            heading_deg=90.0, is_reliable=True, in_parking_zone=True,
+        )
+        self.assertIsNone(self.analyzer.evaluate_pair(slow_parked, ped))
+
+        fast_exiting = SpeedReading(
+            track_id=1, category="vehicle",
+            x_m=1.0, y_m=2.0, vx_ms=0.0, vy_ms=7.0,
+            speed_ms=7.0, speed_kmh=25.2, is_speeding=False,
+            heading_deg=90.0, is_reliable=True, in_parking_zone=True,
+        )
+        res = self.analyzer.evaluate_pair(fast_exiting, ped)
+        self.assertIsNotNone(res)
+        self.assertEqual(res.risk_level, RiskLevel.LEVEL_3_CRITICAL)
 
 
 class TestConflictEventTracker(unittest.TestCase):
@@ -1709,6 +1797,146 @@ class TestPipelineIO(unittest.TestCase):
                         "--source", str(Path(d) / "x.mp4"), "--calib", str(calib),
                         "--allow-legacy-calib", "--output", str(Path(d) / "out"),
                     ])
+
+    def test_live_stream_source_redaction_and_wall_clock(self):
+        import cv2
+        from unittest import mock
+
+        from analysis.pipeline import (
+            ConflictPerceptionPipeline,
+            LiveStreamClock,
+            parse_video_source,
+        )
+        from tracking.core import DEFAULT_TRACKER, TrackingSession, normalize_session_source
+
+        raw_rtsp = "rtsp://admin:secret123@192.168.1.20:554/stream?channel=1"
+        cap_arg, label, is_live = parse_video_source(raw_rtsp)
+        self.assertEqual(cap_arg, raw_rtsp)
+        self.assertEqual(label, "rtsp://***@192.168.1.20:554/stream?channel=1")
+        self.assertTrue(is_live)
+
+        self.assertEqual(parse_video_source("0"), (0, "camera:0", True))
+        self.assertEqual(normalize_session_source(0), "camera:0")
+        self.assertEqual(
+            normalize_session_source(raw_rtsp),
+            "rtsp://***@192.168.1.20:554/stream?channel=1",
+        )
+
+        # Windows 环境下含问号推流 URL 不得再触发 Path.resolve 异常
+        with mock.patch("tracking.core.load_model") as m_load:
+            m_load.return_value.names = {0: "person", 2: "car"}
+            sess = TrackingSession(raw_rtsp, "unused.pt", DEFAULT_TRACKER)
+            self.assertEqual(sess.source, "rtsp://***@192.168.1.20:554/stream?channel=1")
+
+        clock = LiveStreamClock()
+        t0, k0 = clock.timestamp(0, 0.0)
+        t1, k1 = clock.timestamp(1, 0.0)
+        t2, k2 = clock.timestamp(2, 50.0)
+        self.assertEqual((t0, k0), (0.0, "wall_clock"))
+        self.assertEqual(k1, "wall_clock")
+        self.assertGreater(t1, t0)
+        self.assertEqual((t2, k2), (0.05, "video_pts"))
+
+        with tempfile.TemporaryDirectory() as d:
+            calib = RoadCalibrator(
+                [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 6.0, 15.0
+            )
+            pipe = ConflictPerceptionPipeline(calibrator=calib)
+            fake_cap = mock.Mock()
+            fake_cap.isOpened.return_value = True
+            fake_cap.get.side_effect = lambda prop: {
+                cv2.CAP_PROP_FPS: 0.0,
+                cv2.CAP_PROP_FRAME_WIDTH: 64.0,
+                cv2.CAP_PROP_FRAME_HEIGHT: 64.0,
+                cv2.CAP_PROP_POS_MSEC: 0.0,
+            }.get(prop, 0.0)
+            fake_cap.read.return_value = (True, np.zeros((64, 64, 3), dtype=np.uint8))
+
+            fake_session = self._speeding_vehicle_session()
+            out_dir = Path(d) / "live_out"
+            with mock.patch("analysis.pipeline.cv2.VideoCapture", return_value=fake_cap) as m_cap, \
+                 mock.patch("analysis.pipeline.TrackingSession", return_value=fake_session):
+                summary = pipe.process_video(raw_rtsp, out_dir, max_frames=3)
+
+            m_cap.assert_called_once_with(raw_rtsp)
+            self.assertEqual(summary["status"], "ok")
+            self.assertEqual(summary["stop_reason"], "max_frames")
+            self.assertEqual(summary["frames_processed"], 3)
+            self.assertNotIn("secret123", summary["source_video"])
+            self.assertIn("***@", summary["source_video"])
+
+    def test_process_tracks_offline_replay_and_cli(self):
+        from unittest import mock
+
+        from analysis.__main__ import main
+        from analysis.pipeline import ConflictPerceptionPipeline
+        from analysis.schema import validate_run
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            tracks_path = root / "tracks.jsonl"
+            frames = []
+            for idx in range(10):
+                t_s = round(idx * 0.1, 3)
+                v_y = 350.0 + idx * 20.0
+                p_x = 640.0
+                p_y = 560.0
+                frames.append(json.dumps({
+                    "schema_version": 1,
+                    "session_id": "offline-sess-01",
+                    "source": "campus_clip.mp4",
+                    "frame_index": idx,
+                    "timestamp_s": t_s,
+                    "timestamp_source": "video_pts",
+                    "width": 1280,
+                    "height": 720,
+                    "tracks": [
+                        {
+                            "track_id": 1, "class_id": 2, "class_name": "car",
+                            "category": "vehicle", "confidence": 0.9,
+                            "bbox_xyxy": [620.0, v_y - 30.0, 660.0, v_y],
+                            "anchor_xy": [640.0, v_y],
+                            "anchor_type": "bbox_bottom_center", "observation": "detected",
+                        },
+                        {
+                            "track_id": 2, "class_id": 0, "class_name": "person",
+                            "category": "pedestrian", "confidence": 0.85,
+                            "bbox_xyxy": [p_x - 10.0, p_y - 40.0, p_x + 10.0, p_y],
+                            "anchor_xy": [p_x, p_y],
+                            "anchor_type": "bbox_bottom_center", "observation": "detected",
+                        },
+                    ],
+                }))
+            tracks_path.write_text("\n".join(frames) + "\n", encoding="utf-8")
+
+            out_dir = root / "replay_out"
+            with mock.patch("analysis.pipeline.TrackingSession") as m_sess:
+                self.assertEqual(
+                    main(["--tracks", str(tracks_path), "--demo", "--output", str(out_dir)]),
+                    0,
+                )
+            m_sess.assert_not_called()
+
+            summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["status"], "ok")
+            self.assertEqual(summary["input_mode"], "tracks_jsonl")
+            self.assertIsNone(summary["annotated_output"])
+            self.assertEqual(summary["frames_processed"], 10)
+            self.assertGreater(summary["max_observed_speed_kmh"], 0.0)
+            self.assertTrue(validate_run(out_dir)["valid"])
+
+            # 非单调时间戳轨迹文件在初始化阶段即拒绝并写失败 summary.json
+            bad_tracks = root / "bad_tracks.jsonl"
+            bad_tracks.write_text("\n".join([frames[1], frames[0]]) + "\n", encoding="utf-8")
+            calib = RoadCalibrator(
+                [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)], 10.0, 10.0
+            )
+            bad_out = root / "bad_replay_out"
+            with self.assertRaises(ValueError):
+                ConflictPerceptionPipeline(calibrator=calib).process_tracks(bad_tracks, bad_out)
+            bad_summary = json.loads((bad_out / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(bad_summary["status"], "failed")
+            self.assertEqual(bad_summary["stop_reason"], "initialization")
 
 
 if __name__ == "__main__":

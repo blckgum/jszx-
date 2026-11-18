@@ -32,6 +32,7 @@ class SpeedReading:
     heading_deg: float         # 运动方向角 (0~360度)
     is_reliable: bool          # 速度估计是否已收敛可信 (需要足够的连续观测点)
     is_stationary: bool = False  # 是否持续静止（泊车/停靠），需连续多帧低速确认
+    in_parking_zone: bool = False  # 是否位于标定的路侧停车区多边形内
     object_kind: str = ""      # pedestrian | bicycle | motorcycle | car | bus | truck | motor_vehicle
 
     def __post_init__(self):

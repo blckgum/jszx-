@@ -12,6 +12,7 @@ from analysis.schema import (
     load_json_strict,
     load_jsonl_strict,
     validate_ablation,
+    validate_batch_run,
     validate_configuration,
     validate_run,
     validate_scenarios,
@@ -211,6 +212,56 @@ class SchemaTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as context:
                 schema_main(["--run", temporary])
             self.assertEqual(context.exception.code, 1)
+
+    def test_batch_summary_and_headless_tracks_summary_contracts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child = root / "0001_clip"
+            child.mkdir()
+            (child / "summary.json").write_text(json.dumps({
+                "schema_version": 1, "status": "ok", "stop_reason": "eof", "frames_processed": 1,
+                "elapsed_seconds": 0.1, "annotated_output": None,
+                "conflicts_jsonl": "conflicts.jsonl", "events_jsonl": "events.jsonl",
+                "speeds_csv": "speeds.csv", "configuration_json": "configuration.json",
+                "total_alert_events": 0, "total_speeding_alerts": 0,
+                "total_caution_events": 0, "total_critical_conflicts": 0,
+            }), encoding="utf-8")
+            (child / "configuration.json").write_text(
+                json.dumps(valid_configuration()), encoding="utf-8"
+            )
+            (child / "conflicts.jsonl").write_text("", encoding="utf-8")
+            (child / "events.jsonl").write_text("", encoding="utf-8")
+            with (child / "speeds.csv").open("w", newline="", encoding="utf-8") as stream:
+                csv.writer(stream).writerow([
+                    "schema_version", "frame_idx", "timestamp_s", "track_id", "category",
+                    "speed_kmh", "risk_level", "event_id", "is_reliable", "is_stationary",
+                ])
+            self.assertTrue(validate_run(child)["valid"])
+
+            batch_summary = {
+                "schema_version": 1,
+                "kind": "analysis_batch",
+                "source_dir": str(root),
+                "output_dir": str(root),
+                "status": "completed",
+                "videos_discovered": 1,
+                "videos_not_processed": 0,
+                "total_alert_events": 0,
+                "total_speeding_alerts": 0,
+                "total_caution_events": 0,
+                "total_critical_conflicts": 0,
+                "results": [{"source": "clip.mp4", "output": str(child), "status": "ok"}],
+            }
+            (root / "batch_summary.json").write_text(json.dumps(batch_summary), encoding="utf-8")
+            res = validate_batch_run(root)
+            self.assertTrue(res["valid"])
+            self.assertEqual(res["validated_runs"], 1)
+            self.assertEqual(schema_main(["--run", str(root)]), 0)
+
+            # 子目录输出损坏时批量校验必须失败
+            (child / "summary.json").write_text('{"schema_version": 2}', encoding="utf-8")
+            with self.assertRaises(SchemaValidationError):
+                validate_batch_run(root)
 
 
 if __name__ == "__main__":

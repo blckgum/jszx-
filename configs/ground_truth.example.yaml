@@ -1,0 +1,18 @@
+# 人工真值评测模板（实测校园视频核对测速误差与预警准确率时填写）
+schema_version: 1
+tolerance_s: 0.5  # 预测事件区间与真值时间窗匹配容差（秒）
+
+speed_references:
+  - track_id: 1
+    reference_speed_kmh: 24.5
+    start_timestamp_s: 1.0
+    end_timestamp_s: 4.0
+    only_reliable: true
+
+expected_events:
+  - kind: conflict          # conflict | speeding
+    veh_track_id: 1
+    ped_track_id: 2
+    start_timestamp_s: 2.0
+    end_timestamp_s: 4.0
+    conflict_moment_s: 4.5  # 可选：实际潜在碰撞/最近会车时刻，用于计算预警提前量 (Lead Time)

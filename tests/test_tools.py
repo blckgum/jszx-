@@ -8,14 +8,16 @@ from unittest import mock
 import cv2
 import numpy as np
 
+from analysis.__main__ import main as analysis_main
 from analysis.ablation import main as ablation_main, run_conflict_ablation, run_speed_ablation
+from analysis.batch import analyze_directory
 from analysis.calibration import RoadCalibrator
 from analysis.conflict import ConflictAnalyzer, RiskLevel
-from analysis.evaluate import evaluate_run, main as evaluate_main, to_markdown
+from analysis.evaluate import evaluate_run, load_ground_truth, main as evaluate_main, to_markdown
 from analysis.pipeline import ConflictPerceptionPipeline
 from analysis.policy import object_policy, read_object_policy_config
 from analysis.scenarios import default_scenarios, main as scenarios_main, run_scenarios
-from analysis.schema import validate_run
+from analysis.schema import main as schema_main, validate_batch_run, validate_run
 from analysis.speed import SpeedEstimator, SpeedReading
 
 
@@ -268,6 +270,152 @@ class AnalysisToolTests(unittest.TestCase):
         rows = run_conflict_ablation(critical_thresholds=(1.0, 3.0), horizons=(2.0, 4.0))
         self.assertEqual(len(rows), 3)
         self.assertTrue(any(row["risk_level"] == "LEVEL_3_CRITICAL" for row in rows))
+
+    def test_analyze_directory_batch_isolation_and_error_tolerance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            src_dir = root / "videos"
+            src_dir.mkdir()
+            for name in ("01_good.mp4", "03_good.mp4"):
+                writer = cv2.VideoWriter(
+                    str(src_dir / name), cv2.VideoWriter_fourcc(*"mp4v"), 25.0, (64, 64)
+                )
+                for _ in range(4):
+                    writer.write(np.zeros((64, 64, 3), np.uint8))
+                writer.release()
+            (src_dir / "02_broken.mp4").write_bytes(b"corrupted-video-bytes")
+
+            calib = RoadCalibrator(
+                [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 6.0, 15.0
+            )
+            fake_session = mock.Mock()
+            fake_rec = mock.Mock()
+            fake_rec.tracks = []
+            fake_session.process.return_value = fake_rec
+            fake_session.retained_ids.return_value = set()
+
+            batch_out = root / "batch_mixed"
+            with mock.patch("analysis.pipeline.TrackingSession", return_value=fake_session):
+                batch_summary = analyze_directory(
+                    src_dir, calibrator=calib, output_dir=batch_out
+                )
+
+            self.assertEqual(batch_summary["status"], "completed_with_errors")
+            self.assertEqual(batch_summary["videos_discovered"], 3)
+            self.assertEqual(batch_summary["videos_not_processed"], 0)
+            self.assertEqual([r["status"] for r in batch_summary["results"]], ["ok", "failed", "ok"])
+            self.assertEqual(fake_session.process.call_count, 8)
+            self.assertTrue(validate_batch_run(batch_out)["valid"])
+
+            # 移除损坏视频后通过 CLI 运行：应返回退出码 0，并直接通过 schema CLI
+            (src_dir / "02_broken.mp4").unlink()
+            cli_batch_out = root / "batch_clean"
+            with mock.patch("analysis.pipeline.TrackingSession", return_value=fake_session):
+                self.assertEqual(
+                    analysis_main([
+                        "--source", str(src_dir),
+                        "--demo",
+                        "--output", str(cli_batch_out),
+                    ]),
+                    0,
+                )
+            self.assertEqual(schema_main(["--run", str(cli_batch_out)]), 0)
+
+    def test_ground_truth_speed_and_event_evaluation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "summary.json").write_text(
+                json.dumps({"frames_processed": 20}), encoding="utf-8"
+            )
+            (root / "conflicts.jsonl").write_text("", encoding="utf-8")
+            (root / "events.jsonl").write_text(
+                "\n".join([
+                    json.dumps({
+                        "schema_version": 1, "event_id": 1, "kind": "conflict",
+                        "veh_track_id": 1, "ped_track_id": 2,
+                        "start_frame": 5, "end_frame": 10,
+                        "start_timestamp_s": 1.0, "end_timestamp_s": 2.0,
+                        "peak_risk_level": 3, "min_ttc_seconds": 1.1, "end_reason": "cooldown",
+                    }),
+                    json.dumps({
+                        "schema_version": 1, "event_id": 2, "kind": "speeding",
+                        "veh_track_id": 3, "ped_track_id": None,
+                        "start_frame": 12, "end_frame": 16,
+                        "start_timestamp_s": 5.0, "end_timestamp_s": 6.0,
+                        "peak_risk_level": 1, "min_ttc_seconds": None, "end_reason": "eof",
+                    }),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            with (root / "speeds.csv").open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=["timestamp_s", "track_id", "speed_kmh", "is_reliable", "is_stationary"],
+                )
+                writer.writeheader()
+                for ts, spd, rel in (
+                    ("0.5", "10.0", "0"),
+                    ("1.5", "22.0", "1"),
+                    ("2.5", "18.0", "1"),
+                ):
+                    writer.writerow({
+                        "timestamp_s": ts, "track_id": "1", "speed_kmh": spd,
+                        "is_reliable": rel, "is_stationary": "0",
+                    })
+                writer.writerow({
+                    "timestamp_s": "2.0", "track_id": "2", "speed_kmh": "32.0",
+                    "is_reliable": "1", "is_stationary": "0",
+                })
+
+            gt_path = root / "gt.yaml"
+            gt_path.write_text(
+                "schema_version: 1\n"
+                "tolerance_s: 0.5\n"
+                "speed_references:\n"
+                "  - {track_id: 1, reference_speed_kmh: 22.0, only_reliable: true}\n"
+                "  - {track_id: 2, reference_speed_kmh: 30.0, only_reliable: true}\n"
+                "expected_events:\n"
+                "  - {kind: conflict, veh_track_id: 1, ped_track_id: 2, start_timestamp_s: 1.5, end_timestamp_s: 2.5, conflict_moment_s: 3.0}\n"
+                "  - {kind: conflict, veh_track_id: 9, ped_track_id: 8, start_timestamp_s: 8.0, end_timestamp_s: 9.0}\n",
+                encoding="utf-8",
+            )
+
+            res = evaluate_run(root, ground_truth=gt_path)
+            self.assertTrue(res["has_ground_truth"])
+            gt_eval = res["ground_truth_evaluation"]
+            sa = gt_eval["speed_accuracy"]
+            # track 1 reliable mean = (22 + 18)/2 = 20.0 -> err = -2.0; track 2 err = +2.0 -> MAE=2.0, RMSE=2.0
+            self.assertEqual(sa["matched_count"], 2)
+            self.assertAlmostEqual(sa["mae_kmh"], 2.0)
+            self.assertAlmostEqual(sa["rmse_kmh"], 2.0)
+            self.assertAlmostEqual(sa["mean_signed_bias_kmh"], 0.0)
+
+            ea = gt_eval["event_accuracy"]
+            self.assertEqual((ea["tp"], ea["fp"], ea["fn"]), (1, 1, 1))
+            self.assertAlmostEqual(ea["precision"], 0.5)
+            self.assertAlmostEqual(ea["recall"], 0.5)
+            self.assertAlmostEqual(ea["f1"], 0.5)
+            # lead_time = conflict_moment_s (3.0) - pred start (1.0) = 2.0s
+            self.assertAlmostEqual(ea["lead_time_s"]["mean"], 2.0)
+
+            md_path = root / "eval_gt.md"
+            self.assertEqual(
+                evaluate_main([
+                    "--run", str(root),
+                    "--ground-truth", str(gt_path),
+                    "--markdown",
+                    "--output", str(md_path),
+                ]),
+                0,
+            )
+            md_text = md_path.read_text(encoding="utf-8")
+            self.assertIn("Ground-truth accuracy", md_text)
+            self.assertIn("MAE=2.0", md_text)
+
+            bad_gt = root / "bad_gt.yaml"
+            bad_gt.write_text("schema_version: 2\n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_ground_truth(bad_gt)
 
 
 if __name__ == "__main__":

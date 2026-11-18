@@ -179,6 +179,10 @@ def validate_summary(data):
             "configuration_json", "total_alert_events", "total_speeding_alerts",
             "total_caution_events", "total_critical_conflicts",
         ), "summary")
+        if data["annotated_output"] is not None and (
+            not isinstance(data["annotated_output"], str) or not data["annotated_output"]
+        ):
+            raise SchemaValidationError("summary.annotated_output 必须为非空字符串或 null")
         for key in ("total_alert_events", "total_speeding_alerts", "total_caution_events",
                     "total_critical_conflicts"):
             _integer(data[key], f"summary.{key}", minimum=0)
@@ -382,12 +386,79 @@ def validate_run(run_dir: str | Path) -> dict:
             "note": "仅表示输出格式有效，不代表算法精度或真实场景验证通过。"}
 
 
+def validate_batch_summary(data):
+    data = _mapping(data, "batch summary")
+    _reject_non_finite_tree(data, "batch summary")
+    _required(data, (
+        "schema_version", "kind", "source_dir", "output_dir", "status",
+        "videos_discovered", "videos_not_processed",
+        "total_alert_events", "total_speeding_alerts",
+        "total_caution_events", "total_critical_conflicts", "results",
+    ), "batch summary")
+    _schema_version(data, "batch summary")
+    if data["kind"] != "analysis_batch":
+        raise SchemaValidationError("batch summary.kind 必须为 analysis_batch")
+    if data["status"] not in {"running", "completed", "completed_with_errors", "interrupted", "stopped"}:
+        raise SchemaValidationError("batch summary.status 无效")
+    for key in (
+        "videos_discovered", "videos_not_processed", "total_alert_events",
+        "total_speeding_alerts", "total_caution_events", "total_critical_conflicts",
+    ):
+        _integer(data[key], f"batch summary.{key}", minimum=0)
+    if not isinstance(data["results"], list):
+        raise SchemaValidationError("batch summary.results 必须是列表")
+    for idx, item in enumerate(data["results"]):
+        entry = _mapping(item, f"batch summary.results[{idx}]")
+        _required(entry, ("source", "output", "status"), f"batch summary.results[{idx}]")
+        if entry["status"] not in {"ok", "failed", "interrupted"}:
+            raise SchemaValidationError(f"batch summary.results[{idx}].status 无效")
+        for s_key in ("source", "output"):
+            if not isinstance(entry[s_key], str) or not entry[s_key]:
+                raise SchemaValidationError(f"batch summary.results[{idx}].{s_key} 必须是非空字符串")
+    return data
+
+
+def validate_batch_run(batch_dir: str | Path) -> dict:
+    root = Path(batch_dir).expanduser().resolve()
+    if not root.is_dir():
+        raise SchemaValidationError(f"批量运行目录不存在: {root}")
+    summary = validate_batch_summary(load_json_strict(root / "batch_summary.json"))
+    ok_runs = 0
+    for idx, item in enumerate(summary["results"]):
+        if item["status"] != "ok":
+            continue
+        child_dir = Path(item["output"])
+        if not child_dir.is_dir():
+            child_dir = root / child_dir.name
+        try:
+            validate_run(child_dir)
+        except SchemaValidationError as exc:
+            raise SchemaValidationError(
+                f"batch_summary.results[{idx}] 子目录校验失败: {exc}"
+            ) from None
+        ok_runs += 1
+    return {
+        "schema_version": 1,
+        "valid": True,
+        "kind": "analysis_batch",
+        "batch_dir": str(root),
+        "validated_runs": ok_runs,
+        "total_results": len(summary["results"]),
+        "note": "仅表示批量与子目录输出格式有效，不代表算法精度或真实场景验证通过。",
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="校验 analysis 运行输出格式")
-    parser.add_argument("--run", required=True, help="runs/analysis/run-* 目录")
+    parser.add_argument("--run", required=True, help="runs/analysis/run-* 或 batch-* 目录")
     args = parser.parse_args(argv)
     try:
-        print(json.dumps(validate_run(args.run), ensure_ascii=False, indent=2, allow_nan=False))
+        root = Path(args.run).expanduser().resolve()
+        if (root / "batch_summary.json").is_file() and not (root / "summary.json").is_file():
+            result = validate_batch_run(root)
+        else:
+            result = validate_run(root)
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
     except (OSError, SchemaValidationError) as exc:
         parser.exit(1, f"Schema 校验失败: {exc}\n")
     return 0

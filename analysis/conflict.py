@@ -75,6 +75,7 @@ class ConflictAnalyzer:
         ttc_caution_s: float = 3.5,
         horizon_s: float = 3.5,
         object_policies: dict[str, ObjectPolicy] | None = None,
+        parking_zone_max_speed_kmh: float = 5.0,
     ):
         if not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
             raise ValueError("speed_limit_kmh 必须为有限正数")
@@ -85,6 +86,12 @@ class ConflictAnalyzer:
                 and math.isfinite(horizon_s)
                 and 0 < ttc_critical_s <= ttc_caution_s <= horizon_s):
             raise ValueError("TTC 阈值需满足 0 < ttc_critical <= ttc_caution <= horizon")
+        if (
+            type(parking_zone_max_speed_kmh) not in (int, float)
+            or not math.isfinite(parking_zone_max_speed_kmh)
+            or parking_zone_max_speed_kmh < 0
+        ):
+            raise ValueError("parking_zone_max_speed_kmh 必须为有限非负数")
         self.speed_limit_kmh = speed_limit_kmh
         self.safe_radius_veh_m = safe_radius_veh_m
         self.safe_radius_ped_m = safe_radius_ped_m
@@ -93,6 +100,7 @@ class ConflictAnalyzer:
         self.ttc_caution_s = ttc_caution_s
         self.horizon_s = horizon_s
         self.object_policies = object_policies
+        self.parking_zone_max_speed_kmh = float(parking_zone_max_speed_kmh)
 
     def evaluate_pair(
         self, veh: SpeedReading, ped: SpeedReading
@@ -112,6 +120,10 @@ class ConflictAnalyzer:
         # is_reliable 兜底：--parked-frames 1 或低 FPS 时静止标记可能在
         # 收敛前置位，未收敛目标一律保守参与研判，不做豁免
         if veh.is_stationary and veh.is_reliable:
+            return None
+        # 停靠在路侧停车区多边形内的低速/蠕行车辆豁免碰撞误报；
+        # 若停车区内车辆高速驶出 (> parking_zone_max_speed_kmh)，仍正常触发预警
+        if veh.in_parking_zone and veh.is_reliable and veh.speed_kmh <= self.parking_zone_max_speed_kmh:
             return None
 
         vehicle_policy = object_policy(veh.object_kind, veh.category, self.object_policies)

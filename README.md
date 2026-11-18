@@ -2,7 +2,7 @@
 
 面向校园道路固定路侧摄像头，研究车辆与行人的视觉感知、连续跟踪、实际速度估计和冲突风险预警。系统以 YOLOv8 + ByteTrack 提供检测与连续轨迹，`analysis` 模块完成道路标定、物理测速、TTC 冲突研判、事件去抖与四级预警，形成从视频输入到风险提示和事件记录的完整技术链路。
 
-**当前阶段：全链路已实现**（检测 → 跟踪 → 标定测速 → 冲突分析 → 预警）。CPU 环境下 148 项测试全部通过；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
+**当前阶段：全链路已实现**（检测 → 跟踪 → 标定测速 → 冲突分析 → 预警）。CPU 环境下 155 项测试全部通过；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
 
 ## 技术链路
 
@@ -47,8 +47,12 @@ python -m tracking --source path/to/video.mp4 --tracker configs/bytetrack.yaml -
 # 路面标定：在含已知尺寸参照物的图像/首帧上取 4 个角点
 python -m analysis.interactive_calibrator --source path/to/road.jpg --width 6.0 --length 15.0
 
-# 端到端冲突感知与预警（默认读 configs/calibration.yaml）
+# 端到端冲突感知与预警（默认读 configs/calibration.yaml；支持本地视频、目录、摄像头索引或 rtsp://）
 python -m analysis --source path/to/video.mp4 --device cpu --show
+python -m analysis --source 0 --device cpu --show
+python -m analysis --source path/to/video_dir --device cpu
+# 基于已有 tracks.jsonl 离线复盘测速与 TTC（不重跑检测跟踪）
+python -m analysis --tracks runs/yolo/track/run-*/tracks.jsonl --calib configs/calibration.yaml
 
 # 无实测标定时的流程演示（内存合成标定，物理量不可信）
 python -m analysis --source path/to/video.mp4 --demo
@@ -56,7 +60,7 @@ python -m analysis --source path/to/video.mp4 --demo
 # 无视频的合成轨迹参数消融与运行产物评价
 python -m analysis.ablation --output runs/analysis/ablation.json
 python -m analysis.scenarios --output runs/analysis/scenarios.json
-python -m analysis.evaluate --run runs/analysis/run-<timestamp> --markdown --output runs/analysis/evaluation.md
+python -m analysis.evaluate --run runs/analysis/run-<timestamp> --ground-truth configs/ground_truth.example.yaml --markdown --output runs/analysis/evaluation.md
 python -m analysis.schema --run runs/analysis/run-<timestamp>
 ```
 
@@ -81,9 +85,9 @@ python -m analysis.schema --run runs/analysis/run-<timestamp>
 
 ## 已知边界
 
-- 纯视觉路侧预警，不做底盘控制；摄像机/网络流接入尚未实现
+- 纯视觉路侧预警，不做底盘控制；本地摄像头 / RTSP 流接入已实现，但实景网络丢包与端到端延迟未经现场压测
 - ByteTrack 换 ID 会把同一物理事件拆成多条记录（日志保留 track_id 供事后归并）
-- 停车区/行车道分区豁免、非机动车细分：待真实校园素材后定案
+- 路侧停车区多边形豁免与真值 MAE/F1 评测工具已实现，具体校园参数阈值待实拍素材验证后定案
 - 夜间/雨天、遮挡鲁棒性与实景精度未经评估
 
 ## 仓库结构
@@ -91,9 +95,9 @@ python -m analysis.schema --run runs/analysis/run-<timestamp>
 ```text
 detection/   YOLOv8 检测、训练与评估入口
 tracking/    ByteTrack 会话、轨迹与 px/s 运动记录、平滑、可视化、批处理
-analysis/    标定 · 测速 · 冲突研判 · 事件去抖 · 渲染 · 端到端管线
-configs/     bytetrack.yaml、motion.yaml、object_policy.yaml、calibration.yaml、数据配置模板
-tests/       单元、集成与异常路径测试（148 项）
+analysis/    标定 · 测速 · 冲突研判 · 事件去抖 · 批量运行 · 真值评测 · 端到端管线
+configs/     bytetrack.yaml、motion.yaml、object_policy.yaml、calibration.yaml、真值与数据配置模板
+tests/       单元、集成与异常路径测试（155 项）
 docs/        课题需求、研究蓝图（含数学推导）与模块解释文档
 ```
 
