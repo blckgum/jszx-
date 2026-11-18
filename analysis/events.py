@@ -137,8 +137,14 @@ class ConflictEventTracker:
         确认中的挂起帧不返回注解；事件确认后其 start_frame 已回溯包含挂起帧，
         下游可通过事件记录还原完整区间。
         """
-        if not (math.isfinite(timestamp_s) and frame_idx >= 0):
-            raise ValueError("frame_idx/timestamp_s 必须为有效帧序与有限时间戳")
+        if type(frame_idx) is not int or frame_idx < 0:
+            raise ValueError("frame_idx 必须为 >= 0 的整数")
+        if (
+            type(timestamp_s) not in (int, float)
+            or not math.isfinite(timestamp_s)
+            or timestamp_s < 0
+        ):
+            raise ValueError("timestamp_s 必须为 >= 0 的有限数值")
         if self._last_frame_idx is not None and frame_idx <= self._last_frame_idx:
             # 每帧只允许一次 update：重复或回退帧序会让 alarm/gap 计数失真
             raise ValueError("frame_idx 必须逐帧严格递增")
@@ -244,6 +250,4 @@ class ConflictEventTracker:
             if st.event is not None:
                 st.event.end_reason = reason
                 self._finalized.append(st.event)
-        self._states = {
-            k: st for k, st in self._states.items() if st.event is None
-        }
+        self._states.clear()

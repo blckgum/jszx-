@@ -42,9 +42,20 @@ class ConflictAssessment:
     vehicle_kind: str = "motor_vehicle"
 
 
+def _is_finite_number(value) -> bool:
+    return (
+        type(value) is not bool
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
 def _conflict_sort_key(c: ConflictAssessment):
     """冲突项比较键：先按风险等级，同等级按 TTC 越小越紧急"""
-    return (int(c.risk_level), -(c.ttc_seconds or 999.0))
+    return (
+        int(c.risk_level),
+        -(c.ttc_seconds if c.ttc_seconds is not None else 999.0),
+    )
 
 
 def build_conflict_maps(
@@ -77,28 +88,31 @@ class ConflictAnalyzer:
         object_policies: dict[str, ObjectPolicy] | None = None,
         parking_zone_max_speed_kmh: float = 5.0,
     ):
-        if not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
+        if not _is_finite_number(speed_limit_kmh) or speed_limit_kmh <= 0:
             raise ValueError("speed_limit_kmh 必须为有限正数")
-        if not (math.isfinite(safe_radius_veh_m) and safe_radius_veh_m > 0
-                and math.isfinite(safe_radius_ped_m) and safe_radius_ped_m > 0):
-            raise ValueError("安全半径必须为有限正数")
-        if not (math.isfinite(ttc_critical_s) and math.isfinite(ttc_caution_s)
-                and math.isfinite(horizon_s)
-                and 0 < ttc_critical_s <= ttc_caution_s <= horizon_s):
-            raise ValueError("TTC 阈值需满足 0 < ttc_critical <= ttc_caution <= horizon")
-        if (
-            type(parking_zone_max_speed_kmh) not in (int, float)
-            or not math.isfinite(parking_zone_max_speed_kmh)
-            or parking_zone_max_speed_kmh < 0
+        if not (
+            _is_finite_number(safe_radius_veh_m)
+            and safe_radius_veh_m > 0
+            and _is_finite_number(safe_radius_ped_m)
+            and safe_radius_ped_m > 0
         ):
+            raise ValueError("安全半径必须为有限正数")
+        if not (
+            _is_finite_number(ttc_critical_s)
+            and _is_finite_number(ttc_caution_s)
+            and _is_finite_number(horizon_s)
+            and 0 < ttc_critical_s <= ttc_caution_s <= horizon_s
+        ):
+            raise ValueError("TTC 阈值需满足 0 < ttc_critical <= ttc_caution <= horizon")
+        if not _is_finite_number(parking_zone_max_speed_kmh) or parking_zone_max_speed_kmh < 0:
             raise ValueError("parking_zone_max_speed_kmh 必须为有限非负数")
-        self.speed_limit_kmh = speed_limit_kmh
-        self.safe_radius_veh_m = safe_radius_veh_m
-        self.safe_radius_ped_m = safe_radius_ped_m
-        self.critical_dist_m = safe_radius_veh_m + safe_radius_ped_m  # 默认机动车 3.0 米
-        self.ttc_critical_s = ttc_critical_s
-        self.ttc_caution_s = ttc_caution_s
-        self.horizon_s = horizon_s
+        self.speed_limit_kmh = float(speed_limit_kmh)
+        self.safe_radius_veh_m = float(safe_radius_veh_m)
+        self.safe_radius_ped_m = float(safe_radius_ped_m)
+        self.critical_dist_m = self.safe_radius_veh_m + self.safe_radius_ped_m  # 默认机动车 3.0 米
+        self.ttc_critical_s = float(ttc_critical_s)
+        self.ttc_caution_s = float(ttc_caution_s)
+        self.horizon_s = float(horizon_s)
         self.object_policies = object_policies
         self.parking_zone_max_speed_kmh = float(parking_zone_max_speed_kmh)
 
@@ -170,9 +184,11 @@ class ConflictAnalyzer:
             if t_cpa <= self.ttc_critical_s:
                 level = RiskLevel.LEVEL_3_CRITICAL
                 desc = f"紧急碰撞危险! (TTC={t_cpa:.1f}s, 预计间距={min_dist:.1f}m)"
-            else:
+            elif t_cpa <= self.ttc_caution_s:
                 level = RiskLevel.LEVEL_2_CAUTION
                 desc = f"注意减速礼让行人 (TTC={t_cpa:.1f}s, 轨迹汇聚)"
+            else:
+                return None
         elif min_dist <= critical_dist_m * 1.5 and t_cpa <= self.ttc_caution_s:
             level = RiskLevel.LEVEL_2_CAUTION
             desc = f"注意横穿行人 (预计间距={min_dist:.1f}m)"
@@ -215,7 +231,16 @@ class ConflictAnalyzer:
                         or conflict.risk_level > highest_conflict.risk_level
                         or (
                             conflict.risk_level == highest_conflict.risk_level
-                            and (conflict.ttc_seconds or 999) < (highest_conflict.ttc_seconds or 999)
+                            and (
+                                conflict.ttc_seconds
+                                if conflict.ttc_seconds is not None
+                                else 999.0
+                            )
+                            < (
+                                highest_conflict.ttc_seconds
+                                if highest_conflict.ttc_seconds is not None
+                                else 999.0
+                            )
                         )
                     ):
                         highest_conflict = conflict

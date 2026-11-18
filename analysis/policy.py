@@ -44,23 +44,27 @@ def read_object_policy_config(path: str | Path = DEFAULT_OBJECT_POLICY_CONFIG) -
         data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
         raise ValueError(f"对象策略 YAML 格式错误: {exc}") from None
-    if not isinstance(data, dict) or data.get("schema_version") != 1:
+    if (
+        not isinstance(data, dict)
+        or type(data.get("schema_version")) is not int
+        or data["schema_version"] != 1
+    ):
         raise ValueError("对象策略必须包含 schema_version: 1")
     raw = data.get("policies")
     if not isinstance(raw, dict) or not raw:
         raise ValueError("对象策略必须包含非空 policies 映射")
     policies = {}
     for name, values in raw.items():
-        if not isinstance(name, str) or not isinstance(values, dict):
+        if not isinstance(name, str) or not name.strip() or not isinstance(values, dict):
             raise ValueError("对象策略名称和值必须是映射")
         kind = values.get("kind")
         radius = values.get("safe_radius_veh_m")
         label = values.get("label")
-        if not isinstance(kind, str) or not kind:
+        if not isinstance(kind, str) or not kind.strip():
             raise ValueError(f"对象策略 {name} 的 kind 无效")
         if type(radius) not in (int, float) or not math.isfinite(radius) or radius <= 0:
             raise ValueError(f"对象策略 {name} 的 safe_radius_veh_m 必须为有限正数")
-        if not isinstance(label, str) or not label:
+        if not isinstance(label, str) or not label.strip():
             raise ValueError(f"对象策略 {name} 的 label 无效")
         policies[name.lower()] = ObjectPolicy(kind, float(radius), label)
     for required in ("person", "pedestrian", "vehicle", "motor_vehicle"):

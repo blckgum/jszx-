@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import math
+import re
 import os
 import sys
 import time
@@ -25,13 +27,101 @@ DEFAULT_TRACKER = ROOT / "configs" / "bytetrack.yaml"
 LIVE_STREAM_PREFIXES = ("rtsp://", "rtmp://", "http://", "https://")
 
 
+_DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?$")
+
+
+def _is_valid_port(port_str: str) -> bool:
+    return port_str.isascii() and port_str.isdigit() and 1 <= int(port_str) <= 65535
+
+
+def _is_valid_host_port(text: str) -> bool:
+    """校验 text 是否为合法的 IPv4 / [IPv6] / localhost / 域名（可选 :端口）。"""
+    if not text or any(ch in text for ch in ("@", "/", "?", "#", "\\")) or any(ch.isspace() for ch in text):
+        return False
+    if text.startswith("["):
+        close_idx = text.find("]")
+        if close_idx == -1:
+            return False
+        ipv6_part = text[1:close_idx]
+        after = text[close_idx + 1:]
+        try:
+            ipaddress.IPv6Address(ipv6_part)
+        except ValueError:
+            return False
+        if not after:
+            return True
+        if after.startswith(":"):
+            return _is_valid_port(after[1:])
+        return False
+
+    if "[" in text or "]" in text:
+        return False
+    if ":" in text:
+        if text.count(":") > 1:
+            return False
+        host, port_str = text.split(":", 1)
+        if not _is_valid_port(port_str):
+            return False
+    else:
+        host = text
+
+    if not host:
+        return False
+    try:
+        ipaddress.IPv4Address(host)
+        return True
+    except ValueError:
+        pass
+    if host.lower() == "localhost":
+        return True
+    if "." not in host or host.startswith(".") or host.endswith(".") or ".." in host:
+        return False
+    labels = host.split(".")
+    if labels[-1].isdigit():
+        return False
+    return all(_DOMAIN_LABEL_RE.match(label) is not None for label in labels)
+
+
 def redact_stream_url(url: str) -> str:
     """将推流 URL 中的用户名与密码脱敏为 ***@，保留主机、端口与路径。"""
-    split = urlsplit(url)
-    if split.username is None and split.password is None:
-        return url
-    host_port = split.netloc.rsplit("@", 1)[-1]
-    return urlunsplit((split.scheme, f"***@{host_port}", split.path, split.query, split.fragment))
+    if "://" not in url:
+        try:
+            split = urlsplit(url)
+        except ValueError:
+            return url
+        if split.username is None and split.password is None:
+            return url
+        host_port = split.netloc.rsplit("@", 1)[-1]
+        return urlunsplit((split.scheme, f"***@{host_port}", split.path, split.query, split.fragment))
+
+    scheme, rest = url.split("://", 1)
+    delim_positions = [idx for idx in (rest.find("/"), rest.find("?"), rest.find("#")) if idx != -1]
+    first_delim = min(delim_positions) if delim_positions else len(rest)
+    authority = rest[:first_delim]
+    suffix = rest[first_delim:]
+
+    if "@" in authority:
+        _, host_port = authority.rsplit("@", 1)
+        return f"{scheme}://***@{host_port}{suffix}"
+
+    if "@" in rest and not _is_valid_host_port(authority):
+        search_start = 0
+        while True:
+            at_idx = rest.find("@", search_start)
+            if at_idx == -1:
+                break
+            creds = rest[:at_idx]
+            after_at = rest[at_idx + 1:]
+            host_delims = [
+                idx for idx in (after_at.find("/"), after_at.find("?"), after_at.find("#")) if idx != -1
+            ]
+            host_end = min(host_delims) if host_delims else len(after_at)
+            candidate_host_port = after_at[:host_end]
+            if ":" in creds and _is_valid_host_port(candidate_host_port):
+                return f"{scheme}://***@{after_at}"
+            search_start = at_idx + 1
+
+    return url
 
 
 def normalize_session_source(source: str | int | Path) -> str:
@@ -46,13 +136,16 @@ def normalize_session_source(source: str | int | Path) -> str:
         stripped = source.strip()
         if not stripped:
             raise ValueError("输入源不能为空")
-        if stripped.isdigit():
+        if stripped.isascii() and stripped.isdigit():
             return f"camera:{int(stripped)}"
         lower = stripped.lower()
         if lower.startswith(LIVE_STREAM_PREFIXES):
             return redact_stream_url(stripped)
         if lower.startswith("camera:"):
-            return stripped
+            idx_part = stripped.split(":", 1)[1].strip()
+            if not (idx_part.isascii() and idx_part.isdigit()):
+                raise ValueError(f"无效的摄像头标识: {source}")
+            return f"camera:{int(idx_part)}"
     return str(Path(source).expanduser().resolve())
 
 

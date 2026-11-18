@@ -41,7 +41,6 @@ from .conflict import (
 from .events import ConflictEventTracker
 from .policy import DEFAULT_OBJECT_POLICY_CONFIG, read_object_policy_config
 from .provenance import collect_provenance
-from .schema import load_jsonl_strict
 from .speed import SpeedEstimator, SpeedReading
 from .visualization import EnhancedConflictVisualizer, trajectory_color
 
@@ -56,10 +55,13 @@ def is_live_source(source: str | int | Path | None) -> bool:
         stripped = source.strip()
         if not stripped:
             return False
-        if stripped.isdigit():
+        if stripped.isascii() and stripped.isdigit():
             return True
         lower = stripped.lower()
-        return lower.startswith(LIVE_STREAM_PREFIXES) or lower.startswith("camera:")
+        if lower.startswith("camera:"):
+            idx_part = stripped.split(":", 1)[1].strip()
+            return idx_part.isascii() and idx_part.isdigit()
+        return lower.startswith(LIVE_STREAM_PREFIXES)
     return False
 
 
@@ -75,13 +77,13 @@ def parse_video_source(video_path: str | int | Path) -> tuple[int | str, str, bo
         stripped = video_path.strip()
         if not stripped:
             raise ValueError("视频输入源不能为空")
-        if stripped.isdigit():
+        if stripped.isascii() and stripped.isdigit():
             idx = int(stripped)
             return idx, f"camera:{idx}", True
         lower = stripped.lower()
         if lower.startswith("camera:"):
             idx_part = stripped.split(":", 1)[1].strip()
-            if not idx_part.isdigit():
+            if not (idx_part.isascii() and idx_part.isdigit()):
                 raise ValueError(f"无效的摄像头标识: {video_path}")
             idx = int(idx_part)
             return idx, f"camera:{idx}", True
@@ -95,23 +97,30 @@ class LiveStreamClock:
     """实时流单调时钟：优先使用递增 PTS，缺少或重复时回退到墙钟时间。"""
 
     def __init__(self):
-        self._wall_start: Optional[float] = None
+        self._anchor_wall: Optional[float] = None
+        self._anchor_ts: float = 0.0
         self.previous: float = -1.0
 
     def timestamp(self, frame_index: int, milliseconds: float) -> tuple[float, str]:
-        if self._wall_start is None:
-            self._wall_start = time.perf_counter()
+        now = time.perf_counter()
+        if self._anchor_wall is None:
+            self._anchor_wall = now
+            self._anchor_ts = 0.0
         pts_s = milliseconds / 1000.0 if milliseconds is not None else float("nan")
         if math.isfinite(pts_s) and pts_s >= 0 and pts_s > self.previous and (
             frame_index > 0 or pts_s > 0
         ):
+            self._anchor_wall = now
+            self._anchor_ts = pts_s
             self.previous = pts_s
             return pts_s, "video_pts"
         if frame_index == 0 and self.previous < 0:
+            self._anchor_wall = now
+            self._anchor_ts = 0.0
             self.previous = 0.0
             return 0.0, "wall_clock"
-        wall_s = time.perf_counter() - self._wall_start
-        ts = max(wall_s, self.previous + 1e-4)
+        wall_s = self._anchor_ts + (now - self._anchor_wall)
+        ts = max(wall_s, math.nextafter(self.previous, math.inf), self.previous + 1e-4)
         self.previous = ts
         return ts, "wall_clock"
 
@@ -149,28 +158,55 @@ class ConflictPerceptionPipeline:
         object_policy_config: str | Path = DEFAULT_OBJECT_POLICY_CONFIG,
         parking_zone_max_speed_kmh: float = 5.0,
     ):
-        if not math.isfinite(iou) or not (0 < iou <= 1):
+        if type(speed_limit_kmh) not in (int, float) or not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
+            raise ValueError("speed_limit_kmh 必须为有限正数")
+        if type(iou) not in (int, float) or not math.isfinite(iou) or not (0 < iou <= 1):
             raise ValueError("iou 必须在 (0, 1] 区间")
-        if fps is not None and (not math.isfinite(fps) or fps <= 0):
+        if fps is not None and (type(fps) not in (int, float) or not math.isfinite(fps) or fps <= 0):
             raise ValueError("fps 必须是有限正数")
         if type(imgsz) is not int or imgsz <= 0:
             raise ValueError("imgsz 必须是正整数")
-        if not math.isfinite(zone_margin_m) or zone_margin_m < 0:
+        if type(ema_alpha) not in (int, float) or not math.isfinite(ema_alpha) or not (0 < ema_alpha <= 1):
+            raise ValueError("ema_alpha 必须在 (0, 1] 区间")
+        if type(window_size) is not int or window_size < 3:
+            raise ValueError("window_size 必须是 >= 3 的整数帧数")
+        if type(zone_margin_m) not in (int, float) or not math.isfinite(zone_margin_m) or zone_margin_m < 0:
             raise ValueError("zone_margin_m 必须为有限非负数")
-        if window_seconds is not None and (not math.isfinite(window_seconds) or window_seconds <= 0):
+        for ttc_name, ttc_val in (
+            ("ttc_critical_s", ttc_critical_s),
+            ("ttc_caution_s", ttc_caution_s),
+            ("horizon_s", horizon_s),
+        ):
+            if type(ttc_val) not in (int, float) or not math.isfinite(ttc_val) or ttc_val <= 0:
+                raise ValueError(f"{ttc_name} 必须为有限正数")
+        if not (ttc_critical_s <= ttc_caution_s <= horizon_s):
+            raise ValueError("TTC 阈值需满足 0 < ttc_critical_s <= ttc_caution_s <= horizon_s")
+        if type(stationary_speed_ms) not in (int, float) or not math.isfinite(stationary_speed_ms) or stationary_speed_ms <= 0:
+            raise ValueError("stationary_speed_ms 必须为有限正数")
+        if type(stationary_min_frames) is not int or stationary_min_frames < 1:
+            raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
+        if type(category_confirm_frames) is not int or category_confirm_frames < 1:
+            raise ValueError("category_confirm_frames 必须是 >= 1 的整数帧数")
+        if type(reliable_min_span_s) not in (int, float) or not math.isfinite(reliable_min_span_s) or reliable_min_span_s < 0:
+            raise ValueError("reliable_min_span_s 必须为有限非负数")
+        if window_seconds is not None and (
+            type(window_seconds) not in (int, float) or not math.isfinite(window_seconds) or window_seconds <= 0
+        ):
             raise ValueError("window_seconds 必须为有限正数")
-        if stationary_seconds is not None and (not math.isfinite(stationary_seconds) or stationary_seconds <= 0):
+        if stationary_seconds is not None and (
+            type(stationary_seconds) not in (int, float) or not math.isfinite(stationary_seconds) or stationary_seconds <= 0
+        ):
             raise ValueError("stationary_seconds 必须为有限正数")
         if type(alert_confirm_frames) is not int or alert_confirm_frames < 1:
             raise ValueError("alert_confirm_frames 必须是 >= 1 的整数帧数")
         if alert_confirm_seconds is not None and (
-            not math.isfinite(alert_confirm_seconds) or alert_confirm_seconds <= 0
+            type(alert_confirm_seconds) not in (int, float) or not math.isfinite(alert_confirm_seconds) or alert_confirm_seconds <= 0
         ):
             raise ValueError("alert_confirm_seconds 必须为有限正数")
         if type(alert_cooldown_frames) is not int or alert_cooldown_frames < 0:
             raise ValueError("alert_cooldown_frames 必须是 >= 0 的整数帧数")
         if alert_cooldown_seconds is not None and (
-            not math.isfinite(alert_cooldown_seconds) or alert_cooldown_seconds < 0
+            type(alert_cooldown_seconds) not in (int, float) or not math.isfinite(alert_cooldown_seconds) or alert_cooldown_seconds < 0
         ):
             raise ValueError("alert_cooldown_seconds 必须为有限非负数")
         if (
@@ -347,10 +383,13 @@ class ConflictPerceptionPipeline:
     @staticmethod
     def _load_validated_tracks(tracks_file: Path) -> list[dict]:
         """读取并严格校验离线 tracks.jsonl 帧序列。"""
+        from .schema import load_jsonl_strict
+
         if not tracks_file.is_file():
             raise FileNotFoundError(f"未找到跟踪轨迹文件: {tracks_file}")
         rows = load_jsonl_strict(tracks_file)
         expected_session: Optional[str] = None
+        expected_shape: Optional[tuple[int, int]] = None
         prev_frame = -1
         prev_ts = -1.0
         for line_idx, row in enumerate(rows, 1):
@@ -375,6 +414,12 @@ class ConflictPerceptionPipeline:
                 raise ValueError(f"tracks.jsonl 第 {line_idx} 行 timestamp_s 必须非负有限且严格递增")
             if type(w) is not int or type(h) is not int or w <= 0 or h <= 0:
                 raise ValueError(f"tracks.jsonl 第 {line_idx} 行 width/height 必须为正整数")
+            if expected_shape is None:
+                expected_shape = (w, h)
+            elif (w, h) != expected_shape:
+                raise ValueError(
+                    f"tracks.jsonl 第 {line_idx} 行分辨率 ({w}x{h}) 与首帧 ({expected_shape[0]}x{expected_shape[1]}) 不一致"
+                )
             raw_tracks = row.get("tracks")
             if not isinstance(raw_tracks, list):
                 raise ValueError(f"tracks.jsonl 第 {line_idx} 行 tracks 必须是列表")
@@ -543,7 +588,7 @@ class ConflictPerceptionPipeline:
         capture_arg, src_label, is_live_stream = parse_video_source(video_path)
         out_dir = Path(output_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
-        init_started_at = time.time()
+        init_started_at = time.perf_counter()
         out_video_path = out_dir / "annotated_conflict.mp4"
         jsonl_path = out_dir / "conflicts.jsonl"
         events_path = out_dir / "events.jsonl"
@@ -552,15 +597,16 @@ class ConflictPerceptionPipeline:
 
         def _write_initialization_failure(exc: BaseException):
             """初始化阶段失败时留下最小可消费摘要，不掩盖原始异常。"""
+            is_interrupt = isinstance(exc, KeyboardInterrupt)
             try:
                 self._write_summary_file(out_dir, {
                     "schema_version": 1,
-                    "status": "failed",
-                    "stop_reason": "initialization",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "status": "interrupted" if is_interrupt else "failed",
+                    "stop_reason": "interrupt" if is_interrupt else "initialization",
+                    "error": "KeyboardInterrupt" if is_interrupt else f"{type(exc).__name__}: {exc}",
                     "source_video": src_label,
                     "frames_processed": 0,
-                    "elapsed_seconds": round(time.time() - init_started_at, 2),
+                    "elapsed_seconds": round(max(0.0, time.perf_counter() - init_started_at), 2),
                     "annotated_output": str(out_video_path),
                     "conflicts_jsonl": str(jsonl_path),
                     "events_jsonl": str(events_path),
@@ -668,7 +714,7 @@ class ConflictPerceptionPipeline:
             return live
 
         frame_idx = 0
-        t_start = time.time()
+        t_start = time.perf_counter()
         src_display = src_label if is_live_stream else Path(src_label).name
 
         print("=" * 60)
@@ -680,6 +726,8 @@ class ConflictPerceptionPipeline:
 
         loop_state = "eof"
         loop_error = ""
+        main_loop_failed = False
+        close_exc: Optional[BaseException] = None
         try:
             while True:
                 if max_frames is not None and frame_idx >= max_frames:
@@ -717,14 +765,17 @@ class ConflictPerceptionPipeline:
                         break
 
                 if frame_idx % 30 == 0:
-                    fps_proc = frame_idx / (time.time() - t_start)
+                    elapsed_now = time.perf_counter() - t_start
+                    fps_proc = frame_idx / elapsed_now if elapsed_now > 0 else 0.0
                     print(f"[*] 已处理 {frame_idx} 帧 | 处理速率: {fps_proc:.1f} FPS | 最高时速: {max_observed_speed_kmh:.1f} km/h")
 
         except KeyboardInterrupt:
+            main_loop_failed = True
             loop_state = "interrupt"
             loop_error = "KeyboardInterrupt"
             raise
         except BaseException as exc:
+            main_loop_failed = True
             loop_state = "exception"
             loop_error = f"{type(exc).__name__}: {exc}"
             raise
@@ -734,7 +785,13 @@ class ConflictPerceptionPipeline:
                 _drain_alert_events()
             except Exception:
                 pass
-            resources.close()
+            try:
+                resources.close()
+            except BaseException as exc:
+                close_exc = exc
+                if not main_loop_failed:
+                    loop_state = "exception"
+                    loop_error = f"{type(exc).__name__}: {exc}"
             if loop_state in ("interrupt", "exception"):
                 try:
                     self._write_summary_file(out_dir, {
@@ -742,19 +799,28 @@ class ConflictPerceptionPipeline:
                         "status": "interrupted" if loop_state == "interrupt" else "failed",
                         "stop_reason": loop_state,
                         "error": loop_error,
-                        "frames_processed": frame_idx,
-                        "elapsed_seconds": round(time.time() - t_start, 2),
-                        "max_observed_speed_kmh": round(max_observed_speed_kmh, 1),
+                        "source_video": src_label,
+                        "annotated_output": str(out_video_path),
+                        "conflicts_jsonl": str(jsonl_path),
                         "events_jsonl": str(events_path.resolve()),
+                        "speeds_csv": str(csv_path),
                         "configuration_json": str(configuration_path),
                         "configuration": configuration,
+                        "frames_processed": frame_idx,
+                        "elapsed_seconds": round(max(0.0, time.perf_counter() - t_start), 2),
+                        "max_observed_speed_kmh": round(max_observed_speed_kmh, 1),
                     })
                 except Exception:
                     pass
             if show_window:
-                cv2.destroyAllWindows()
+                try:
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
+            if close_exc is not None and not main_loop_failed:
+                raise close_exc
 
-        elapsed = time.time() - t_start
+        elapsed = max(0.0, time.perf_counter() - t_start)
         proc_fps = frame_idx / elapsed if elapsed > 0 else 0
 
         summary = {
@@ -808,7 +874,7 @@ class ConflictPerceptionPipeline:
         tracks_file = Path(tracks_path).expanduser().resolve()
         out_dir = Path(output_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
-        init_started_at = time.time()
+        init_started_at = time.perf_counter()
         video_src = Path(video_path).expanduser().resolve() if video_path is not None else None
         out_video_path = out_dir / "annotated_conflict.mp4"
         jsonl_path = out_dir / "conflicts.jsonl"
@@ -817,16 +883,18 @@ class ConflictPerceptionPipeline:
         configuration_path = out_dir / "configuration.json"
 
         def _write_initialization_failure(exc: BaseException):
+            is_interrupt = isinstance(exc, KeyboardInterrupt)
             try:
                 self._write_summary_file(out_dir, {
                     "schema_version": 1,
-                    "status": "failed",
-                    "stop_reason": "initialization",
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "input_mode": "tracks_jsonl",
+                    "status": "interrupted" if is_interrupt else "failed",
+                    "stop_reason": "interrupt" if is_interrupt else "initialization",
+                    "error": "KeyboardInterrupt" if is_interrupt else f"{type(exc).__name__}: {exc}",
                     "source_tracks": str(tracks_file),
                     "source_video": str(video_src) if video_src is not None else str(tracks_file),
                     "frames_processed": 0,
-                    "elapsed_seconds": round(time.time() - init_started_at, 2),
+                    "elapsed_seconds": round(max(0.0, time.perf_counter() - init_started_at), 2),
                     "annotated_output": str(out_video_path) if video_src is not None else None,
                     "conflicts_jsonl": str(jsonl_path),
                     "events_jsonl": str(events_path),
@@ -868,7 +936,19 @@ class ConflictPerceptionPipeline:
                         float(raw_frames[i]["timestamp_s"]) - float(raw_frames[i - 1]["timestamp_s"])
                         for i in range(1, len(raw_frames))
                     ]
-                    fps = round(1.0 / statistics.median(dts), 6)
+                    median_dt = statistics.median(dts)
+                    if not math.isfinite(median_dt) or median_dt <= 0:
+                        raise ValueError("离线轨迹时间间隔无效，无法推算 FPS；请通过 --fps 显式指定")
+                    raw_inferred_fps = 1.0 / median_dt
+                    if not math.isfinite(raw_inferred_fps) or not (1e-3 <= raw_inferred_fps <= 1000.0):
+                        raise ValueError(
+                            f"离线轨迹推算 FPS ({raw_inferred_fps}) 超出允许范围 [1e-3, 1000.0]；请通过 --fps 显式指定"
+                        )
+                    fps = round(raw_inferred_fps, 6)
+                    if not math.isfinite(fps) or not (1e-3 <= fps <= 1000.0):
+                        raise ValueError(
+                            f"离线轨迹推算 FPS ({fps}) 超出允许范围 [1e-3, 1000.0]；请通过 --fps 显式指定"
+                        )
                 else:
                     raise RuntimeError("离线轨迹不足 2 帧，无法推算 FPS；请通过 --fps 显式指定")
 
@@ -903,14 +983,22 @@ class ConflictPerceptionPipeline:
         counts = {"critical": 0, "caution": 0, "speeding": 0}
         max_observed_speed_kmh = 0.0
         last_seen_frame: Dict[int, int] = {}
+        source_video_record = (
+            str(video_src)
+            if video_src is not None
+            else (str(raw_frames[0]["source"]) if raw_frames and raw_frames[0].get("source") else str(tracks_file))
+        )
 
         def _drain_alert_events():
             self._drain_alert_events_into(events_file, counts)
 
         frames_processed = 0
-        t_start = time.time()
+        next_video_frame = 0
+        t_start = time.perf_counter()
         loop_state = "eof"
         loop_error = ""
+        main_loop_failed = False
+        close_exc: Optional[BaseException] = None
         try:
             for row in raw_frames:
                 if max_frames is not None and frames_processed >= max_frames:
@@ -921,9 +1009,14 @@ class ConflictPerceptionPipeline:
                 timestamp_s = float(row["timestamp_s"])
                 frame = None
                 if cap is not None:
+                    while next_video_frame < frame_idx:
+                        if not cap.grab():
+                            raise RuntimeError("同步渲染视频帧数少于 tracks.jsonl 记录数")
+                        next_video_frame += 1
                     ok, frame = cap.read()
                     if not ok or frame is None:
                         raise RuntimeError("同步渲染视频帧数少于 tracks.jsonl 记录数")
+                    next_video_frame += 1
                     if (frame.shape[1], frame.shape[0]) != (row["width"], row["height"]):
                         raise RuntimeError("同步渲染视频分辨率与 tracks.jsonl 记录不一致")
 
@@ -943,7 +1036,7 @@ class ConflictPerceptionPipeline:
                         if t.track_id is not None:
                             last_seen_frame[t.track_id] = frame_idx
                     for tid in list(last_seen_frame):
-                        if frame_idx - last_seen_frame[tid] > track_buffer or tid in out_of_zone:
+                        if frame_idx - last_seen_frame[tid] > track_buffer + 1 or tid in out_of_zone:
                             del last_seen_frame[tid]
                     return set(last_seen_frame)
 
@@ -969,10 +1062,12 @@ class ConflictPerceptionPipeline:
                         loop_state = "user_quit"
                         break
         except KeyboardInterrupt:
+            main_loop_failed = True
             loop_state = "interrupt"
             loop_error = "KeyboardInterrupt"
             raise
         except BaseException as exc:
+            main_loop_failed = True
             loop_state = "exception"
             loop_error = f"{type(exc).__name__}: {exc}"
             raise
@@ -982,34 +1077,45 @@ class ConflictPerceptionPipeline:
                 _drain_alert_events()
             except Exception:
                 pass
-            resources.close()
+            try:
+                resources.close()
+            except BaseException as exc:
+                close_exc = exc
+                if not main_loop_failed:
+                    loop_state = "exception"
+                    loop_error = f"{type(exc).__name__}: {exc}"
             if loop_state in ("interrupt", "exception"):
                 try:
                     self._write_summary_file(out_dir, {
                         "schema_version": 1,
+                        "input_mode": "tracks_jsonl",
                         "status": "interrupted" if loop_state == "interrupt" else "failed",
                         "stop_reason": loop_state,
                         "error": loop_error,
                         "source_tracks": str(tracks_file),
-                        "frames_processed": frames_processed,
-                        "elapsed_seconds": round(time.time() - t_start, 2),
-                        "max_observed_speed_kmh": round(max_observed_speed_kmh, 1),
+                        "source_video": source_video_record,
+                        "annotated_output": str(out_video_path) if video_src is not None else None,
+                        "conflicts_jsonl": str(jsonl_path),
                         "events_jsonl": str(events_path.resolve()),
+                        "speeds_csv": str(csv_path),
                         "configuration_json": str(configuration_path),
                         "configuration": configuration,
+                        "frames_processed": frames_processed,
+                        "elapsed_seconds": round(max(0.0, time.perf_counter() - t_start), 2),
+                        "max_observed_speed_kmh": round(max_observed_speed_kmh, 1),
                     })
                 except Exception:
                     pass
             if show_window and video_src is not None:
-                cv2.destroyAllWindows()
+                try:
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
+            if close_exc is not None and not main_loop_failed:
+                raise close_exc
 
-        elapsed = time.time() - t_start
+        elapsed = max(0.0, time.perf_counter() - t_start)
         proc_fps = frames_processed / elapsed if elapsed > 0 else 0
-        source_video_record = (
-            str(video_src)
-            if video_src is not None
-            else (str(raw_frames[0]["source"]) if raw_frames and raw_frames[0].get("source") else str(tracks_file))
-        )
         summary = {
             "schema_version": 1,
             "input_mode": "tracks_jsonl",

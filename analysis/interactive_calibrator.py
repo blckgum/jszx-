@@ -43,6 +43,7 @@ def run_interactive_calibration(
     length_m: float,
     output_path: str | Path = "configs/calibration.yaml",
     predefined_points: Optional[List[Tuple[float, float]]] = None,
+    save_output: bool = True,
 ) -> RoadCalibrator:
     """执行交互式或参数化标定流程"""
     if (
@@ -147,8 +148,9 @@ def run_interactive_calibration(
         length_m=length_m,
         name=src.stem,
     )
-    saved_yaml = calibrator.to_yaml(output_path)
-    print(f"[OK] 空间透视单应性标定成功完成！参数已持久化保存至: {saved_yaml}")
+    if save_output:
+        saved_yaml = calibrator.to_yaml(output_path)
+        print(f"[OK] 空间透视单应性标定成功完成！参数已持久化保存至: {saved_yaml}")
     return calibrator
 
 
@@ -226,6 +228,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         length_m=args.length,
         output_path=args.output,
         predefined_points=pts,
+        save_output=(check_img_pts is None),
     )
     if check_img_pts is not None:
         report = calibrator.evaluate_check_points(check_img_pts, check_gd_pts)
@@ -233,6 +236,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"[OK] 独立检查点验证 ({report['count']} 点): "
             f"RMSE = {report['rmse_m']:.3f} m | Max = {report['max_error_m']:.3f} m"
         )
+        saved_yaml = calibrator.to_yaml(args.output)
+        print(f"[OK] 空间透视单应性标定成功完成！参数已持久化保存至: {saved_yaml}")
         if args.validation_output:
             val_path = Path(args.validation_output).expanduser().resolve()
             val_path.parent.mkdir(parents=True, exist_ok=True)

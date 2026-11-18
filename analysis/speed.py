@@ -17,6 +17,14 @@ from typing import Dict, List, Optional, Tuple
 from .policy import ObjectPolicy, object_policy
 
 
+def _is_finite_number(value) -> bool:
+    return (
+        type(value) is not bool
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
 @dataclass
 class SpeedReading:
     """单目标速度研判数据模型"""
@@ -58,27 +66,37 @@ class TrackMotionTracker:
     ):
         if type(window_size) is not int or window_size < 3:
             raise ValueError("window_size 必须是 >= 3 的整数帧数")
-        if not math.isfinite(ema_alpha) or not (0 < ema_alpha <= 1):
+        if not _is_finite_number(ema_alpha) or not (0 < ema_alpha <= 1):
             raise ValueError("ema_alpha 必须在 (0, 1] 区间")
-        if not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
+        if not _is_finite_number(speed_limit_kmh) or speed_limit_kmh <= 0:
             raise ValueError("speed_limit_kmh 必须为有限正数")
-        if not math.isfinite(stationary_speed_ms) or stationary_speed_ms <= 0:
+        if not _is_finite_number(stationary_speed_ms) or stationary_speed_ms <= 0:
             raise ValueError("stationary_speed_ms 必须为有限正数")
         if type(stationary_min_frames) is not int or stationary_min_frames < 1:
             raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
-        if not math.isfinite(reliable_min_span_s) or reliable_min_span_s < 0:
+        if not _is_finite_number(reliable_min_span_s) or reliable_min_span_s < 0:
             raise ValueError("reliable_min_span_s 必须为有限非负数")
 
         self.track_id = track_id
         self.category = category
         self.window_size = window_size
-        self.ema_alpha = ema_alpha
-        self.speed_limit_kmh = speed_limit_kmh
-        self.stationary_speed_ms = stationary_speed_ms
+        self.ema_alpha = float(ema_alpha)
+        self.speed_limit_kmh = float(speed_limit_kmh)
+        self.stationary_speed_ms = float(stationary_speed_ms)
         self.stationary_min_frames = stationary_min_frames
-        self.reliable_min_span_s = reliable_min_span_s
+        self.reliable_min_span_s = float(reliable_min_span_s)
         self.object_policies = object_policies
-        self.object_kind = object_policy(object_kind, category, object_policies).kind
+        if category in ("pedestrian", "person"):
+            self.object_kind = object_policy(None, category, object_policies).kind
+        else:
+            safe_kind = (
+                object_kind
+                if isinstance(object_kind, str)
+                and object_kind.strip()
+                and object_kind.strip().lower() not in ("person", "pedestrian")
+                else None
+            )
+            self.object_kind = object_policy(safe_kind, category, object_policies).kind
 
         # 历史物理轨迹窗口: deque of (timestamp_s, x_m, y_m)
         self.history: deque[Tuple[float, float, float]] = deque(maxlen=window_size)
@@ -116,7 +134,7 @@ class TrackMotionTracker:
         # 否则 NaN 经差分进入 EMA 后会使平滑速度永久不可恢复；
         # 读数回填最后有效位置，不把 NaN 暴露给下游渲染/研判
         if not (math.isfinite(timestamp_s) and math.isfinite(x_m) and math.isfinite(y_m)):
-            x_out, y_out = self._last_valid_xy if self._last_valid_xy is not None else (x_m, y_m)
+            x_out, y_out = self._last_valid_xy if self._last_valid_xy is not None else (0.0, 0.0)
             return SpeedReading(
                 track_id=self.track_id,
                 category=self.category,
@@ -253,28 +271,28 @@ class SpeedEstimator:
         object_policies: dict[str, ObjectPolicy] | None = None,
         reliable_min_span_s: float = 0.2,
     ):
-        if not math.isfinite(ema_alpha) or not (0 < ema_alpha <= 1):
+        if not _is_finite_number(ema_alpha) or not (0 < ema_alpha <= 1):
             raise ValueError("ema_alpha 必须在 (0, 1] 区间")
         if type(window_size) is not int or window_size < 3:
             raise ValueError("window_size 必须是 >= 3 的整数帧数")
-        if not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
+        if not _is_finite_number(speed_limit_kmh) or speed_limit_kmh <= 0:
             raise ValueError("speed_limit_kmh 必须为有限正数")
-        if not math.isfinite(stationary_speed_ms) or stationary_speed_ms <= 0:
+        if not _is_finite_number(stationary_speed_ms) or stationary_speed_ms <= 0:
             raise ValueError("stationary_speed_ms 必须为有限正数")
         if type(stationary_min_frames) is not int or stationary_min_frames < 1:
             raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
         if type(category_confirm_frames) is not int or category_confirm_frames < 1:
             raise ValueError("category_confirm_frames 必须是 >= 1 的整数帧数")
-        if not math.isfinite(reliable_min_span_s) or reliable_min_span_s < 0:
+        if not _is_finite_number(reliable_min_span_s) or reliable_min_span_s < 0:
             raise ValueError("reliable_min_span_s 必须为有限非负数")
-        self.speed_limit_kmh = speed_limit_kmh
+        self.speed_limit_kmh = float(speed_limit_kmh)
         self.window_size = window_size
-        self.ema_alpha = ema_alpha
-        self.stationary_speed_ms = stationary_speed_ms
+        self.ema_alpha = float(ema_alpha)
+        self.stationary_speed_ms = float(stationary_speed_ms)
         self.stationary_min_frames = stationary_min_frames
         self.category_confirm_frames = category_confirm_frames
         self.object_policies = object_policies
-        self.reliable_min_span_s = reliable_min_span_s
+        self.reliable_min_span_s = float(reliable_min_span_s)
         self.tracks: Dict[int, TrackMotionTracker] = {}
 
     def update(
@@ -310,10 +328,21 @@ class SpeedEstimator:
                 tracker.observe_category(category, self.category_confirm_frames)
                 if tracker.category in ("pedestrian", "person"):
                     tracker.object_kind = "pedestrian"
-                elif object_kind is not None or tracker.object_kind == "pedestrian":
-                    tracker.object_kind = object_policy(
-                        object_kind, tracker.category, tracker.object_policies
-                    ).kind
+                else:
+                    has_valid_veh_kind = (
+                        isinstance(object_kind, str)
+                        and bool(object_kind.strip())
+                        and object_kind.strip().lower() not in ("person", "pedestrian")
+                    )
+                    if category == tracker.category and has_valid_veh_kind:
+                        tracker.object_kind = object_policy(
+                            object_kind, tracker.category, tracker.object_policies
+                        ).kind
+                    elif tracker.object_kind == "pedestrian":
+                        safe_kind = object_kind if has_valid_veh_kind else None
+                        tracker.object_kind = object_policy(
+                            safe_kind, tracker.category, tracker.object_policies
+                        ).kind
         return self.tracks[track_id].update(timestamp_s, x_m, y_m)
 
     def prune_stale_tracks(self, live_track_ids: set[int]):

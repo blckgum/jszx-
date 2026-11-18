@@ -292,10 +292,14 @@ def main(argv: list[str] | None = None):
         import datetime
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         prefix = "batch" if source_is_dir else "run"
-        out_dir = Path("runs") / "analysis" / f"{prefix}-{timestamp}"
-    if synthetic_calib is not None:
-        Path(out_dir).mkdir(parents=True, exist_ok=True)
-        synthetic_calib.to_yaml(Path(out_dir) / "calibration.synthetic.yaml")
+        out_dir = str((Path("runs") / "analysis" / f"{prefix}-{timestamp}").resolve())
+    else:
+        out_dir = str(Path(out_dir).expanduser().resolve())
+
+    def _save_synthetic_calib():
+        if synthetic_calib is not None:
+            Path(out_dir).mkdir(parents=True, exist_ok=True)
+            synthetic_calib.to_yaml(Path(out_dir) / "calibration.synthetic.yaml")
 
     # 静止确认时长解析（与 --window-s 同语义：秒级参数设置后覆盖帧级）：
     # 默认按 3.0s 秒级换算——原 8 帧（25fps 下仅 0.32s）会把礼让/排队
@@ -344,6 +348,7 @@ def main(argv: list[str] | None = None):
             show_window=args.show,
             **pipeline_kwargs,
         )
+        _save_synthetic_calib()
         return 0 if batch_summary["status"] == "completed" else 1
 
     pipeline = ConflictPerceptionPipeline(calibrator=calibrator, **pipeline_kwargs)
@@ -362,6 +367,7 @@ def main(argv: list[str] | None = None):
             show_window=args.show,
             max_frames=args.max_frames,
         )
+    _save_synthetic_calib()
     return 0
 
 

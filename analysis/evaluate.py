@@ -13,10 +13,17 @@ from statistics import fmean
 import yaml
 
 
+def _reject_non_finite_constant(value: str):
+    raise ValueError(f"JSON 不允许非有限常量: {value}")
+
+
 def _read_json(path: Path, default):
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(
+        path.read_text(encoding="utf-8"),
+        parse_constant=_reject_non_finite_constant,
+    )
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -27,7 +34,9 @@ def _read_jsonl(path: Path) -> list[dict]:
         if not line.strip():
             continue
         try:
-            rows.append(json.loads(line))
+            rows.append(
+                json.loads(line, parse_constant=_reject_non_finite_constant)
+            )
         except json.JSONDecodeError as exc:
             raise ValueError(f"{path} 第 {line_no} 行不是有效 JSON: {exc}") from None
     return rows

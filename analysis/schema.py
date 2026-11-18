@@ -263,6 +263,8 @@ def validate_speeds_csv(path: str | Path):
             raise SchemaValidationError(f"{file_path} 缺少 CSV 列: {', '.join(sorted(missing))}")
         count = 0
         for line_no, row in enumerate(reader, 2):
+            if None in row:
+                raise SchemaValidationError(f"{file_path} 第 {line_no} 行包含多余未命名列")
             try:
                 schema_version = int(row["schema_version"])
                 _integer(schema_version, f"speeds.csv 第 {line_no} 行 schema_version", minimum=1)
@@ -276,6 +278,10 @@ def validate_speeds_csv(path: str | Path):
                 _finite_number(float(row["speed_kmh"]), f"speeds.csv 第 {line_no} 行 speed_kmh", minimum=0)
             except (TypeError, ValueError) as exc:
                 raise SchemaValidationError(f"{file_path} 第 {line_no} 行数值字段无效: {exc}") from None
+            for text_col in ("category", "risk_level"):
+                val = row.get(text_col)
+                if not isinstance(val, str) or not val.strip():
+                    raise SchemaValidationError(f"{file_path} 第 {line_no} 行 {text_col} 必须是非空字符串")
             if row["is_reliable"] not in {"0", "1"} or row["is_stationary"] not in {"0", "1"}:
                 raise SchemaValidationError(f"{file_path} 第 {line_no} 行布尔字段必须是 0/1")
             if row["event_id"]:
@@ -405,6 +411,10 @@ def validate_batch_summary(data):
         "total_speeding_alerts", "total_caution_events", "total_critical_conflicts",
     ):
         _integer(data[key], f"batch summary.{key}", minimum=0)
+    if data["videos_not_processed"] > data["videos_discovered"]:
+        raise SchemaValidationError(
+            "batch summary.videos_not_processed 不能大于 videos_discovered"
+        )
     if not isinstance(data["results"], list):
         raise SchemaValidationError("batch summary.results 必须是列表")
     for idx, item in enumerate(data["results"]):

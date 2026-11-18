@@ -46,6 +46,26 @@ class EnhancedConflictVisualizer:
         self.COLOR_CRITICAL = (0, 0, 255)     # 红色 (紧急碰撞)
         self.COLOR_ZONE = (255, 191, 0)       # 天蓝/深黄色 (标定区域)
 
+    def _project_ground_point(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+        """优先调用 ground_to_pixel_checked 投射地面点，缺失时安全回退 ground_to_pixel。"""
+        checked_fn = getattr(self.calibrator, "ground_to_pixel_checked", None)
+        if callable(checked_fn):
+            pt = checked_fn(x, y)
+            if pt is None:
+                return None
+            u, v = int(pt[0]), int(pt[1])
+            if abs(u) > 1_000_000 or abs(v) > 1_000_000:
+                return None
+            return (u, v)
+
+        pt = self.calibrator.ground_to_pixel(x, y)
+        if pt is None:
+            return None
+        u, v = int(pt[0]), int(pt[1])
+        if u < 0 or v < 0 or abs(u) > 1_000_000 or abs(v) > 1_000_000:
+            return None
+        return (u, v)
+
     def draw_calibrated_ground_zone(self, frame: np.ndarray, alpha: float = 0.25):
         """在路面上半透明叠加渲染受控标定多边形区域与路侧停车区"""
         pts = np.array(self.calibrator.image_points, dtype=np.int32)
@@ -55,8 +75,8 @@ class EnhancedConflictVisualizer:
         cv2.polylines(frame, [pts], isClosed=True, color=(0, 220, 255), thickness=2)
 
         for zone in getattr(self.calibrator, "parking_zones", ()):
-            px_pts = [self.calibrator.ground_to_pixel(gx, gy) for gx, gy in zone]
-            if any(u < 0 or v < 0 for u, v in px_pts):
+            px_pts = [self._project_ground_point(gx, gy) for gx, gy in zone]
+            if any(pt is None for pt in px_pts):
                 continue
             arr = np.array(px_pts, dtype=np.int32)
             cv2.polylines(frame, [arr], isClosed=True, color=(180, 180, 80), thickness=2)
@@ -84,14 +104,15 @@ class EnhancedConflictVisualizer:
         segments: List[List[Tuple[int, int]]] = []
         current: List[Tuple[int, int]] = []
         last_visible: Optional[Tuple[int, int]] = None
+        h, w = frame.shape[:2]
         for i in range(steps + 1):
             t = i * dt
             future_x = reading.x_m + reading.vx_ms * t
             future_y = reading.y_m + reading.vy_ms * t
-            u, v = self.calibrator.ground_to_pixel(future_x, future_y)
-            if 0 <= u < frame.shape[1] and 0 <= v < frame.shape[0]:
-                current.append((u, v))
-                last_visible = (u, v)
+            pt = self._project_ground_point(future_x, future_y)
+            if pt is not None and 0 <= pt[0] < w and 0 <= pt[1] < h:
+                current.append(pt)
+                last_visible = pt
             else:
                 if len(current) >= 2:
                     segments.append(current)
@@ -125,7 +146,9 @@ class EnhancedConflictVisualizer:
         elif conflict and conflict.risk_level == RiskLevel.LEVEL_2_CAUTION:
             color = self.COLOR_CAUTION
             label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h [CAUTION{mark}]"
-        elif reading.is_speeding:
+        elif reading.is_speeding or (
+            conflict is not None and conflict.risk_level == RiskLevel.LEVEL_1_SPEEDING
+        ):
             color = self.COLOR_SPEEDING
             label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h [SPEEDING{mark}]"
         else:
@@ -165,13 +188,23 @@ class EnhancedConflictVisualizer:
         提供时按 provisional（未确认瞬时帧）/confirmed（已确认事件）区分标注"""
         h, w = frame.shape[:2]
 
-        # 确定当前帧最高风险等级
+        # 确定当前帧最高风险等级：优先风险级别 -> 已确认事件 -> 最小 TTC
         max_level = RiskLevel.LEVEL_0_SAFE
         primary_conflict: Optional[ConflictAssessment] = None
+        best_key: Optional[Tuple[int, int, float]] = None
         for c in conflicts:
-            if c.risk_level > max_level:
-                max_level = c.risk_level
+            if c.risk_level <= RiskLevel.LEVEL_0_SAFE:
+                continue
+            eid = (event_ids or {}).get((c.veh_track_id, c.ped_track_id))
+            key = (
+                int(c.risk_level),
+                1 if eid is not None else 0,
+                -(c.ttc_seconds if c.ttc_seconds is not None else 999.0),
+            )
+            if best_key is None or key > best_key:
+                best_key = key
                 primary_conflict = c
+                max_level = c.risk_level
 
         # 头部横幅尺寸
         banner_h = 48
@@ -179,10 +212,12 @@ class EnhancedConflictVisualizer:
 
         if max_level == RiskLevel.LEVEL_3_CRITICAL:
             bg_color = (0, 0, 180)
-            banner_text = f"CRITICAL CONFLICT ALERT: Veh #{primary_conflict.veh_track_id} <-> Ped #{primary_conflict.ped_track_id} | TTC: {primary_conflict.ttc_seconds:.1f}s | BRAKE NOW!"
+            ttc_str = f"{primary_conflict.ttc_seconds:.1f}s" if primary_conflict.ttc_seconds is not None else "N/A"
+            banner_text = f"CRITICAL CONFLICT ALERT: Veh #{primary_conflict.veh_track_id} <-> Ped #{primary_conflict.ped_track_id} | TTC: {ttc_str} | BRAKE NOW!"
         elif max_level == RiskLevel.LEVEL_2_CAUTION:
             bg_color = (0, 120, 220)
-            banner_text = f"CAUTION: Trajectory Convergence (Veh #{primary_conflict.veh_track_id} <-> Ped #{primary_conflict.ped_track_id} | TTC: {primary_conflict.ttc_seconds:.1f}s)"
+            ttc_str = f"{primary_conflict.ttc_seconds:.1f}s" if primary_conflict.ttc_seconds is not None else "N/A"
+            banner_text = f"CAUTION: Trajectory Convergence (Veh #{primary_conflict.veh_track_id} <-> Ped #{primary_conflict.ped_track_id} | TTC: {ttc_str})"
         elif max_level == RiskLevel.LEVEL_1_SPEEDING:
             bg_color = (0, 180, 210)
             banner_text = f"SPEED LIMIT WARNING: Veh #{primary_conflict.veh_track_id} @ {primary_conflict.veh_speed_kmh:.1f} km/h (Limit: {self.speed_limit_kmh:g} km/h)"
@@ -226,8 +261,8 @@ class EnhancedConflictVisualizer:
             return
 
         # 车辆与行人图像底边中心点
-        u_v, v_v = self.calibrator.ground_to_pixel(veh_r.x_m, veh_r.y_m)
-        u_p, v_p = self.calibrator.ground_to_pixel(ped_r.x_m, ped_r.y_m)
+        veh_pt = self._project_ground_point(veh_r.x_m, veh_r.y_m)
+        ped_pt = self._project_ground_point(ped_r.x_m, ped_r.y_m)
 
         color = (
             self.COLOR_CRITICAL
@@ -236,18 +271,29 @@ class EnhancedConflictVisualizer:
         )
 
         # 连虚线
-        cv2.line(frame, (u_v, v_v), (u_p, v_p), color, 2, cv2.LINE_AA)
+        if veh_pt is not None and ped_pt is not None:
+            cv2.line(frame, veh_pt, ped_pt, color, 2, cv2.LINE_AA)
 
         # 预测交点投射到图像并画警示光圈
         if conflict.conflict_ground_xy:
             cx, cy = conflict.conflict_ground_xy
-            cu, cv_pt = self.calibrator.ground_to_pixel(cx, cy)
-            if 0 <= cu < frame.shape[1] and 0 <= cv_pt < frame.shape[0]:
+            conflict_pt = self._project_ground_point(cx, cy)
+            if (
+                conflict_pt is not None
+                and 0 <= conflict_pt[0] < frame.shape[1]
+                and 0 <= conflict_pt[1] < frame.shape[0]
+            ):
+                cu, cv_pt = conflict_pt
                 cv2.circle(frame, (cu, cv_pt), 14, color, 2, cv2.LINE_AA)
                 cv2.circle(frame, (cu, cv_pt), 4, color, -1)
+                ttc_label = (
+                    f"TTC {conflict.ttc_seconds:.1f}s"
+                    if conflict.ttc_seconds is not None
+                    else "TTC N/A"
+                )
                 cv2.putText(
                     frame,
-                    f"TTC {conflict.ttc_seconds:.1f}s",
+                    ttc_label,
                     (cu + 8, cv_pt - 8),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,

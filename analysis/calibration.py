@@ -98,6 +98,8 @@ class RoadCalibrator:
         synthetic: bool = False,
         parking_zones: Optional[List[List[Tuple[float, float]]]] = None,
     ):
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("标定名称 name 必须是非空字符串")
         if type(synthetic) is not bool:
             raise ValueError("synthetic 必须是布尔值")
         if len(image_points) != 4:
@@ -115,6 +117,28 @@ class RoadCalibrator:
             _validate_point_2d(pt, f"第 {idx + 1} 个标定角点")
             for idx, pt in enumerate(image_points)
         ]
+
+        crosses: List[float] = []
+        for i in range(4):
+            x_i, y_i = parsed_points[i]
+            x_n, y_n = parsed_points[(i + 1) % 4]
+            x_nn, y_nn = parsed_points[(i + 2) % 4]
+            cross = (x_n - x_i) * (y_nn - y_n) - (y_n - y_i) * (x_nn - x_n)
+            if not math.isfinite(cross):
+                raise ValueError("标定角点几何计算溢出，请检查像素坐标范围")
+            crosses.append(cross)
+        if not (all(c > 1e-3 for c in crosses) or all(c < -1e-3 for c in crosses)):
+            raise ValueError("4 个标定角点必须构成严格凸四边形（不可共线、重复、凹陷或自交叉）")
+
+        area = 0.5 * abs(
+            sum(
+                parsed_points[i][0] * parsed_points[(i + 1) % 4][1]
+                - parsed_points[(i + 1) % 4][0] * parsed_points[i][1]
+                for i in range(4)
+            )
+        )
+        if not math.isfinite(area) or area < 1.0:
+            raise ValueError(f"4 个标定角点围成的多边形面积过小或无效 ({area})")
 
         parsed_parking_zones: List[List[Tuple[float, float]]] = []
         if parking_zones is not None:
@@ -148,17 +172,43 @@ class RoadCalibrator:
         dst_pts = np.array(self.ground_points, dtype=np.float32)
 
         # 求解 3x3 单应性透视变换矩阵 H
-        h_mat = cv2.getPerspectiveTransform(src_pts, dst_pts)
-        if h_mat is None or np.isnan(h_mat).any():
-            raise RuntimeError("无法求解有效的单应性矩阵，请检查 4 个角点是否退化共线")
+        try:
+            h_mat = cv2.getPerspectiveTransform(src_pts, dst_pts)
+        except cv2.error as exc:
+            raise ValueError(f"无法求解有效的单应性矩阵: {exc}") from None
+        if h_mat is None or not np.isfinite(h_mat).all():
+            raise ValueError("无法求解有效的单应性矩阵，请检查 4 个角点是否退化共线")
 
         self.H = h_mat.astype(np.float64)
+        if not np.isfinite(self.H).all():
+            raise ValueError("单应性矩阵包含非有限数值")
         try:
             self.H_inv = np.linalg.inv(self.H)
         except np.linalg.LinAlgError:
-            raise RuntimeError(
+            raise ValueError(
                 "单应性矩阵不可逆，请检查 4 个角点是否退化共线或重复选取"
             ) from None
+        if not np.isfinite(self.H_inv).all():
+            raise ValueError("逆单应性矩阵包含非有限数值")
+
+        cond_h = float(np.linalg.cond(self.H))
+        if not math.isfinite(cond_h) or cond_h >= 1e12:
+            raise ValueError(f"单应性矩阵条件数过大 ({cond_h:.3e})，请检查 4 个标定角点是否退化")
+
+        for (u, v), (gx, gy) in zip(self.image_points, self.ground_points):
+            px, py = self.pixel_to_ground(u, v)
+            if not (math.isfinite(px) and math.isfinite(py)) or math.hypot(px - gx, py - gy) >= 1e-2:
+                raise ValueError("标定角点往返投影误差超过 1e-2 米，单应性变换数值无效")
+
+        w_signs: List[int] = []
+        for gx, gy in self.ground_points:
+            w = float((self.H_inv @ np.array([gx, gy, 1.0], dtype=np.float64))[2])
+            if not math.isfinite(w) or abs(w) < 1e-6:
+                raise ValueError("逆单应性投影齐次尺度分量过小或非有限，请检查 4 个标定角点")
+            w_signs.append(1 if w > 0 else -1)
+        if len(set(w_signs)) != 1:
+            raise ValueError("标定地面角点齐次尺度符号不一致，无法构成有效单向视场")
+        self._front_w_sign: int = w_signs[0]
 
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "RoadCalibrator":
@@ -211,11 +261,15 @@ class RoadCalibrator:
         if raw_zones is not None and not isinstance(raw_zones, (list, tuple)):
             raise ValueError(f"标定文件 {path} 的 parking_zones 必须是列表")
 
+        raw_name = data.get("name", "campus_road")
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError(f"标定文件 {path} 的 name 必须是非空字符串")
+
         calibrator = cls(
             image_points=img_pts,
             width_m=data["width_m"],
             length_m=data["length_m"],
-            name=data.get("name", "campus_road"),
+            name=raw_name,
             synthetic=synthetic,
             parking_zones=raw_zones,
         )
@@ -254,27 +308,62 @@ class RoadCalibrator:
         """
         核心几何变换：将图像像素坐标 (u, v) 映射为道路实际米制坐标 (X, Y)
         """
-        p_img = np.array([u, v, 1.0], dtype=np.float64).reshape(3, 1)
+        if (
+            isinstance(u, bool)
+            or isinstance(v, bool)
+            or not isinstance(u, (int, float))
+            or not isinstance(v, (int, float))
+            or not (math.isfinite(u) and math.isfinite(v))
+        ):
+            return float("nan"), float("nan")
+        p_img = np.array([float(u), float(v), 1.0], dtype=np.float64).reshape(3, 1)
         p_ground = self.H @ p_img
-        scale = p_ground[2, 0]
-        if abs(scale) < 1e-8:
+        scale = float(p_ground[2, 0])
+        if not math.isfinite(scale) or abs(scale) < 1e-8:
             return float("nan"), float("nan")
 
         x_m = float(p_ground[0, 0] / scale)
         y_m = float(p_ground[1, 0] / scale)
         return x_m, y_m
 
+    def ground_to_pixel_checked(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+        """逆向几何变换：将道路米制坐标 (X, Y) 投射回图像像素坐标 (u, v)；
+        对非有限输入、相机主平面后方点及近地平线溢出坐标返回 None。
+        """
+        if (
+            isinstance(x, bool)
+            or isinstance(y, bool)
+            or not isinstance(x, (int, float))
+            or not isinstance(y, (int, float))
+            or not (math.isfinite(x) and math.isfinite(y))
+        ):
+            return None
+        p_g = np.array([float(x), float(y), 1.0], dtype=np.float64).reshape(3, 1)
+        p_img = self.H_inv @ p_g
+        scale = float(p_img[2, 0])
+        if (
+            not math.isfinite(scale)
+            or abs(scale) < 1e-6
+            or scale * self._front_w_sign <= 0
+        ):
+            return None
+
+        u_f = float(p_img[0, 0] / scale)
+        v_f = float(p_img[1, 0] / scale)
+        if (
+            not (math.isfinite(u_f) and math.isfinite(v_f))
+            or abs(u_f) > 1_000_000
+            or abs(v_f) > 1_000_000
+        ):
+            return None
+        return int(round(u_f)), int(round(v_f))
+
     def ground_to_pixel(self, x: float, y: float) -> Tuple[int, int]:
         """逆向几何变换：将道路米制坐标 (X, Y) 投射回图像像素坐标 (u, v)"""
-        p_g = np.array([x, y, 1.0], dtype=np.float64).reshape(3, 1)
-        p_img = self.H_inv @ p_g
-        scale = p_img[2, 0]
-        if abs(scale) < 1e-8:
+        pt = self.ground_to_pixel_checked(x, y)
+        if pt is None or pt[0] < 0 or pt[1] < 0:
             return -1, -1
-
-        u = int(round(p_img[0, 0] / scale))
-        v = int(round(p_img[1, 0] / scale))
-        return u, v
+        return pt
 
     def is_in_zone(self, x: float, y: float, margin_m: float = 2.0) -> bool:
         """判断目标地面坐标是否处于重点受控监测区域内（带冗余边距缓冲）"""
