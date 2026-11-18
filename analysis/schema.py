@@ -41,6 +41,9 @@ def _schema_version(data: dict, name: str):
 
 
 def load_json_strict(path: str | Path):
+    # 拒绝空白路径字符串，防止 Path("") 解析成当前目录 '.' 触发目录读取异常。
+    if isinstance(path, str) and not path.strip():
+        raise SchemaValidationError("文件路径不能为空")
     file_path = Path(path)
     try:
         data = json.loads(file_path.read_text(encoding="utf-8"), parse_constant=_reject_constant)
@@ -51,6 +54,9 @@ def load_json_strict(path: str | Path):
 
 
 def _load_jsonl_strict_with_lines(path: str | Path) -> list[tuple[int, object]]:
+    # 拒绝空白路径字符串，防止 Path("") 解析成当前目录 '.'。
+    if isinstance(path, str) and not path.strip():
+        raise SchemaValidationError("文件路径不能为空")
     file_path = Path(path)
     rows = []
     for line_no, line in enumerate(file_path.read_text(encoding="utf-8").splitlines(), 1):
@@ -258,6 +264,9 @@ SPEED_COLUMNS = {
 
 
 def validate_speeds_csv(path: str | Path):
+    # 拒绝空白路径字符串，防止 Path("") 解析成当前目录 '.'。
+    if isinstance(path, str) and not path.strip():
+        raise SchemaValidationError("CSV 路径不能为空")
     file_path = Path(path)
     with file_path.open(encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
@@ -476,6 +485,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="校验 analysis 运行输出格式")
     parser.add_argument("--run", required=True, help="runs/analysis/run-* 或 batch-* 目录")
     args = parser.parse_args(argv)
+    # 必须在 Path(args.run) 之前拦截空白字符串：否则 Path("") 会解析为当前工作目录 '.'，
+    # 转为 Path 对象后还会绕过 validate_run / validate_batch_run 中的 isinstance(..., str) 空白拦截。
+    if not args.run.strip():
+        parser.error("--run 不能为空")
     try:
         root = Path(args.run).expanduser().resolve()
         if (root / "batch_summary.json").is_file() and not (root / "summary.json").is_file():

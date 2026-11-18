@@ -40,6 +40,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="生成非实拍的 ByteTrack 功能检查视频，不下载数据集")
     parser.add_argument("--output", required=True, help="尚不存在的样例目录")
     args = parser.parse_args(argv)
+    # 拒绝空白输出目录字符串，防止 Path("") 解析为当前工作目录 '.' 或误建空白目录。
+    if not args.output.strip():
+        parser.error("--output 不能为空")
     output = Path(args.output).expanduser().resolve()
     try:
         output.mkdir(parents=True, exist_ok=False)

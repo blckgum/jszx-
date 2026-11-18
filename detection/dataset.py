@@ -17,6 +17,9 @@ from .core import IMAGE_SUFFIXES, TARGET_CLASSES
 def audit_dataset(config: str | Path, required_splits: tuple[str, ...]):
     # 返回两部分：可交给 Ultralytics 的统一配置，以及每个划分的图片数和目标数。
     # required_splits 指定本次必须检查的集合：训练时检查 train/val，评估时检查所选集合。
+    # 拒绝空白配置路径字符串，防止 Path("") 解析为当前工作目录 '.'。
+    if isinstance(config, str) and not config.strip():
+        raise ValueError("数据集配置路径不能为空")
     config = Path(config).expanduser().resolve()
     try:
         data = yaml.safe_load(config.read_text(encoding="utf-8"))

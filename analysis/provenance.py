@@ -34,8 +34,8 @@ def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def file_fingerprint(path: str | Path | None) -> dict:
-    # 文件缺失、权限受限或路径未提供时仅标注状态，不阻断主流程运行。
-    if path is None:
+    # 文件缺失、权限受限或路径未提供/为空白时仅标注 unavailable，防止 Path("") 解析成当前目录 '.'。
+    if path is None or (isinstance(path, str) and not path.strip()):
         return {"path": None, "status": "unavailable", "sha256": None, "size_bytes": None}
     try:
         resolved = Path(path).expanduser().resolve()

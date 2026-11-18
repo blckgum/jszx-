@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from detection.core import VIDEO_SUFFIXES, new_run, write_json
+from detection.core import DEFAULT_WEIGHTS, VIDEO_SUFFIXES, new_run, write_json
 from .core import DEFAULT_TRACKER, read_tracker_config, track_video
 from .motion import DEFAULT_MOTION_CONFIG, read_motion_config
 
@@ -24,6 +24,10 @@ def track_directory(source, *, output=None, **options):
         raise ValueError("目录中没有支持的视频文件")
     read_tracker_config(options.get("tracker", DEFAULT_TRACKER))
     read_motion_config(options.get("motion_config", DEFAULT_MOTION_CONFIG))
+    weights = options.get("weights", DEFAULT_WEIGHTS)
+    # 提前拦截空白权重字符串，避免先创建空批次目录后再在子任务里失败。
+    if isinstance(weights, str) and not weights.strip():
+        raise ValueError("模型权重路径不能为空")
     output = new_run(output, "track-batch")
     summary = {"schema_version": 1, "source": str(source), "videos_discovered": len(videos),
                "status": "running", "results": []}

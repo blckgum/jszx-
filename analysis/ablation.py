@@ -90,6 +90,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="运行无视频的测速/TTC 参数消融")
     parser.add_argument("--output", help="输出 JSON 文件；不指定则打印")
     args = parser.parse_args(argv)
+    # 必须在写出前拦截空白 --output：否则 "" 会静默回退打印到 stdout，
+    # 而 "   " 经 Path() 解析后会在工作区尝试写出空白文件名。
+    if args.output is not None and not args.output.strip():
+        parser.error("--output 不能为空")
     result = run_default_ablation()
     text = json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)
     if args.output:

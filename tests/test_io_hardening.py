@@ -1,4 +1,6 @@
+import contextlib
 import csv
+import io
 import json
 import os
 import subprocess
@@ -991,6 +993,206 @@ class CliSchemaEvaluateHardeningTests(unittest.TestCase):
                     _write_tracks_jsonl(bad_tracks, [bad_row])
                     with self.assertRaises(ValueError):
                         pipe.process_tracks(bad_tracks, root / f"out_{label}")
+
+    def test_schema_cli_rejects_blank_run_even_when_cwd_has_valid_summary(self):
+        from analysis.schema import (
+            load_json_strict,
+            load_jsonl_strict,
+            main as schema_main,
+            validate_batch_run,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vpath = root / "clip.mp4"
+            _write_dummy_video(vpath, n_frames=2)
+
+            run_dir = root / "valid_run"
+            fake_session = mock.Mock()
+            fake_rec = mock.Mock()
+            fake_rec.tracks = []
+            fake_session.process.return_value = fake_rec
+            fake_session.retained_ids.return_value = set()
+            pipe = ConflictPerceptionPipeline(calibrator=_sample_calibrator())
+            with mock.patch("analysis.pipeline.TrackingSession", return_value=fake_session):
+                pipe.process_video(vpath, run_dir)
+            self.assertTrue(validate_run(run_dir)["valid"])
+
+            batch_dir = root / "valid_batch"
+            child_dir = batch_dir / "0001_clip"
+            child_dir.mkdir(parents=True)
+            with mock.patch("analysis.pipeline.TrackingSession", return_value=fake_session):
+                pipe.process_video(vpath, child_dir)
+            (batch_dir / "batch_summary.json").write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "kind": "analysis_batch",
+                    "source_dir": str(root),
+                    "output_dir": str(batch_dir),
+                    "status": "completed",
+                    "videos_discovered": 1,
+                    "videos_not_processed": 0,
+                    "total_alert_events": 0,
+                    "total_speeding_alerts": 0,
+                    "total_caution_events": 0,
+                    "total_critical_conflicts": 0,
+                    "results": [{"source": str(vpath), "output": str(child_dir), "status": "ok"}],
+                }),
+                encoding="utf-8",
+            )
+            self.assertTrue(validate_batch_run(batch_dir)["valid"])
+
+            prev_cwd = Path.cwd()
+            try:
+                for valid_dir in (run_dir, batch_dir):
+                    os.chdir(valid_dir)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(schema_main(["--run", str(valid_dir)]), 0)
+                    for bad_run in ("", "   ", "\t\n"):
+                        err_buf = io.StringIO()
+                        out_buf = io.StringIO()
+                        with self.subTest(cwd=valid_dir.name, bad_run=bad_run), \
+                                contextlib.redirect_stdout(out_buf), \
+                                contextlib.redirect_stderr(err_buf), \
+                                self.assertRaises(SystemExit) as ctx:
+                            schema_main(["--run", bad_run])
+                        self.assertNotEqual(ctx.exception.code, 0)
+                        self.assertEqual(out_buf.getvalue(), "")
+                        self.assertIn("--run", err_buf.getvalue())
+
+                os.chdir(run_dir)
+                for cli_arg in ("", "   "):
+                    proc = subprocess.run(
+                        [sys.executable, "-m", "analysis.schema", "--run", cli_arg],
+                        capture_output=True,
+                        text=True,
+                        cwd=str(run_dir),
+                    )
+                    self.assertNotEqual(proc.returncode, 0, msg=proc.stdout)
+                    self.assertNotIn('"valid": true', proc.stdout)
+            finally:
+                os.chdir(prev_cwd)
+
+            for bad_file in ("", "   "):
+                with self.subTest(bad_file=bad_file):
+                    with self.assertRaises(SchemaValidationError):
+                        load_json_strict(bad_file)
+                    with self.assertRaises(SchemaValidationError):
+                        load_jsonl_strict(bad_file)
+                    with self.assertRaises(SchemaValidationError):
+                        validate_speeds_csv(bad_file)
+
+    def test_track_video_and_tracking_helpers_reject_blank_paths(self):
+        from analysis.policy import read_object_policy_config
+        from analysis.provenance import file_fingerprint
+        from detection.core import detect, load_model, new_run
+        from detection.dataset import audit_dataset
+        from tracking.__main__ import main as tracking_main
+        from tracking.batch import track_directory
+        from tracking.core import track_video
+        from tracking.demo import main as tracking_demo_main
+        from tracking.motion import read_motion_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src_dir = root / "videos"
+            src_dir.mkdir()
+            vpath = src_dir / "clip.mp4"
+            _write_dummy_video(vpath, n_frames=2)
+
+            clean_cwd = root / "clean_cwd"
+            clean_cwd.mkdir()
+            prev_cwd = Path.cwd()
+            try:
+                os.chdir(clean_cwd)
+                for bad_path in ("", "   ", "\t\n"):
+                    with self.subTest(bad_path=bad_path):
+                        with self.assertRaises(ValueError):
+                            track_video(bad_path)
+                        with self.assertRaises(ValueError):
+                            track_video(vpath, output=bad_path)
+                        with self.assertRaises(ValueError):
+                            track_video(vpath, weights=bad_path)
+                        with self.assertRaises(ValueError):
+                            track_video(vpath, tracker=bad_path)
+                        with self.assertRaises(ValueError):
+                            track_video(vpath, motion_config=bad_path)
+                        with self.assertRaises(ValueError):
+                            track_directory(src_dir, weights=bad_path)
+                        with self.assertRaises(ValueError):
+                            track_directory(src_dir, tracker=bad_path)
+                        with self.assertRaises(ValueError):
+                            track_directory(src_dir, motion_config=bad_path)
+                        with self.assertRaises(ValueError):
+                            read_tracker_config(bad_path)
+                        with self.assertRaises(ValueError):
+                            read_motion_config(bad_path)
+                        with self.assertRaises(ValueError):
+                            new_run(bad_path, "track")
+                        with self.assertRaises(ValueError):
+                            load_model(bad_path)
+                        with self.assertRaises(ValueError):
+                            detect(SimpleNamespace(source=bad_path))
+                        with self.assertRaises(ValueError):
+                            audit_dataset(bad_path, ("train",))
+                        with self.assertRaises(ValueError):
+                            read_object_policy_config(bad_path)
+                        with self.assertRaises(ValueError):
+                            ConflictPerceptionPipeline(calibrator=_sample_calibrator(), weights=bad_path)
+                        with self.assertRaises(ValueError):
+                            ConflictPerceptionPipeline(calibrator=_sample_calibrator(), tracker_config=bad_path)
+                        with self.assertRaises(ValueError):
+                            ConflictPerceptionPipeline(
+                                calibrator=_sample_calibrator(), object_policy_config=bad_path
+                            )
+                        fp = file_fingerprint(bad_path)
+                        self.assertIsNone(fp["path"])
+                        self.assertEqual(fp["status"], "unavailable")
+
+                        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as demo_ctx:
+                            tracking_demo_main(["--output", bad_path])
+                        self.assertNotEqual(demo_ctx.exception.code, 0)
+
+                for bad_trk_cli in (
+                    ["--source", str(vpath), "--weights", "   "],
+                    ["--source", str(vpath), "--tracker", ""],
+                    ["--source", str(vpath), "--motion-config", "   "],
+                ):
+                    with self.subTest(bad_trk_cli=bad_trk_cli), \
+                            contextlib.redirect_stderr(io.StringIO()), \
+                            self.assertRaises(SystemExit) as trk_ctx:
+                        tracking_main(bad_trk_cli)
+                    self.assertNotEqual(trk_ctx.exception.code, 0)
+
+                self.assertEqual(list(clean_cwd.iterdir()), [])
+            finally:
+                os.chdir(prev_cwd)
+
+    def test_ablation_and_scenarios_cli_reject_blank_output(self):
+        from analysis.ablation import main as ablation_main
+        from analysis.scenarios import main as scenarios_main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            clean_cwd = Path(tmp) / "clean_cwd"
+            clean_cwd.mkdir()
+            prev_cwd = Path.cwd()
+            try:
+                os.chdir(clean_cwd)
+                for bad_out in ("", "   ", "\t\n"):
+                    for name, cli_main in (("ablation", ablation_main), ("scenarios", scenarios_main)):
+                        out_buf = io.StringIO()
+                        err_buf = io.StringIO()
+                        with self.subTest(cli=name, bad_out=bad_out), \
+                                contextlib.redirect_stdout(out_buf), \
+                                contextlib.redirect_stderr(err_buf), \
+                                self.assertRaises(SystemExit) as ctx:
+                            cli_main(["--output", bad_out])
+                        self.assertNotEqual(ctx.exception.code, 0)
+                        self.assertEqual(out_buf.getvalue(), "")
+                        self.assertIn("--output", err_buf.getvalue())
+                self.assertEqual(list(clean_cwd.iterdir()), [])
+            finally:
+                os.chdir(prev_cwd)
 
 
 if __name__ == "__main__":

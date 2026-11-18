@@ -40,6 +40,9 @@ def prepare_runtime() -> None:
 
 
 def load_model(weights: str | Path):
+    # 拒绝空白权重路径字符串，防止 Path("") 解析为当前工作目录 '.'。
+    if isinstance(weights, str) and not weights.strip():
+        raise ValueError("模型权重路径不能为空")
     prepare_runtime()
     # 在真正需要模型时再导入，查看命令帮助和进行数据审计无需先加载 PyTorch 模型。
     from ultralytics import YOLO
@@ -85,6 +88,9 @@ def new_run(output: str | Path | None, task: str) -> Path:
         parent = ROOT / "runs" / "yolo" / task
         parent.mkdir(parents=True, exist_ok=True)
         return Path(tempfile.mkdtemp(prefix="run-", dir=parent))
+    # 拒绝空白输出目录字符串，防止 Path("") 解析为当前工作目录 '.' 或误建空白目录。
+    if isinstance(output, str) and not output.strip():
+        raise ValueError("输出目录不能为空")
     path = Path(output).expanduser().resolve()
     # 每次运行必须使用新目录，避免覆盖已有训练或推理结果。
     path.mkdir(parents=True, exist_ok=False)
@@ -99,6 +105,9 @@ def write_json(path: Path, value) -> None:
 def detect(args) -> Path:
     import cv2
 
+    # 拒绝空白输入源字符串，防止 Path("") 解析为当前工作目录 '.'。
+    if isinstance(args.source, str) and not args.source.strip():
+        raise ValueError("--source 不能为空")
     # 图片目录视为一组独立图片；只有视频文件才具有连续帧与时间轴。
     source = Path(args.source).expanduser().resolve()
     if source.is_dir():

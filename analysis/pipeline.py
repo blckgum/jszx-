@@ -224,6 +224,13 @@ class ConflictPerceptionPipeline:
             or parking_zone_max_speed_kmh < 0
         ):
             raise ValueError("parking_zone_max_speed_kmh 必须为有限非负数")
+        # 拒绝空白路径字符串，防止后续 Path("") 解析为当前工作目录 '.'。
+        if isinstance(weights, str) and not weights.strip():
+            raise ValueError("模型权重路径不能为空")
+        if isinstance(tracker_config, str) and not tracker_config.strip():
+            raise ValueError("跟踪配置路径不能为空")
+        if isinstance(object_policy_config, str) and not object_policy_config.strip():
+            raise ValueError("对象策略配置路径不能为空")
 
         self.calibrator = calibrator
         self.weights = weights

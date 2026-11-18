@@ -171,6 +171,9 @@ def resolve_conf(config, conf):
 
 
 def read_tracker_config(path):
+    # 拒绝空白路径字符串，防止 Path("") 解析为当前工作目录 '.'。
+    if isinstance(path, str) and not path.strip():
+        raise ValueError("跟踪配置路径不能为空")
     path = Path(path).expanduser().resolve()
     try:
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -279,6 +282,14 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
                 classes=None, conf=None, imgsz=640, iou=0.7, device=None,
                 trail_length=None, max_frames=None, fps=None, show=False,
                 motion_config=DEFAULT_MOTION_CONFIG):
+    # 必须在 Path(source) 与 new_run(output, "track") 之前拦截空白字符串，
+    # 防止 Path("") 解析为当前工作目录 '.' 或误在工作区创建空白名称目录。
+    if isinstance(source, str) and not source.strip():
+        raise ValueError("输入视频路径不能为空")
+    if isinstance(output, str) and not output.strip():
+        raise ValueError("输出目录不能为空")
+    if isinstance(weights, str) and not weights.strip():
+        raise ValueError("模型权重路径不能为空")
     import cv2
 
     prepare_runtime()
