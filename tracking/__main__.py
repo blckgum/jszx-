@@ -34,6 +34,10 @@ def main(argv=None):
     parser.add_argument("--fps", type=float, default=None, help="覆盖输出 FPS 和固定间隔时间轴")
     parser.add_argument("--show", action="store_true", help="本地桌面显示，支持 Space/P 暂停、Q/Esc 退出")
     args = parser.parse_args(argv)
+    if not args.source.strip():
+        parser.error("--source 不能为空")
+    if args.output is not None and not args.output.strip():
+        parser.error("--output 不能为空")
     try:
         is_batch = Path(args.source).expanduser().is_dir()
         output = (track_directory if is_batch else track_video)(**vars(args))

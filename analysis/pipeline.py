@@ -413,7 +413,7 @@ class ConflictPerceptionPipeline:
             if type(row.get("schema_version")) is not int or row["schema_version"] != 1:
                 raise ValueError(f"tracks.jsonl 第 {line_idx} 行 schema_version 必须为 1")
             sid = row.get("session_id")
-            if not isinstance(sid, str) or not sid:
+            if not isinstance(sid, str) or not sid.strip():
                 raise ValueError(f"tracks.jsonl 第 {line_idx} 行缺少有效 session_id")
             if expected_session is None:
                 expected_session = sid
@@ -450,7 +450,13 @@ class ConflictPerceptionPipeline:
                     seen_ids.add(tid)
                 cname = target.get("class_name")
                 cat = target.get("category")
-                if not isinstance(cname, str) or not cname or not isinstance(cat, str) or not cat:
+                # 拒绝纯空白字符串，防止写出非法 speeds.csv 行并在 Schema 校验阶段失败。
+                if (
+                    not isinstance(cname, str)
+                    or not cname.strip()
+                    or not isinstance(cat, str)
+                    or not cat.strip()
+                ):
                     raise ValueError(f"tracks.jsonl 第 {line_idx} 行缺少 class_name 或 category")
                 bbox = target.get("bbox_xyxy")
                 anchor = target.get("anchor_xy")
@@ -605,6 +611,9 @@ class ConflictPerceptionPipeline:
         """端到端处理本地视频、USB 摄像头或 RTSP/HTTP 实时流，输出渲染视频与告警日志"""
         if max_frames is not None and (type(max_frames) is not int or max_frames < 0):
             raise ValueError("max_frames 必须是 >= 0 的整数")
+        # 拒绝空白输出目录字符串，防止 Path("") 解析为当前工作目录 '.' 并污染工作区。
+        if isinstance(output_dir, str) and not output_dir.strip():
+            raise ValueError("输出目录不能为空")
 
         capture_arg, src_label, is_live_stream = parse_video_source(video_path)
         out_dir = Path(output_dir).expanduser().resolve()
@@ -908,6 +917,9 @@ class ConflictPerceptionPipeline:
         """从已有 tracks.jsonl 离线复盘测速、TTC 与事件去抖（无需重跑检测与跟踪）。"""
         if max_frames is not None and (type(max_frames) is not int or max_frames < 0):
             raise ValueError("max_frames 必须是 >= 0 的整数")
+        # 拒绝空白输出目录字符串，防止 Path("") 解析为当前工作目录 '.' 并污染工作区。
+        if isinstance(output_dir, str) and not output_dir.strip():
+            raise ValueError("输出目录不能为空")
         # 拒绝空字符串路径，避免 Path("") 解析成当前工作目录 '.'。
         if isinstance(tracks_path, str) and not tracks_path.strip():
             raise ValueError("tracks.jsonl 路径不能为空")

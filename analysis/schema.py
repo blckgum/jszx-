@@ -363,6 +363,9 @@ def validate_ablation(data):
 def validate_run(run_dir: str | Path) -> dict:
     # 先校验 summary.json 获取运行状态：status=="ok" 时要求完整产物齐全，
     # 失败或中断目录仍校验已落盘的局部文件（如 summary/configuration/已刷盘事件），但不强求全套文件。
+    # 拒绝空白路径字符串，防止 Path("") 解析成当前目录 '.'。
+    if isinstance(run_dir, str) and not run_dir.strip():
+        raise SchemaValidationError("运行目录不能为空")
     root = Path(run_dir).expanduser().resolve()
     if not root.is_dir():
         raise SchemaValidationError(f"运行目录不存在: {root}")
@@ -435,6 +438,9 @@ def validate_batch_summary(data):
 
 
 def validate_batch_run(batch_dir: str | Path) -> dict:
+    # 拒绝空白路径字符串，防止 Path("") 解析成当前目录 '.'。
+    if isinstance(batch_dir, str) and not batch_dir.strip():
+        raise SchemaValidationError("批量运行目录不能为空")
     root = Path(batch_dir).expanduser().resolve()
     if not root.is_dir():
         raise SchemaValidationError(f"批量运行目录不存在: {root}")

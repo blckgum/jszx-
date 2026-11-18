@@ -231,6 +231,9 @@ class RoadCalibrator:
     @classmethod
     def from_yaml(cls, yaml_path: str | Path) -> "RoadCalibrator":
         """从已保存的 YAML 配置文件载入标定矩阵"""
+        # 拒绝空路径字符串，防止 Path("") 解析成当前目录 '.' 触发目录读取异常。
+        if isinstance(yaml_path, str) and not yaml_path.strip():
+            raise ValueError("标定配置文件路径不能为空")
         path = Path(yaml_path).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError(f"未找到标定配置文件: {path}")
@@ -297,6 +300,9 @@ class RoadCalibrator:
 
     def to_yaml(self, save_path: str | Path) -> Path:
         """持久化标定参数至 YAML 文件"""
+        # 拒绝空路径字符串，防止 Path("") 解析成当前目录 '.' 并尝试覆写目录。
+        if isinstance(save_path, str) and not save_path.strip():
+            raise ValueError("标定配置文件保存路径不能为空")
         path = Path(save_path).expanduser().resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
 

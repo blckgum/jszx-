@@ -251,6 +251,12 @@ def main(argv: list[str] | None = None):
         parser.error("--output 不能为空")
     if not args.calib.strip():
         parser.error("--calib 不能为空")
+    if not args.weights.strip():
+        parser.error("--weights 不能为空")
+    if not args.tracker.strip():
+        parser.error("--tracker 不能为空")
+    if not args.object_policy.strip():
+        parser.error("--object-policy 不能为空")
 
     calib_path = Path(args.calib).expanduser().resolve()
     synthetic_calib = None

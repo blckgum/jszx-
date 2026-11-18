@@ -56,6 +56,10 @@ def run_interactive_calibration(
         or length_m <= 0
     ):
         raise ValueError("道路的实际物理宽度和长度必须为大于 0 的有限正数（单位：米）")
+    if isinstance(source_path, str) and not source_path.strip():
+        raise ValueError("标定输入源路径不能为空")
+    if save_output and isinstance(output_path, str) and not output_path.strip():
+        raise ValueError("标定输出路径不能为空")
 
     src = Path(source_path).expanduser().resolve()
     if not src.is_file():
@@ -208,6 +212,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if not args.source.strip():
+        parser.error("--source 不能为空")
+    if not args.output.strip():
+        parser.error("--output 不能为空")
+    if args.validation_output is not None and not args.validation_output.strip():
+        parser.error("--validation-output 不能为空")
     if not (math.isfinite(args.width) and args.width > 0):
         parser.error("--width 必须为有限正数")
     if not (math.isfinite(args.length) and args.length > 0):

@@ -878,6 +878,120 @@ class CliSchemaEvaluateHardeningTests(unittest.TestCase):
             self.assertEqual(gt_res["speed_accuracy"]["matched_count"], 0)
             self.assertEqual(gt_res["event_accuracy"]["tp"], 0)
 
+    def test_pipeline_and_tools_reject_blank_paths_and_whitespace_track_fields(self):
+        from analysis.evaluate import load_ground_truth, main as evaluate_main
+        from analysis.interactive_calibrator import main as calib_main, run_interactive_calibration
+        from analysis.schema import validate_batch_run
+        from tracking.__main__ import main as tracking_main
+        from tracking.batch import track_directory
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pipe = ConflictPerceptionPipeline(calibrator=_sample_calibrator(), fps=10.0)
+            vpath = root / "clip.mp4"
+            _write_dummy_video(vpath, n_frames=2)
+            tracks_path = root / "tracks.jsonl"
+            _write_tracks_jsonl(tracks_path, [
+                _make_track_row(0, 0.0, [], width=64, height=64),
+            ])
+
+            clean_cwd = root / "clean_cwd"
+            clean_cwd.mkdir()
+            prev_cwd = Path.cwd()
+            try:
+                os.chdir(clean_cwd)
+                for bad_out in ("", "   ", "\t\n"):
+                    with self.subTest(bad_out=bad_out):
+                        with self.assertRaises(ValueError):
+                            pipe.process_video(vpath, bad_out)
+                        with self.assertRaises(ValueError):
+                            pipe.process_tracks(tracks_path, bad_out)
+                        with self.assertRaises(ValueError):
+                            track_directory(root, output=bad_out)
+                self.assertEqual(list(clean_cwd.iterdir()), [])
+
+                # 空白路径不得在各入口把 Path("") 解析成当前目录 '.'
+                for bad_path in ("", "   "):
+                    with self.assertRaises(ValueError):
+                        track_directory(bad_path)
+                    with self.assertRaises(ValueError):
+                        RoadCalibrator.from_yaml(bad_path)
+                    with self.assertRaises(ValueError):
+                        _sample_calibrator().to_yaml(bad_path)
+                    with self.assertRaises(ValueError):
+                        evaluate_run(bad_path)
+                    with self.assertRaises(ValueError):
+                        load_ground_truth(bad_path)
+                    with self.assertRaises(SchemaValidationError):
+                        validate_run(bad_path)
+                    with self.assertRaises(SchemaValidationError):
+                        validate_batch_run(bad_path)
+                    with self.assertRaises(ValueError):
+                        run_interactive_calibration(bad_path, 6.0, 15.0, save_output=False)
+                    with self.assertRaises(ValueError):
+                        run_interactive_calibration(
+                            vpath,
+                            6.0,
+                            15.0,
+                            output_path=bad_path,
+                            predefined_points=[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)],
+                            save_output=True,
+                        )
+            finally:
+                os.chdir(prev_cwd)
+
+            # CLI 空白路径参数检查
+            for bad_cli in (
+                ["--source", "x.mp4", "--demo", "--weights", "   "],
+                ["--source", "x.mp4", "--demo", "--tracker", ""],
+                ["--source", "x.mp4", "--demo", "--object-policy", ""],
+            ):
+                with self.subTest(bad_cli=bad_cli), self.assertRaises(SystemExit):
+                    analysis_main(bad_cli)
+            for bad_eval_cli in (
+                ["--run", "   "],
+                ["--run", str(root), "--ground-truth", ""],
+                ["--run", str(root), "--output", "   "],
+            ):
+                with self.subTest(bad_eval_cli=bad_eval_cli), self.assertRaises(SystemExit):
+                    evaluate_main(bad_eval_cli)
+            for bad_calib_cli in (
+                ["--source", "   "],
+                ["--source", str(vpath), "--output", ""],
+                ["--source", str(vpath), "--check-image-points", "1,1", "--check-ground-points", "1,1", "--validation-output", "   "],
+            ):
+                with self.subTest(bad_calib_cli=bad_calib_cli), self.assertRaises(SystemExit):
+                    calib_main(bad_calib_cli)
+            for bad_trk_cli in (["--source", ""], ["--source", str(vpath), "--output", "   "]):
+                with self.subTest(bad_trk_cli=bad_trk_cli), self.assertRaises(SystemExit):
+                    tracking_main(bad_trk_cli)
+
+            # tracks.jsonl 中纯空白 session_id / class_name / category 必须拦截，防止写出非法 speeds.csv
+            for bad_row, label in (
+                (_make_track_row(0, 0.0, [], session_id="   "), "blank_session"),
+                (
+                    _make_track_row(
+                        0,
+                        0.0,
+                        [{**_make_target_dict(1, 100.0), "class_name": "   "}],
+                    ),
+                    "blank_class_name",
+                ),
+                (
+                    _make_track_row(
+                        0,
+                        0.0,
+                        [{**_make_target_dict(1, 100.0), "category": "   "}],
+                    ),
+                    "blank_category",
+                ),
+            ):
+                with self.subTest(label=label):
+                    bad_tracks = root / f"{label}.jsonl"
+                    _write_tracks_jsonl(bad_tracks, [bad_row])
+                    with self.assertRaises(ValueError):
+                        pipe.process_tracks(bad_tracks, root / f"out_{label}")
+
 
 if __name__ == "__main__":
     unittest.main()

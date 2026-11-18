@@ -9,6 +9,11 @@ from .motion import DEFAULT_MOTION_CONFIG, read_motion_config
 
 
 def track_directory(source, *, output=None, **options):
+    # 拒绝空白输入/输出路径字符串，防止 Path("") 解析为当前工作目录 '.'。
+    if isinstance(source, str) and not source.strip():
+        raise ValueError("批量输入目录不能为空")
+    if isinstance(output, str) and not output.strip():
+        raise ValueError("批量输出目录不能为空")
     source = Path(source).expanduser().resolve()
     if not source.is_dir():
         raise ValueError("批量输入必须是本地目录")

@@ -173,6 +173,8 @@ def _validate_ground_truth(data) -> dict:
 
 def load_ground_truth(path: str | Path) -> dict:
     """加载并校验 JSON/YAML 格式的速度与事件人工真值文件。"""
+    if isinstance(path, str) and not path.strip():
+        raise ValueError("真值文件路径不能为空")
     gt_path = Path(path).expanduser().resolve()
     if not gt_path.is_file():
         raise FileNotFoundError(f"真值文件不存在: {gt_path}")
@@ -370,6 +372,11 @@ def evaluate_run(
     ground_truth: str | Path | dict | None = None,
 ) -> dict:
     """读取运行产物，返回描述性指标；提供人工真值时同时计算准确率与测速误差。"""
+    # 拒绝空字符串目录，防止 Path("") 解析成当前工作目录 '.'。
+    if isinstance(run_dir, str) and not run_dir.strip():
+        raise ValueError("运行输出目录不能为空")
+    if isinstance(ground_truth, str) and not ground_truth.strip():
+        raise ValueError("真值文件路径不能为空")
     root = Path(run_dir).expanduser().resolve()
     if not root.is_dir():
         raise FileNotFoundError(f"运行目录不存在: {root}")
@@ -511,6 +518,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--markdown", action="store_true", help="输出简短 Markdown 而不是 JSON")
     parser.add_argument("--validate", action="store_true", help="评价前严格校验当前输出契约")
     args = parser.parse_args(argv)
+    if not args.run.strip():
+        parser.error("--run 不能为空")
+    if args.ground_truth is not None and not args.ground_truth.strip():
+        parser.error("--ground-truth 不能为空")
+    if args.output is not None and not args.output.strip():
+        parser.error("--output 不能为空")
     result = evaluate_run(args.run, validate=args.validate, ground_truth=args.ground_truth)
     content = (
         to_markdown(result)
