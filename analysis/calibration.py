@@ -23,6 +23,7 @@ def _validate_point_2d(pt, label: str) -> Tuple[float, float]:
     if not isinstance(pt, (list, tuple)) or len(pt) != 2:
         raise ValueError(f"{label}必须是长度为 2 的坐标对")
     x, y = pt
+    # 用精确 type() 检查而非 isinstance(..., (int, float))，防止 bool(True/False) 混入坐标。
     if (
         type(x) not in (int, float)
         or type(y) not in (int, float)
@@ -39,10 +40,18 @@ def _validate_polygon_2d(poly, name: str = "多边形") -> List[Tuple[float, flo
 
 
 def _point_in_polygon(x: float, y: float, polygon: List[Tuple[float, float]]) -> bool:
-    if not (math.isfinite(x) and math.isfinite(y)) or len(polygon) < 3:
+    if (
+        isinstance(x, bool)
+        or isinstance(y, bool)
+        or not isinstance(x, (int, float))
+        or not isinstance(y, (int, float))
+        or not (math.isfinite(x) and math.isfinite(y))
+        or len(polygon) < 3
+    ):
         return False
     n = len(polygon)
-    # 边界点视为在区域内
+    # 先做边段最近点距离检查：落在多边形边界上（1e-9 米容差内）一律视为在区域内，
+    # 避免射线法在顶点或水平边上的浮点边界歧义。
     for i in range(n):
         x1, y1 = polygon[i]
         x2, y2 = polygon[(i + 1) % n]
@@ -55,6 +64,7 @@ def _point_in_polygon(x: float, y: float, polygon: List[Tuple[float, float]]) ->
             t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / seg_len_sq))
             if math.hypot(x - (x1 + t * dx), y - (y1 + t * dy)) <= 1e-9:
                 return True
+    # 标准射线法（Ray-Casting）：仅当边跨越水平线 y 时才求交点，因此必有 yj != yi，不会除零。
     inside = False
     j = n - 1
     for i in range(n):
@@ -118,6 +128,8 @@ class RoadCalibrator:
             for idx, pt in enumerate(image_points)
         ]
 
+        # 连续相邻两边的二维叉积符号必须严格一致（全正或全负）：
+        # 既兼容顺时针/逆时针两种标定顺序，又能拦截共线、重合、凹四边形和蝴蝶自交叉退化。
         crosses: List[float] = []
         for i in range(4):
             x_i, y_i = parsed_points[i]
@@ -130,6 +142,7 @@ class RoadCalibrator:
         if not (all(c > 1e-3 for c in crosses) or all(c < -1e-3 for c in crosses)):
             raise ValueError("4 个标定角点必须构成严格凸四边形（不可共线、重复、凹陷或自交叉）")
 
+        # 鞋带公式计算像素多边形面积，拦截极微小退化选区。
         area = 0.5 * abs(
             sum(
                 parsed_points[i][0] * parsed_points[(i + 1) % 4][1]
@@ -191,15 +204,20 @@ class RoadCalibrator:
         if not np.isfinite(self.H_inv).all():
             raise ValueError("逆单应性矩阵包含非有限数值")
 
+        # 矩阵条件数过大意味着角点几何极度狭长或接近奇异，微小的像素框抖动会被放大成巨大米制误差。
         cond_h = float(np.linalg.cond(self.H))
         if not math.isfinite(cond_h) or cond_h >= 1e12:
             raise ValueError(f"单应性矩阵条件数过大 ({cond_h:.3e})，请检查 4 个标定角点是否退化")
 
+        # 校验 4 个拟合角点的地面投影精度，确保 float32 求解的 H 数值稳定。
         for (u, v), (gx, gy) in zip(self.image_points, self.ground_points):
             px, py = self.pixel_to_ground(u, v)
             if not (math.isfinite(px) and math.isfinite(py)) or math.hypot(px - gx, py - gy) >= 1e-2:
                 raise ValueError("标定角点往返投影误差超过 1e-2 米，单应性变换数值无效")
 
+        # 记录相机前方地面对应的逆投影齐次尺度 w 符号（cheirality 参考符号）：
+        # 当外推点越过地平线落到相机主平面后方时，w 会反号并把像素折返到画面上方天空，
+        # 后续 ground_to_pixel_checked 据此过滤相机后方伪影点。
         w_signs: List[int] = []
         for gx, gy in self.ground_points:
             w = float((self.H_inv @ np.array([gx, gy, 1.0], dtype=np.float64))[2])
@@ -317,13 +335,18 @@ class RoadCalibrator:
         ):
             return float("nan"), float("nan")
         p_img = np.array([float(u), float(v), 1.0], dtype=np.float64).reshape(3, 1)
-        p_ground = self.H @ p_img
+        with np.errstate(over="ignore", invalid="ignore"):
+            p_ground = self.H @ p_img
         scale = float(p_ground[2, 0])
+        # 地平线附近齐次分量趋近于 0，透视除法会发散，返回 NaN 交给上游安全丢弃。
         if not math.isfinite(scale) or abs(scale) < 1e-8:
             return float("nan"), float("nan")
 
-        x_m = float(p_ground[0, 0] / scale)
-        y_m = float(p_ground[1, 0] / scale)
+        with np.errstate(over="ignore", invalid="ignore"):
+            x_m = float(p_ground[0, 0] / scale)
+            y_m = float(p_ground[1, 0] / scale)
+        if not (math.isfinite(x_m) and math.isfinite(y_m)):
+            return float("nan"), float("nan")
         return x_m, y_m
 
     def ground_to_pixel_checked(self, x: float, y: float) -> Optional[Tuple[int, int]]:
@@ -339,8 +362,10 @@ class RoadCalibrator:
         ):
             return None
         p_g = np.array([float(x), float(y), 1.0], dtype=np.float64).reshape(3, 1)
-        p_img = self.H_inv @ p_g
+        with np.errstate(over="ignore", invalid="ignore"):
+            p_img = self.H_inv @ p_g
         scale = float(p_img[2, 0])
+        # 既拦截近地平线奇异点 (|w| < 1e-6)，也拦截跨越相机主平面跑到相机后方的点 (w 与前方反号)。
         if (
             not math.isfinite(scale)
             or abs(scale) < 1e-6
@@ -348,8 +373,10 @@ class RoadCalibrator:
         ):
             return None
 
-        u_f = float(p_img[0, 0] / scale)
-        v_f = float(p_img[1, 0] / scale)
+        with np.errstate(over="ignore", invalid="ignore"):
+            u_f = float(p_img[0, 0] / scale)
+            v_f = float(p_img[1, 0] / scale)
+        # 限制绝对像素范围，防止超大坐标在传入 OpenCV int32 绘图接口时触发溢出崩溃。
         if (
             not (math.isfinite(u_f) and math.isfinite(v_f))
             or abs(u_f) > 1_000_000
@@ -361,13 +388,20 @@ class RoadCalibrator:
     def ground_to_pixel(self, x: float, y: float) -> Tuple[int, int]:
         """逆向几何变换：将道路米制坐标 (X, Y) 投射回图像像素坐标 (u, v)"""
         pt = self.ground_to_pixel_checked(x, y)
+        # 保持旧接口契约：无效点及画幅左/上方负像素坐标统一返回 (-1, -1)。
         if pt is None or pt[0] < 0 or pt[1] < 0:
             return -1, -1
         return pt
 
     def is_in_zone(self, x: float, y: float, margin_m: float = 2.0) -> bool:
         """判断目标地面坐标是否处于重点受控监测区域内（带冗余边距缓冲）"""
-        if not (math.isfinite(x) and math.isfinite(y)):
+        if (
+            isinstance(x, bool)
+            or isinstance(y, bool)
+            or not isinstance(x, (int, float))
+            or not isinstance(y, (int, float))
+            or not (math.isfinite(x) and math.isfinite(y))
+        ):
             return False
         return (
             (-margin_m <= x <= self.width_m + margin_m)
@@ -378,6 +412,8 @@ class RoadCalibrator:
         self, pixel_polygon: List[Tuple[float, float]]
     ) -> List[Tuple[float, float]]:
         """将图像像素多边形投射为地面米制停车区并登记。"""
+        # 停车区以图像像素多边形录入后，立即通过单应性 H 转换为地面米制坐标留档：
+        # 这样无论后续是否缩放渲染分辨率，物理多边形边界与车辆接地坐标始终处于同一米制坐标系。
         parsed = _validate_polygon_2d(pixel_polygon, name="像素停车区")
         ground_poly: List[Tuple[float, float]] = []
         for u, v in parsed:
@@ -415,6 +451,8 @@ class RoadCalibrator:
             for idx, pt in enumerate(check_ground_points)
         ]
 
+        # 独立检查点不得与参与求解 H 的 4 个标定角点重合，也不得自身重复，
+        # 否则测得的是训练角点拟合残差而非真实地面投影误差。
         for idx, (u, v) in enumerate(parsed_img):
             if any(math.hypot(u - fu, v - fv) < 1e-6 for fu, fv in self.image_points) or any(
                 math.hypot(u - pu, v - pv) < 1e-6 for pu, pv in parsed_img[:idx]

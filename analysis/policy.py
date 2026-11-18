@@ -44,6 +44,7 @@ def read_object_policy_config(path: str | Path = DEFAULT_OBJECT_POLICY_CONFIG) -
         data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
         raise ValueError(f"对象策略 YAML 格式错误: {exc}") from None
+    # 精确校验 schema_version 为整数 1（排除 True/1.0），避免把配置版本错误静默放行。
     if (
         not isinstance(data, dict)
         or type(data.get("schema_version")) is not int
@@ -62,11 +63,13 @@ def read_object_policy_config(path: str | Path = DEFAULT_OBJECT_POLICY_CONFIG) -
         label = values.get("label")
         if not isinstance(kind, str) or not kind.strip():
             raise ValueError(f"对象策略 {name} 的 kind 无效")
+        # 拒绝 bool 与 NaN/Inf，确保安全半径为有限正数。
         if type(radius) not in (int, float) or not math.isfinite(radius) or radius <= 0:
             raise ValueError(f"对象策略 {name} 的 safe_radius_veh_m 必须为有限正数")
         if not isinstance(label, str) or not label.strip():
             raise ValueError(f"对象策略 {name} 的 label 无效")
-        policies[name.lower()] = ObjectPolicy(kind, float(radius), label)
+        policies[name.strip().lower()] = ObjectPolicy(kind.strip(), float(radius), label.strip())
+    # 强制保留基础行人/机动车兜底键，防止未知类别回退时找不到默认半径。
     for required in ("person", "pedestrian", "vehicle", "motor_vehicle"):
         if required not in policies:
             raise ValueError(f"对象策略缺少必需类别: {required}")
@@ -80,9 +83,11 @@ def object_policy(
 ) -> ObjectPolicy:
     """将模型类别映射到稳定策略；未知车辆保守使用机动车半径。"""
     policies = policies or POLICIES
+    # 粗分类已判定为行人或细分标签为行人时，优先走行人包络策略。
     if category in ("pedestrian", "person"):
         return policies.get("pedestrian", PEDESTRIAN_POLICY)
     key = (class_name or "vehicle").strip().lower()
     if key in ("person", "pedestrian"):
         return policies.get("pedestrian", PEDESTRIAN_POLICY)
+    # 未收录的车辆子类保守回退到普通机动车半径，避免低估碰撞包络。
     return policies.get(key, policies.get("vehicle", POLICIES["vehicle"]))

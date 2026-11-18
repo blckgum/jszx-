@@ -241,6 +241,16 @@ def main(argv: list[str] | None = None):
         parser.error("--parking-speed 必须为有限非负数")
     if args.source is None and args.tracks is None:
         parser.error("必须至少指定 --source 或 --tracks")
+    # 提前拒绝空白路径字符串：Python 中 Path("") 等价于当前目录 '.'，
+    # 若不拦截会把 --source "" 误判为对当前工作目录执行批量分析。
+    if args.source is not None and not args.source.strip():
+        parser.error("--source 不能为空")
+    if args.tracks is not None and not args.tracks.strip():
+        parser.error("--tracks 不能为空")
+    if args.output is not None and not args.output.strip():
+        parser.error("--output 不能为空")
+    if not args.calib.strip():
+        parser.error("--calib 不能为空")
 
     calib_path = Path(args.calib).expanduser().resolve()
     synthetic_calib = None
@@ -281,6 +291,8 @@ def main(argv: list[str] | None = None):
         )
         calibrator = synthetic_calib
 
+    # 仅在未指定 --tracks 且 --source 为本地普通目录时走目录批量运行器；
+    # 推流 URL（rtsp/http）与摄像头数字索引一律视为实时流而非目录。
     out_dir = args.output
     source_is_dir = (
         args.tracks is None
@@ -294,9 +306,11 @@ def main(argv: list[str] | None = None):
         prefix = "batch" if source_is_dir else "run"
         out_dir = str((Path("runs") / "analysis" / f"{prefix}-{timestamp}").resolve())
     else:
+        # 提前展开 '~' 并解析为绝对路径，避免在当前目录误建名为 '~' 的文件夹。
         out_dir = str(Path(out_dir).expanduser().resolve())
 
     def _save_synthetic_calib():
+        # 仅在主流程成功完成且使用了内存合成标定时才将占位参数留档到输出目录。
         if synthetic_calib is not None:
             Path(out_dir).mkdir(parents=True, exist_ok=True)
             synthetic_calib.to_yaml(Path(out_dir) / "calibration.synthetic.yaml")
@@ -349,8 +363,10 @@ def main(argv: list[str] | None = None):
             **pipeline_kwargs,
         )
         _save_synthetic_calib()
+        # 只要批量中有单段失败或中断（completed_with_errors / interrupted / stopped），均返回非零退出码。
         return 0 if batch_summary["status"] == "completed" else 1
 
+    # 离线复盘模式 (--tracks) 跳过检测与跟踪，支持可选 --source 本地视频仅作同步画面叠加。
     pipeline = ConflictPerceptionPipeline(calibrator=calibrator, **pipeline_kwargs)
     if args.tracks is not None:
         pipeline.process_tracks(

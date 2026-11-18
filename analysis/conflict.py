@@ -43,6 +43,7 @@ class ConflictAssessment:
 
 
 def _is_finite_number(value) -> bool:
+    # 显式排除 bool，防止 True/False 作为 int 子类通过参数校验。
     return (
         type(value) is not bool
         and isinstance(value, (int, float))
@@ -52,6 +53,7 @@ def _is_finite_number(value) -> bool:
 
 def _conflict_sort_key(c: ConflictAssessment):
     """冲突项比较键：先按风险等级，同等级按 TTC 越小越紧急"""
+    # 用 is not None 判断而非布尔真值，确保 ttc_seconds == 0.0 不会被误回退成 999.0。
     return (
         int(c.risk_level),
         -(c.ttc_seconds if c.ttc_seconds is not None else 999.0),
@@ -120,6 +122,16 @@ class ConflictAnalyzer:
         self, veh: SpeedReading, ped: SpeedReading
     ) -> Optional[ConflictAssessment]:
         """评估单一机动车与单一横穿行人之间的潜在几何冲突"""
+        # 拒绝任意 NaN/Inf 运动学输入，防止 NaN 在后续比较中悄悄绕过边界判定。
+        if not all(
+            _is_finite_number(v)
+            for v in (
+                veh.x_m, veh.y_m, veh.vx_ms, veh.vy_ms, veh.speed_kmh,
+                ped.x_m, ped.y_m, ped.vx_ms, ped.vy_ms, ped.speed_ms,
+            )
+        ):
+            return None
+
         dx = ped.x_m - veh.x_m
         dy = ped.y_m - veh.y_m
         current_dist = math.hypot(dx, dy)
@@ -140,6 +152,7 @@ class ConflictAnalyzer:
         if veh.in_parking_zone and veh.is_reliable and veh.speed_kmh <= self.parking_zone_max_speed_kmh:
             return None
 
+        # 按车辆细分子类策略取对应几何包络半径；默认未覆盖策略时沿用分析器自身 safe_radius_veh_m。
         vehicle_policy = object_policy(veh.object_kind, veh.category, self.object_policies)
         veh_radius_m = (
             self.safe_radius_veh_m
@@ -179,7 +192,8 @@ class ConflictAnalyzer:
         conflict_x = veh.x_m + veh.vx_ms * t_cpa
         conflict_y = veh.y_m + veh.vy_ms * t_cpa
 
-        # 分级风险研判
+        # 分级风险研判：核心包络内按 TTC 划分紧急(L3)/注意(L2)；
+        # 若横向余量在 1.5 倍安全半径内且位于注意时域内，同样提示注意擦碰(L2)。
         if min_dist <= critical_dist_m:
             if t_cpa <= self.ttc_critical_s:
                 level = RiskLevel.LEVEL_3_CRITICAL
@@ -188,6 +202,7 @@ class ConflictAnalyzer:
                 level = RiskLevel.LEVEL_2_CAUTION
                 desc = f"注意减速礼让行人 (TTC={t_cpa:.1f}s, 轨迹汇聚)"
             else:
+                # 位于 (ttc_caution_s, horizon_s] 区间但尚未进入注意预警时域，暂不告警。
                 return None
         elif min_dist <= critical_dist_m * 1.5 and t_cpa <= self.ttc_caution_s:
             level = RiskLevel.LEVEL_2_CAUTION
@@ -214,12 +229,20 @@ class ConflictAnalyzer:
     ) -> List[ConflictAssessment]:
         """全场景多目标批量冲突评估"""
         vehicles = [r for r in readings if r.category == "vehicle"]
-        pedestrians = [r for r in readings if r.category == "pedestrian"]
+        pedestrians = [r for r in readings if r.category in ("pedestrian", "person")]
 
         assessments: List[ConflictAssessment] = []
 
         # 遍历所有车辆
         for veh in vehicles:
+            # 跳过任意运动学字段非有限的车辆读数：否则 evaluate_pair 拒绝研判后会落入 else
+            # 分支生成含 NaN speed_kmh 的 LEVEL_0_SAFE 记录，不仅失实且会在严格 JSON 落盘时崩溃。
+            if not all(
+                _is_finite_number(v)
+                for v in (veh.x_m, veh.y_m, veh.vx_ms, veh.vy_ms, veh.speed_kmh)
+            ):
+                continue
+
             highest_conflict: Optional[ConflictAssessment] = None
 
             # 评估与视野内所有行人的交互
@@ -248,7 +271,7 @@ class ConflictAnalyzer:
             veh_kind = object_policy(veh.object_kind, veh.category, self.object_policies).kind
             if highest_conflict is not None:
                 assessments.append(highest_conflict)
-            elif veh.category == "vehicle" and veh.speed_kmh > self.speed_limit_kmh:
+            elif veh.category == "vehicle" and _is_finite_number(veh.speed_kmh) and veh.speed_kmh > self.speed_limit_kmh:
                 # 用本分析器自身的限速值重判而非信任 reading.is_speeding：
                 # 独立使用 ConflictAnalyzer 时两侧限速参数可能不一致
                 # 独立超速判定分支：车辆超速 30 km/h，但前方暂无相交行人

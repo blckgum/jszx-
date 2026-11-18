@@ -702,6 +702,182 @@ class CliSchemaEvaluateHardeningTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 evaluate_run(root, validate=False)
 
+            # JSON 溢出字面量 1e309 (解析为 inf) 同样必须在 validate=False 下被拒绝
+            (root / "events.jsonl").write_text('{"event_id": 1, "duration_s": 1e309}\n', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                evaluate_run(root, validate=False)
+
+    def test_process_tracks_rejects_live_video_and_mismatched_metadata_and_keeps_zero_ttc(self):
+        from analysis.conflict import ConflictAssessment, RiskLevel
+        from analysis.evaluate import evaluate_ground_truth
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tracks_path = root / "tracks.jsonl"
+            _write_tracks_jsonl(tracks_path, [
+                _make_track_row(0, 0.0, [_make_target_dict(1, 100.0)], width=64, height=64),
+            ])
+            pipe = ConflictPerceptionPipeline(calibrator=_sample_calibrator(), fps=10.0)
+
+            for bad_source in ("0", "camera:0", "rtsp://127.0.0.1/live", True):
+                with self.subTest(bad_source=bad_source):
+                    with self.assertRaises(ValueError):
+                        pipe.process_tracks(tracks_path, root / "out_bad", video_path=bad_source)
+
+            # 容器元数据分辨率为 0 或与实际解码帧尺寸不匹配时必须报错
+            bad_cap = mock.Mock()
+            bad_cap.isOpened.return_value = True
+            bad_cap.get.side_effect = lambda prop: {
+                cv2.CAP_PROP_FPS: 10.0,
+                cv2.CAP_PROP_FRAME_WIDTH: 0.0,
+                cv2.CAP_PROP_FRAME_HEIGHT: 0.0,
+            }.get(prop, 0.0)
+            with mock.patch("analysis.pipeline.cv2.VideoCapture", return_value=bad_cap):
+                with self.assertRaisesRegex(RuntimeError, "分辨率元数据"):
+                    pipe.process_tracks(tracks_path, root / "out_zero_wh", video_path=root / "v.mp4")
+
+            # speeds.csv 在 ttc_seconds == 0.0 时必须写出 0.0 而非空字符串
+            zero_ttc_assessment = ConflictAssessment(
+                veh_track_id=1, ped_track_id=2, risk_level=RiskLevel.LEVEL_3_CRITICAL,
+                risk_desc="now", veh_speed_kmh=25.0, ped_speed_ms=1.0,
+                current_distance_m=0.2, min_distance_m=0.0, ttc_seconds=0.0,
+                conflict_ground_xy=(5.0, 10.0),
+            )
+            out_zero_ttc = root / "out_zero_ttc"
+            with mock.patch.object(pipe.conflict_analyzer, "analyze_frame", return_value=[zero_ttc_assessment]):
+                pipe.process_tracks(tracks_path, out_zero_ttc)
+            with (out_zero_ttc / "speeds.csv").open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(rows[0]["ttc_s"], "0.0")
+
+            # evaluate_ground_truth 忽略起止倒挂的无效事件记录
+            gt_res = evaluate_ground_truth(
+                {
+                    "schema_version": 1,
+                    "expected_events": [{
+                        "kind": "conflict", "veh_track_id": 1, "ped_track_id": 2,
+                        "start_timestamp_s": 1.0, "end_timestamp_s": 2.0,
+                    }],
+                },
+                speeds=[],
+                events=[{
+                    "kind": "conflict", "veh_track_id": 1, "ped_track_id": 2,
+                    "start_timestamp_s": 5.0, "end_timestamp_s": 1.0,
+                }],
+            )
+            self.assertEqual(gt_res["event_accuracy"]["tp"], 0)
+
+    def test_video_and_tracks_reject_empty_paths_frame_size_mismatch_and_bool_gt(self):
+        from analysis.batch import analyze_directory
+        from analysis.evaluate import evaluate_ground_truth
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pipe = ConflictPerceptionPipeline(calibrator=_sample_calibrator(), fps=10.0)
+
+            # 1) 空字符串输入源/路径不得被 Path("") 解析为当前目录
+            for bad_cli in (
+                ["--source", "", "--demo"],
+                ["--tracks", "", "--demo"],
+                ["--source", "x.mp4", "--demo", "--output", ""],
+            ):
+                with self.subTest(bad_cli=bad_cli), self.assertRaises(SystemExit):
+                    analysis_main(bad_cli)
+            with self.assertRaises(ValueError):
+                analyze_directory("", calibrator=_sample_calibrator())
+            with self.assertRaises(ValueError):
+                analyze_directory("   ", calibrator=_sample_calibrator())
+            valid_video_dir = root / "batch_src"
+            valid_video_dir.mkdir()
+            _write_dummy_video(valid_video_dir / "clip.mp4", n_frames=2)
+            clean_cwd = root / "clean_cwd"
+            clean_cwd.mkdir()
+            prev_cwd = Path.cwd()
+            try:
+                os.chdir(clean_cwd)
+                for bad_out in ("", "   ", "\t\n"):
+                    with self.subTest(bad_out=bad_out), self.assertRaises(ValueError):
+                        analyze_directory(
+                            valid_video_dir,
+                            calibrator=_sample_calibrator(),
+                            output_dir=bad_out,
+                        )
+                self.assertFalse((clean_cwd / "batch_summary.json").exists())
+                self.assertEqual(list(clean_cwd.iterdir()), [])
+            finally:
+                os.chdir(prev_cwd)
+            tracks_path = root / "tracks.jsonl"
+            _write_tracks_jsonl(tracks_path, [
+                _make_track_row(0, 0.0, [], width=32, height=32),
+            ])
+            with self.assertRaises(ValueError):
+                pipe.process_tracks(tracks_path, root / "out_empty_vid", video_path="   ")
+
+            # 2) process_video 拦截 0x0 容器元数据（不加载模型）以及 cap.get != cap.read 帧尺寸不匹配
+            zero_cap = mock.Mock()
+            zero_cap.isOpened.return_value = True
+            zero_cap.get.side_effect = lambda prop: {
+                cv2.CAP_PROP_FPS: 10.0,
+                cv2.CAP_PROP_FRAME_WIDTH: 0.0,
+                cv2.CAP_PROP_FRAME_HEIGHT: 0.0,
+            }.get(prop, 0.0)
+            with mock.patch("analysis.pipeline.cv2.VideoCapture", return_value=zero_cap), \
+                    mock.patch("analysis.pipeline.TrackingSession") as m_sess:
+                with self.assertRaisesRegex(RuntimeError, "分辨率元数据"):
+                    pipe.process_video(root / "v.mp4", root / "out_pv_zero")
+            m_sess.assert_not_called()
+
+            mismatch_cap = mock.Mock()
+            mismatch_cap.isOpened.return_value = True
+            mismatch_cap.get.side_effect = lambda prop: {
+                cv2.CAP_PROP_FPS: 10.0,
+                cv2.CAP_PROP_FRAME_WIDTH: 64.0,
+                cv2.CAP_PROP_FRAME_HEIGHT: 64.0,
+            }.get(prop, 0.0)
+            mismatch_cap.read.return_value = (True, np.zeros((32, 32, 3), dtype=np.uint8))
+            fake_writer = mock.Mock()
+            fake_writer.isOpened.return_value = True
+            fake_session = mock.Mock()
+            with mock.patch("analysis.pipeline.cv2.VideoCapture", return_value=mismatch_cap), \
+                    mock.patch("analysis.pipeline.cv2.VideoWriter", return_value=fake_writer), \
+                    mock.patch("analysis.pipeline.TrackingSession", return_value=fake_session):
+                with self.assertRaisesRegex(RuntimeError, "实际解码帧分辨率"):
+                    pipe.process_video(root / "v.mp4", root / "out_pv_mismatch")
+            fake_session.process.assert_not_called()
+
+            # 3) process_tracks 拦截 cap.get(64x64) != cap.read(32x32) 即使 tracks 也是 32x32
+            mismatch_cap.read.return_value = (True, np.zeros((32, 32, 3), dtype=np.uint8))
+            with mock.patch("analysis.pipeline.cv2.VideoCapture", return_value=mismatch_cap), \
+                    mock.patch("analysis.pipeline.cv2.VideoWriter", return_value=fake_writer):
+                with self.assertRaisesRegex(RuntimeError, "容器元数据不一致"):
+                    pipe.process_tracks(tracks_path, root / "out_pt_mismatch", video_path=root / "v.mp4")
+
+            # 4) evaluate_ground_truth 忽略 bool/负数预测字段，防止 True==1 误匹配
+            gt_res = evaluate_ground_truth(
+                {
+                    "schema_version": 1,
+                    "speed_references": [{"track_id": 1, "reference_speed_kmh": 20.0}],
+                    "expected_events": [{
+                        "kind": "conflict", "veh_track_id": 1, "ped_track_id": 2,
+                        "start_timestamp_s": 0.0, "end_timestamp_s": 2.0,
+                    }],
+                },
+                speeds=[
+                    {"track_id": True, "timestamp_s": 0.5, "speed_kmh": 20.0, "is_reliable": "1"},
+                    {"track_id": 1, "timestamp_s": False, "speed_kmh": 20.0, "is_reliable": "1"},
+                ],
+                events=[
+                    {"kind": "conflict", "veh_track_id": True, "ped_track_id": 2,
+                     "start_timestamp_s": 0.5, "end_timestamp_s": 1.5},
+                    {"kind": "conflict", "veh_track_id": 1, "ped_track_id": 2,
+                     "start_timestamp_s": False, "end_timestamp_s": True},
+                    {"kind": "conflict", "veh_track_id": 1, "ped_track_id": 2,
+                     "start_timestamp_s": -1.0, "end_timestamp_s": 1.0},
+                ],
+            )
+            self.assertEqual(gt_res["speed_accuracy"]["matched_count"], 0)
+            self.assertEqual(gt_res["event_accuracy"]["tp"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

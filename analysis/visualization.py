@@ -48,6 +48,8 @@ class EnhancedConflictVisualizer:
 
     def _project_ground_point(self, x: float, y: float) -> Optional[Tuple[int, int]]:
         """优先调用 ground_to_pixel_checked 投射地面点，缺失时安全回退 ground_to_pixel。"""
+        # 优先使用带相机前方检查与地平线溢出防护的接口，防止折返画到天空或触发 OpenCV int32 溢出；
+        # 同时也兼容仅提供旧版 ground_to_pixel() 的自定义/Mock 标定对象。
         checked_fn = getattr(self.calibrator, "ground_to_pixel_checked", None)
         if callable(checked_fn):
             pt = checked_fn(x, y)
@@ -62,6 +64,7 @@ class EnhancedConflictVisualizer:
         if pt is None:
             return None
         u, v = int(pt[0]), int(pt[1])
+        # 旧版接口把无效点和负坐标都编码成 (-1, -1)，这里统一拦截。
         if u < 0 or v < 0 or abs(u) > 1_000_000 or abs(v) > 1_000_000:
             return None
         return (u, v)
@@ -75,6 +78,8 @@ class EnhancedConflictVisualizer:
         cv2.polylines(frame, [pts], isClosed=True, color=(0, 220, 255), thickness=2)
 
         for zone in getattr(self.calibrator, "parking_zones", ()):
+            # 只要停车区在相机前方且未近地平线溢出就照常绘制（允许局部越过左/上画幅边界）；
+            # 若任意顶点投射为 None（落在地平线后方或严重溢出），整块跳过以防几何错乱。
             px_pts = [self._project_ground_point(gx, gy) for gx, gy in zone]
             if any(pt is None for pt in px_pts):
                 continue
@@ -188,7 +193,8 @@ class EnhancedConflictVisualizer:
         提供时按 provisional（未确认瞬时帧）/confirmed（已确认事件）区分标注"""
         h, w = frame.shape[:2]
 
-        # 确定当前帧最高风险等级：优先风险级别 -> 已确认事件 -> 最小 TTC
+        # 确定当前帧最高风险等级：依次按 风险级别 -> 是否已通过事件确认 -> 最小 TTC 排序，
+        # 确保已确认告警不会被同等级、刚冒头的瞬时更小 TTC 闪断掩盖。
         max_level = RiskLevel.LEVEL_0_SAFE
         primary_conflict: Optional[ConflictAssessment] = None
         best_key: Optional[Tuple[int, int, float]] = None

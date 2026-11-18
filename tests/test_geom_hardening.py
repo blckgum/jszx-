@@ -506,6 +506,167 @@ class TestConflictEventsAndCalibratorCliHardening(unittest.TestCase):
             report = json.loads(val_json.read_text(encoding="utf-8"))
             self.assertEqual(report["count"], 1)
 
+            # 仅传 --validation-output 而未传检查点坐标对时必须显式报错，不得静默忽略
+            with self.assertRaises(SystemExit):
+                calib_main([
+                    "--source", str(img_path),
+                    "--points", "400,300,880,300,1150,680,130,680",
+                    "--validation-output", str(val_json),
+                    "--output", str(out_yaml),
+                ])
+
+    def test_pixel_to_ground_overflow_and_bool_zone_and_person_alias_guards(self):
+        from analysis.scenarios import _reading
+
+        cal = RoadCalibrator(
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            width_m=100.0,
+            length_m=100.0,
+        )
+        cal.parking_zones = [[(0.0, 0.0), (2.0, 0.0), (2.0, 5.0), (0.0, 5.0)]]
+        gx, gy = cal.pixel_to_ground(1e308, 0.0)
+        self.assertTrue(math.isnan(gx) and math.isnan(gy))
+        self.assertIsNone(cal.ground_to_pixel_checked(1e308, 0.0))
+        self.assertFalse(cal.is_in_zone(True, False))
+        self.assertFalse(cal.is_in_parking_zone(True, False))
+
+        # TrackMotionTracker 与 ConflictAnalyzer 对 category='person' 保持与 'pedestrian' 一致
+        tracker = TrackMotionTracker(2, "person")
+        for i in range(6):
+            r_person = tracker.update(i * 0.1, 3.0, (i % 2) * 0.01)
+        self.assertEqual(r_person.speed_kmh, 0.0)
+
+        analyzer = ConflictAnalyzer()
+        nan_veh = SpeedReading(
+            track_id=1, category="vehicle", object_kind="car",
+            x_m=3.0, y_m=0.0, vx_ms=float("inf"), vy_ms=5.0,
+            speed_ms=5.0, speed_kmh=18.0, is_speeding=False,
+            heading_deg=90.0, is_reliable=True,
+        )
+        ped_person = SpeedReading(
+            track_id=2, category="person", object_kind="pedestrian",
+            x_m=3.0, y_m=5.0, vx_ms=0.0, vy_ms=0.0,
+            speed_ms=0.0, speed_kmh=0.0, is_speeding=False,
+            heading_deg=0.0, is_reliable=True,
+        )
+        self.assertIsNone(analyzer.evaluate_pair(nan_veh, ped_person))
+
+        ok_veh = SpeedReading(
+            track_id=1, category="vehicle", object_kind="car",
+            x_m=3.0, y_m=0.0, vx_ms=0.0, vy_ms=6.0,
+            speed_ms=6.0, speed_kmh=21.6, is_speeding=False,
+            heading_deg=90.0, is_reliable=True,
+        )
+        res = analyzer.analyze_frame([ok_veh, ped_person])
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0].risk_level, RiskLevel.LEVEL_3_CRITICAL)
+
+        overridden = _reading(1, "vehicle", 0.0, 0.0, 0.0, 0.0, speed_kmh=36.0)
+        self.assertTrue(overridden.is_speeding)
+
+    def test_analyze_frame_skips_non_finite_vehicle_and_custom_ped_kind_restores(self):
+        from unittest import mock
+        from analysis.policy import ObjectPolicy
+
+        analyzer = ConflictAnalyzer()
+        nan_speed_veh = SpeedReading(
+            track_id=1, category="vehicle", object_kind="car",
+            x_m=3.0, y_m=0.0, vx_ms=0.0, vy_ms=5.0,
+            speed_ms=5.0, speed_kmh=float("nan"), is_speeding=False,
+            heading_deg=90.0, is_reliable=True,
+        )
+        # 非有限速度/运动学读数不得回落成含 NaN 的 LEVEL_0_SAFE
+        self.assertEqual(analyzer.analyze_frame([nan_speed_veh]), [])
+
+        # 自定义行人策略 kind != "pedestrian" 时，从行人切回车辆无 object_kind 仍应恢复默认机动车策略
+        custom_policies = {
+            "person": ObjectPolicy("walker", 0.8, "行人"),
+            "pedestrian": ObjectPolicy("walker", 0.8, "行人"),
+            "vehicle": ObjectPolicy("motor_vehicle", 2.2, "机动车"),
+            "motor_vehicle": ObjectPolicy("motor_vehicle", 2.2, "机动车"),
+        }
+        est = SpeedEstimator(category_confirm_frames=2, object_policies=custom_policies)
+        est.update(1, "pedestrian", 0.0, 3.0, 0.0)
+        self.assertEqual(est.tracks[1].object_kind, "walker")
+        est.update(1, "vehicle", 0.1, 3.0, 0.5)
+        r_switch = est.update(1, "vehicle", 0.2, 3.0, 1.0)
+        self.assertEqual((r_switch.category, r_switch.object_kind), ("vehicle", "motor_vehicle"))
+
+        # 交互式标定 GUI 分支：验证选点/重置/回车保存与关闭窗口(X)/大写Q退出清理
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            img_path = root / "road.png"
+            ok, encoded = cv2.imencode(".png", np.zeros((720, 1280, 3), dtype=np.uint8))
+            self.assertTrue(ok)
+            encoded.tofile(str(img_path))
+            out_yaml = root / "gui_calib.yaml"
+
+            # --validation-output 不允许与 --output 同路径以免覆盖 YAML
+            with self.assertRaises(SystemExit):
+                calib_main([
+                    "--source", str(img_path),
+                    "--points", "400,300,880,300,1150,680,130,680",
+                    "--check-image-points", "640,490",
+                    "--check-ground-points", "3.0,7.5",
+                    "--validation-output", str(out_yaml),
+                    "--output", str(out_yaml),
+                ])
+
+            mouse_cbs = {}
+
+            def fake_set_mouse(win, cb):
+                mouse_cbs["cb"] = cb
+
+            # 场景 A: 点击 2 点 -> 'R' 重置 -> 点击 4 个凸角点 -> Enter 保存
+            state = {"step": 0}
+
+            def fake_wait_key(_delay):
+                s = state["step"]
+                state["step"] += 1
+                cb = mouse_cbs["cb"]
+                if s == 0:
+                    cb(cv2.EVENT_LBUTTONDOWN, 100, 100, 0, None)
+                    cb(cv2.EVENT_LBUTTONDOWN, 200, 100, 0, None)
+                    return ord("R")
+                if s == 1:
+                    for ux, vy in ((400, 300), (880, 300), (1150, 680), (130, 680)):
+                        cb(cv2.EVENT_LBUTTONDOWN, ux, vy, 0, None)
+                    return 13
+                return ord("q")
+
+            with mock.patch("analysis.interactive_calibrator.cv2.namedWindow"), \
+                    mock.patch("analysis.interactive_calibrator.cv2.setMouseCallback", side_effect=fake_set_mouse), \
+                    mock.patch("analysis.interactive_calibrator.cv2.imshow"), \
+                    mock.patch("analysis.interactive_calibrator.cv2.waitKey", side_effect=fake_wait_key), \
+                    mock.patch("analysis.interactive_calibrator.cv2.getWindowProperty", return_value=1.0), \
+                    mock.patch("analysis.interactive_calibrator.cv2.destroyAllWindows") as m_destroy:
+                gui_cal = run_interactive_calibration(img_path, 6.0, 15.0, output_path=out_yaml)
+            self.assertEqual(gui_cal.width_m, 6.0)
+            self.assertTrue(out_yaml.is_file())
+            m_destroy.assert_called_once()
+
+            # 场景 B: 用户点击窗口右上角关闭按钮 (WND_PROP_VISIBLE < 1) -> KeyboardInterrupt 且释放窗口
+            with mock.patch("analysis.interactive_calibrator.cv2.namedWindow"), \
+                    mock.patch("analysis.interactive_calibrator.cv2.setMouseCallback"), \
+                    mock.patch("analysis.interactive_calibrator.cv2.imshow"), \
+                    mock.patch("analysis.interactive_calibrator.cv2.waitKey", return_value=255), \
+                    mock.patch("analysis.interactive_calibrator.cv2.getWindowProperty", return_value=0.0), \
+                    mock.patch("analysis.interactive_calibrator.cv2.destroyAllWindows") as m_destroy_close:
+                with self.assertRaises(KeyboardInterrupt):
+                    run_interactive_calibration(img_path, 6.0, 15.0, output_path=out_yaml)
+            m_destroy_close.assert_called_once()
+
+            # 场景 C: CapsLock 下按大写 'Q' -> KeyboardInterrupt 且释放窗口
+            with mock.patch("analysis.interactive_calibrator.cv2.namedWindow"), \
+                    mock.patch("analysis.interactive_calibrator.cv2.setMouseCallback"), \
+                    mock.patch("analysis.interactive_calibrator.cv2.imshow"), \
+                    mock.patch("analysis.interactive_calibrator.cv2.waitKey", return_value=ord("Q")), \
+                    mock.patch("analysis.interactive_calibrator.cv2.getWindowProperty", return_value=1.0), \
+                    mock.patch("analysis.interactive_calibrator.cv2.destroyAllWindows") as m_destroy_q:
+                with self.assertRaises(KeyboardInterrupt):
+                    run_interactive_calibration(img_path, 6.0, 15.0, output_path=out_yaml)
+            m_destroy_q.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

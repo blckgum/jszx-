@@ -29,6 +29,7 @@ def run_speed_ablation(
     frames=40,
 ) -> list[dict]:
     """对匀速直线轨迹运行窗口/EMA 组合，返回末帧误差和可靠性。"""
+    # 在理想无噪声米制轨迹上扫描滑窗与 EMA 参数组合，检验算法收敛精度与响应特性。
     rows = []
     for target_speed, window, alpha in product(speeds_ms, window_sizes, ema_alphas):
         estimator = SpeedEstimator(window_size=window, ema_alpha=alpha)
@@ -58,6 +59,7 @@ def run_conflict_ablation(
     pedestrian = _speed_reading(2, "pedestrian", 3.0, 6.0, 0.0, 0.0, "pedestrian")
     rows = []
     for critical, horizon in product(critical_thresholds, horizons):
+        # 冲突分析器契约要求 ttc_critical_s <= ttc_caution_s <= horizon_s，跳过不合法组合。
         if critical > horizon:
             continue
         caution = max(critical, min(3.5, horizon))

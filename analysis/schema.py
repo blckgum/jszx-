@@ -18,6 +18,9 @@ def _reject_constant(value):
 
 
 def _reject_non_finite_tree(value, name: str):
+    # parse_constant 只会拦截 NaN / Infinity / -Infinity 字面量，而 1e309 溢出字面量会被
+    # Python json.loads 直接解析为 float('inf')；因此必须在解析后递归检查整棵值树。
+    # 这里用精确 type() 检查而非 isinstance，确保 bool 不会混入数值或整数校验。
     if type(value) in (int, float):
         if not math.isfinite(value):
             raise SchemaValidationError(f"{name} 包含非有限数值")
@@ -263,6 +266,7 @@ def validate_speeds_csv(path: str | Path):
             raise SchemaValidationError(f"{file_path} 缺少 CSV 列: {', '.join(sorted(missing))}")
         count = 0
         for line_no, row in enumerate(reader, 2):
+            # csv.DictReader 会把超出表头长度的多余列放入键 None 中，需显式拦截。
             if None in row:
                 raise SchemaValidationError(f"{file_path} 第 {line_no} 行包含多余未命名列")
             try:
@@ -357,6 +361,8 @@ def validate_ablation(data):
 
 
 def validate_run(run_dir: str | Path) -> dict:
+    # 先校验 summary.json 获取运行状态：status=="ok" 时要求完整产物齐全，
+    # 失败或中断目录仍校验已落盘的局部文件（如 summary/configuration/已刷盘事件），但不强求全套文件。
     root = Path(run_dir).expanduser().resolve()
     if not root.is_dir():
         raise SchemaValidationError(f"运行目录不存在: {root}")
@@ -434,10 +440,12 @@ def validate_batch_run(batch_dir: str | Path) -> dict:
         raise SchemaValidationError(f"批量运行目录不存在: {root}")
     summary = validate_batch_summary(load_json_strict(root / "batch_summary.json"))
     ok_runs = 0
+    # 逐项校验成功的子运行目录；失败/中断项保留在清单中即可，不要求拥有完整产物。
     for idx, item in enumerate(summary["results"]):
         if item["status"] != "ok":
             continue
         child_dir = Path(item["output"])
+        # 若整个批次目录被整体移动或复制到新位置，回退按子目录名在当前批次根目录下查找。
         if not child_dir.is_dir():
             child_dir = root / child_dir.name
         try:

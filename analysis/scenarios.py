@@ -13,12 +13,14 @@ from .speed import SpeedReading
 
 def _reading(track_id, category, x, y, vx, vy, *, object_kind="motor_vehicle",
              reliable=True, stationary=False, speed_kmh=None):
+    # 构造确定性物理读数供回归场景使用，绕过图像检测与单应性变换噪声。
     speed_ms = (vx * vx + vy * vy) ** 0.5
+    effective_speed_kmh = speed_ms * 3.6 if speed_kmh is None else speed_kmh
     return SpeedReading(
         track_id=track_id, category=category, object_kind=object_kind,
         x_m=x, y_m=y, vx_ms=vx, vy_ms=vy, speed_ms=speed_ms,
-        speed_kmh=speed_ms * 3.6 if speed_kmh is None else speed_kmh,
-        is_speeding=speed_ms * 3.6 > 30.0, heading_deg=0.0,
+        speed_kmh=effective_speed_kmh,
+        is_speeding=effective_speed_kmh > 30.0, heading_deg=0.0,
         is_reliable=reliable, is_stationary=stationary,
     )
 

@@ -110,6 +110,7 @@ class ConflictEventTracker:
     """把逐帧 ConflictAssessment 收敛为去抖后的告警事件流"""
 
     def __init__(self, confirm_frames: int = 3, cooldown_frames: int = 12):
+        # 用精确 type() 校验而非 isinstance(..., int)，防止 bool(True/False) 伪装成 1/0 帧数。
         if type(confirm_frames) is not int or confirm_frames < 1:
             raise ValueError("confirm_frames 必须是 >= 1 的整数帧数")
         if type(cooldown_frames) is not int or cooldown_frames < 0:
@@ -137,6 +138,8 @@ class ConflictEventTracker:
         确认中的挂起帧不返回注解；事件确认后其 start_frame 已回溯包含挂起帧，
         下游可通过事件记录还原完整区间。
         """
+        # Python 中 bool 是 int 的子类，用精确 type() 校验可防止 True/False 穿透
+        # isinstance(..., int/float) 检查变成帧号 1/0 或时间戳 1.0/0.0；同时拦截负数与 NaN/Inf。
         if type(frame_idx) is not int or frame_idx < 0:
             raise ValueError("frame_idx 必须为 >= 0 的整数")
         if (
@@ -250,4 +253,6 @@ class ConflictEventTracker:
             if st.event is not None:
                 st.event.end_reason = reason
                 self._finalized.append(st.event)
+        # 连同未确认的挂起状态一起清空，防止同一实例跨段复用时
+        # 残留之前的 streak 计数导致新片段首帧误触发事件确认。
         self._states.clear()

@@ -17,13 +17,29 @@ def _reject_non_finite_constant(value: str):
     raise ValueError(f"JSON 不允许非有限常量: {value}")
 
 
+def _reject_non_finite_tree(value, name: str):
+    # 与 analysis.schema 保持一致：json.loads 遇到 1e309 会生成 inf 且不经过 parse_constant，
+    # 即使 evaluate_run(..., validate=False) 也必须拒绝非有限数据以免静默污染统计。
+    if type(value) in (int, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{name} 包含非有限数值")
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            _reject_non_finite_tree(v, f"{name}.{k}")
+    elif isinstance(value, (list, tuple)):
+        for idx, item in enumerate(value):
+            _reject_non_finite_tree(item, f"{name}[{idx}]")
+
+
 def _read_json(path: Path, default):
     if not path.exists():
         return default
-    return json.loads(
+    data = json.loads(
         path.read_text(encoding="utf-8"),
         parse_constant=_reject_non_finite_constant,
     )
+    _reject_non_finite_tree(data, str(path))
+    return data
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -34,9 +50,9 @@ def _read_jsonl(path: Path) -> list[dict]:
         if not line.strip():
             continue
         try:
-            rows.append(
-                json.loads(line, parse_constant=_reject_non_finite_constant)
-            )
+            item = json.loads(line, parse_constant=_reject_non_finite_constant)
+            _reject_non_finite_tree(item, f"{path} 第 {line_no} 行")
+            rows.append(item)
         except json.JSONDecodeError as exc:
             raise ValueError(f"{path} 第 {line_no} 行不是有效 JSON: {exc}") from None
     return rows
@@ -50,7 +66,17 @@ def _read_csv(path: Path) -> list[dict[str, str]]:
 
 
 def _finite(values):
-    return [float(value) for value in values if value not in (None, "") and math.isfinite(float(value))]
+    out = []
+    for value in values:
+        if value in (None, "") or type(value) is bool:
+            continue
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(num):
+            out.append(num)
+    return out
 
 
 def _risk_name(value) -> str:
@@ -68,6 +94,8 @@ def _require_non_neg_number(value, name: str) -> float:
 
 
 def _validate_ground_truth(data) -> dict:
+    # 校验人工真值标注契约：要求 schema_version == 1，容差、速度参考与期望事件起止时刻均非负且有限，
+    # veh_track_id / ped_track_id 为 null 时表示匹配任意目标 ID。
     if not isinstance(data, dict):
         raise ValueError("真值标注文件顶层必须是键值映射")
     if type(data.get("schema_version")) is not int or data["schema_version"] != 1:
@@ -156,6 +184,7 @@ def load_ground_truth(path: str | Path) -> dict:
             raw = json.loads(text, parse_constant=_reject)
         except json.JSONDecodeError as exc:
             raise ValueError(f"真值 JSON 解析失败: {exc}") from None
+        _reject_non_finite_tree(raw, str(gt_path))
     else:
         try:
             raw = yaml.safe_load(text)
@@ -174,20 +203,36 @@ def evaluate_ground_truth(
     parsed = _validate_ground_truth(gt)
     tol = parsed["tolerance_s"]
 
+    # 1) 测速误差评价：按人工真值里的 track_id 与可选时间窗筛选 speeds.csv 样本，
+    # 算得平均测速后与 reference_speed_kmh 对比 MAE / RMSE / 最大绝对误差 / 平均偏差。
     speed_items = []
     signed_errors = []
     abs_errors = []
     for ref in parsed["speed_references"]:
         matched_vals = []
         for row in speeds:
+            if not isinstance(row, dict):
+                continue
+            raw_tid = row.get("track_id", "")
+            raw_ts = row.get("timestamp_s", "")
+            raw_spd = row.get("speed_kmh", "")
+            # 防止直接传入 Python 字典时 bool (True/False) 被 int()/float() 转成 1/0.0。
+            if type(raw_tid) is bool or type(raw_ts) is bool or type(raw_spd) is bool:
+                continue
             try:
-                tid = int(row.get("track_id", ""))
-                ts = float(row.get("timestamp_s", ""))
-                spd = float(row.get("speed_kmh", ""))
+                tid = int(raw_tid)
+                ts = float(raw_ts)
+                spd = float(raw_spd)
             except (TypeError, ValueError):
                 continue
-            if tid != ref["track_id"] or not (math.isfinite(ts) and math.isfinite(spd)):
+            if (
+                tid != ref["track_id"]
+                or not (math.isfinite(ts) and math.isfinite(spd))
+                or ts < 0
+                or spd < 0
+            ):
                 continue
+            # 默认只拿 is_reliable == 1 的收敛后样本参与测速精度评价，避免预热期拉低统计。
             if ref["only_reliable"] and str(row.get("is_reliable", "")) != "1":
                 continue
             if ref["start_timestamp_s"] is not None and ts < ref["start_timestamp_s"]:
@@ -233,22 +278,32 @@ def evaluate_ground_truth(
         "items": speed_items,
     }
 
+    # 2) 事件级 1-to-1 贪心匹配：按种类、可选 ID 约束及容差扩展区间 [p_start-tol, p_end+tol]
+    # 与真值区间的重叠时长降序配对（重叠相同时优先匹配起始时刻更接近者），计算 TP/FP/FN 与提前量。
     gt_events = parsed["expected_events"]
     candidates = []
     for gi, g in enumerate(gt_events):
         for pi, p in enumerate(events):
-            if p.get("kind") != g["kind"]:
+            if not isinstance(p, dict) or p.get("kind") != g["kind"]:
                 continue
-            if g["veh_track_id"] is not None and p.get("veh_track_id") != g["veh_track_id"]:
+            # 用精确布尔排除，防止 Python 中 True == 1 把布尔 track_id 误配为 1 号目标。
+            p_veh = p.get("veh_track_id")
+            p_ped = p.get("ped_track_id")
+            if g["veh_track_id"] is not None and (type(p_veh) is bool or p_veh != g["veh_track_id"]):
                 continue
-            if g["ped_track_id"] is not None and p.get("ped_track_id") != g["ped_track_id"]:
+            if g["ped_track_id"] is not None and (type(p_ped) is bool or p_ped != g["ped_track_id"]):
+                continue
+            raw_start = p.get("start_timestamp_s")
+            raw_end = p.get("end_timestamp_s")
+            if type(raw_start) is bool or type(raw_end) is bool:
                 continue
             try:
-                p_start = float(p["start_timestamp_s"])
-                p_end = float(p["end_timestamp_s"])
-            except (KeyError, TypeError, ValueError):
+                p_start = float(raw_start)
+                p_end = float(raw_end)
+            except (TypeError, ValueError):
                 continue
-            if not (math.isfinite(p_start) and math.isfinite(p_end)):
+            # 忽略非有限、负时间戳或起止倒挂的无效预测事件，防止异常区间产生伪匹配。
+            if not (math.isfinite(p_start) and math.isfinite(p_end)) or p_start < 0 or p_end < p_start:
                 continue
             ov_start = max(p_start - tol, g["start_timestamp_s"])
             ov_end = min(p_end + tol, g["end_timestamp_s"])
@@ -278,6 +333,7 @@ def evaluate_ground_truth(
     else:
         f1 = None
 
+    # 预警提前量 = 人工标注的潜在冲突时刻 - 系统开立事件起始时刻；正值表示提前预警。
     leads = [
         float(g["conflict_moment_s"]) - float(p["start_timestamp_s"])
         for g, p in matched_pairs

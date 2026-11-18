@@ -47,6 +47,7 @@ from .visualization import EnhancedConflictVisualizer, trajectory_color
 
 def is_live_source(source: str | int | Path | None) -> bool:
     """判断输入源是否为摄像头设备索引或实时网络视频流。"""
+    # 显式排除 bool，防止 True/False 作为 int 子类被当作摄像头索引 1/0。
     if source is None or type(source) is bool:
         return False
     if type(source) is int:
@@ -55,6 +56,7 @@ def is_live_source(source: str | int | Path | None) -> bool:
         stripped = source.strip()
         if not stripped:
             return False
+        # 仅将 ASCII 纯数字看作摄像头索引，避免 Unicode 上标数字（如 '²'）被误判。
         if stripped.isascii() and stripped.isdigit():
             return True
         lower = stripped.lower()
@@ -67,6 +69,7 @@ def is_live_source(source: str | int | Path | None) -> bool:
 
 def parse_video_source(video_path: str | int | Path) -> tuple[int | str, str, bool]:
     """解析视频输入源，返回 (VideoCapture 参数, 脱敏日志标识, 是否实时流)。"""
+    # Python 中 bool 是 int 的子类，必须提前拒绝，避免 True/False 被当作摄像头索引 1/0。
     if type(video_path) is bool:
         raise ValueError("视频输入源不能为布尔值")
     if type(video_path) is int:
@@ -77,6 +80,7 @@ def parse_video_source(video_path: str | int | Path) -> tuple[int | str, str, bo
         stripped = video_path.strip()
         if not stripped:
             raise ValueError("视频输入源不能为空")
+        # 统一纯 ASCII 数字与 camera:N 两种摄像头写法，返回整数设备号给 VideoCapture。
         if stripped.isascii() and stripped.isdigit():
             idx = int(stripped)
             return idx, f"camera:{idx}", True
@@ -88,6 +92,7 @@ def parse_video_source(video_path: str | int | Path) -> tuple[int | str, str, bo
             idx = int(idx_part)
             return idx, f"camera:{idx}", True
         if lower.startswith(LIVE_STREAM_PREFIXES):
+            # 传给 VideoCapture 的保留原始认证 URL 以便拉流；写入摘要与日志的则脱敏账号密码。
             return stripped, redact_stream_url(stripped), True
     resolved = Path(video_path).expanduser().resolve()
     return str(resolved), str(resolved), False
@@ -107,6 +112,8 @@ class LiveStreamClock:
             self._anchor_wall = now
             self._anchor_ts = 0.0
         pts_s = milliseconds / 1000.0 if milliseconds is not None else float("nan")
+        # OpenCV 在无 PTS 的摄像头/RTSP 流首帧常返回 0.0：因此首帧 pts_s == 0 不视为有效 PTS，
+        # 只有首帧自带正 PTS 或后续帧 PTS 严格递增时才采信 video_pts 并刷新墙钟锚点。
         if math.isfinite(pts_s) and pts_s >= 0 and pts_s > self.previous and (
             frame_index > 0 or pts_s > 0
         ):
@@ -120,6 +127,8 @@ class LiveStreamClock:
             self.previous = 0.0
             return 0.0, "wall_clock"
         wall_s = self._anchor_ts + (now - self._anchor_wall)
+        # 用 math.nextafter 保底严格递增：当异常大 PTS（如 1e13s）超出 float64 1e-4 分辨率时，
+        # previous + 1e-4 会舍入回原值，nextafter 可确保下游差分 dt 永远 > 0。
         ts = max(wall_s, math.nextafter(self.previous, math.inf), self.previous + 1e-4)
         self.previous = ts
         return ts, "wall_clock"
@@ -281,6 +290,8 @@ class ConflictPerceptionPipeline:
         source_tracks: Optional[str] = None,
     ) -> dict:
         """返回可复现实验所需的实际运行配置，而不依赖命令行现场。"""
+        # 在进入逐帧处理前冻结本次运行实效参数（含按 FPS 换算后的帧窗与文件指纹），
+        # 后续修改 configs/*.yaml 不会污染历史实验记录。
         snapshot = {
             "schema_version": 1,
             "input_mode": input_mode,
@@ -387,11 +398,15 @@ class ConflictPerceptionPipeline:
 
         if not tracks_file.is_file():
             raise FileNotFoundError(f"未找到跟踪轨迹文件: {tracks_file}")
+        # 先把全文件按严格 JSON 规则读入并完成契约校验，确认时间轴/分辨率/ID 一致后再创建输出文件，
+        # 避免写到半途因输入损坏报错而留下残缺 CSV/MP4。
         rows = load_jsonl_strict(tracks_file)
         expected_session: Optional[str] = None
         expected_shape: Optional[tuple[int, int]] = None
         prev_frame = -1
         prev_ts = -1.0
+        # 逐帧校验与在线 TrackingSession / ConflictEventTracker 同等的不变量：
+        # 单一 session_id、严格递增帧号与时间戳、恒定分辨率、帧内唯一正整数 track_id 及有限坐标。
         for line_idx, row in enumerate(rows, 1):
             if not isinstance(row, dict):
                 raise ValueError(f"tracks.jsonl 第 {line_idx} 行必须是 JSON 对象")
@@ -408,6 +423,7 @@ class ConflictPerceptionPipeline:
             ts = row.get("timestamp_s")
             w = row.get("width")
             h = row.get("height")
+            # 用精确 type() 检查避免 bool 被当作 0/1 通过整数校验。
             if type(f_idx) is not int or f_idx < 0 or f_idx <= prev_frame:
                 raise ValueError(f"tracks.jsonl 第 {line_idx} 行 frame_index 必须非负且严格递增")
             if type(ts) not in (int, float) or not math.isfinite(ts) or ts < 0 or ts <= prev_ts:
@@ -438,6 +454,7 @@ class ConflictPerceptionPipeline:
                     raise ValueError(f"tracks.jsonl 第 {line_idx} 行缺少 class_name 或 category")
                 bbox = target.get("bbox_xyxy")
                 anchor = target.get("anchor_xy")
+                # 严禁 NaN/Inf/bool 混入框与锚点坐标，防止后续投影和绘图崩溃。
                 if (
                     not isinstance(bbox, (list, tuple))
                     or len(bbox) != 4
@@ -502,15 +519,18 @@ class ConflictPerceptionPipeline:
             if reading.speed_kmh > frame_max_speed:
                 frame_max_speed = reading.speed_kmh
 
+        # 根据存活池剔除已移出跟踪器或越出标定区的目标，防止速度状态字典长期残留。
         live_ids = resolve_live_ids(out_of_zone_ids)
         self.speed_estimator.prune_stale_tracks(live_ids)
 
         conflicts = self.conflict_analyzer.analyze_frame(speed_readings)
         conflict_map, ped_conflict_map = build_conflict_maps(conflicts)
 
+        # 事件去抖状态机推进后立刻弹出已冷却归档的事件写入 events.jsonl。
         event_ids = self.event_tracker.update(conflicts, frame_idx, timestamp_s)
         drain_events_cb()
 
+        # conflicts.jsonl 保存逐帧原始评估（confirmed 帧回填 event_id，未确认瞬时帧为 null）。
         for c in conflicts:
             json_item = {
                 "schema_version": 1,
@@ -523,10 +543,11 @@ class ConflictPerceptionPipeline:
                 json.dumps(json_item, ensure_ascii=False, allow_nan=False) + "\n"
             )
 
+        # speeds.csv 按目标逐行落盘：ttc_s 用 is not None 判断，避免 TTC=0.0 时被当假值留空。
         for r in speed_readings:
             c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
             risk_lvl = c.risk_level.name if c else "LEVEL_0_SAFE"
-            ttc_val = round(c.ttc_seconds, 2) if (c and c.ttc_seconds) else ""
+            ttc_val = round(c.ttc_seconds, 2) if (c and c.ttc_seconds is not None) else ""
             csv_event_id = (
                 event_ids.get((c.veh_track_id, c.ped_track_id))
                 if c is not None else None
@@ -634,6 +655,8 @@ class ConflictPerceptionPipeline:
         try:
             raw_fps = cap.get(cv2.CAP_PROP_FPS)
             if is_live_stream:
+                # 实时流经常缺省 FPS 或返回 0/异常大值；合理区间外保守按 25 FPS 换算秒级窗，
+                # 实际时间戳仍由 LiveStreamClock（PTS 优先、墙钟兜底）单调推进。
                 source_fps = raw_fps if (math.isfinite(raw_fps) and 0 < raw_fps <= 240) else None
                 fps = self.fps if self.fps is not None else (source_fps or 25.0)
                 video_clock = (
@@ -649,8 +672,15 @@ class ConflictPerceptionPipeline:
                     raise RuntimeError("视频缺少有效 FPS；确认帧率后通过 --fps 指定")
                 video_clock = VideoClock(fps=fps, force_fps=self.fps is not None)
 
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            # 在加载 PyTorch 模型与创建 VideoWriter 前先拦截无效的 0x0 或 NaN 容器元数据。
+            raw_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            raw_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            if not (math.isfinite(raw_w) and math.isfinite(raw_h)) or raw_w <= 0 or raw_h <= 0:
+                raise RuntimeError("视频分辨率元数据无效")
+            width = int(raw_w)
+            height = int(raw_h)
+            if width <= 0 or height <= 0:
+                raise RuntimeError("视频分辨率元数据无效")
 
             self._configure_speed_estimator(fps)
             self._configure_event_tracker(fps)
@@ -737,6 +767,10 @@ class ConflictPerceptionPipeline:
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     break
+                # OpenCV VideoWriter 遇到与初始化尺寸不一致的帧只会警告并静默丢帧，
+                # 必须显式校验解码帧分辨率与容器元数据一致，避免悄悄写出空视频。
+                if not hasattr(frame, "shape") or len(frame.shape) < 2 or (frame.shape[1], frame.shape[0]) != (width, height):
+                    raise RuntimeError("实际解码帧分辨率与视频元数据不一致")
 
                 pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
                 timestamp_s, time_kind = video_clock.timestamp(frame_idx, pts_ms)
@@ -760,7 +794,7 @@ class ConflictPerceptionPipeline:
 
                 if show_window and render_frame is not None:
                     cv2.imshow("Campus Vehicle-Pedestrian Conflict System", render_frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                    if (cv2.waitKey(1) & 0xFF) in (ord("q"), ord("Q"), 27):
                         loop_state = "user_quit"
                         break
 
@@ -780,6 +814,8 @@ class ConflictPerceptionPipeline:
             loop_error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
+            # 必须在 resources.close() 关闭文件句柄前刷出仍在冷却/存续中的事件，
+            # 确保中途异常或 Ctrl+C 中断时已确认告警事件同样完整落盘。
             try:
                 self.event_tracker.flush(reason=loop_state)
                 _drain_alert_events()
@@ -788,6 +824,8 @@ class ConflictPerceptionPipeline:
             try:
                 resources.close()
             except BaseException as exc:
+                # 若主循环本身未出错而收尾关闭失败（如 VideoWriter 封装失败），记录关闭异常；
+                # 若主循环已抛错，则保留原始主异常以免被次生关闭异常掩盖。
                 close_exc = exc
                 if not main_loop_failed:
                     loop_state = "exception"
@@ -870,6 +908,15 @@ class ConflictPerceptionPipeline:
         """从已有 tracks.jsonl 离线复盘测速、TTC 与事件去抖（无需重跑检测与跟踪）。"""
         if max_frames is not None and (type(max_frames) is not int or max_frames < 0):
             raise ValueError("max_frames 必须是 >= 0 的整数")
+        # 拒绝空字符串路径，避免 Path("") 解析成当前工作目录 '.'。
+        if isinstance(tracks_path, str) and not tracks_path.strip():
+            raise ValueError("tracks.jsonl 路径不能为空")
+        if video_path is not None and (
+            type(video_path) is bool
+            or is_live_source(video_path)
+            or (isinstance(video_path, str) and not video_path.strip())
+        ):
+            raise ValueError("离线轨迹复盘仅支持非空本地视频文件同步渲染，不支持摄像头索引或实时推流")
 
         tracks_file = Path(tracks_path).expanduser().resolve()
         out_dir = Path(output_dir).expanduser().resolve()
@@ -921,8 +968,14 @@ class ConflictPerceptionPipeline:
                 fps = self.fps if self.fps is not None else source_fps
                 if fps is None:
                     raise RuntimeError("视频缺少有效 FPS；确认帧率后通过 --fps 指定")
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                raw_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                raw_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                if not (math.isfinite(raw_w) and math.isfinite(raw_h)) or raw_w <= 0 or raw_h <= 0:
+                    raise RuntimeError("同步渲染视频分辨率元数据无效")
+                width = int(raw_w)
+                height = int(raw_h)
+                if width <= 0 or height <= 0:
+                    raise RuntimeError("同步渲染视频分辨率元数据无效")
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(str(out_video_path), fourcc, fps, (width, height))
                 resources.callback(writer.release)
@@ -932,6 +985,8 @@ class ConflictPerceptionPipeline:
                 if self.fps is not None:
                     fps = self.fps
                 elif len(raw_frames) >= 2:
+                    # 无视频且未传 --fps 时，用相邻帧时间戳差的中位数反推 FPS（抗偶发跳帧抖动），
+                    # 并将有效范围约束在 [1e-3, 1000.0] 防止极端时间戳触发溢出或舍入归零。
                     dts = [
                         float(raw_frames[i]["timestamp_s"]) - float(raw_frames[i - 1]["timestamp_s"])
                         for i in range(1, len(raw_frames))
@@ -1009,6 +1064,8 @@ class ConflictPerceptionPipeline:
                 timestamp_s = float(row["timestamp_s"])
                 frame = None
                 if cap is not None:
+                    # 若 tracks.jsonl 的 frame_index 存在跳帧，用 cap.grab() 仅推进解复用器而不做完整解码，
+                    # 确保绘制叠加的画面与轨迹帧号严格对齐。
                     while next_video_frame < frame_idx:
                         if not cap.grab():
                             raise RuntimeError("同步渲染视频帧数少于 tracks.jsonl 记录数")
@@ -1017,8 +1074,11 @@ class ConflictPerceptionPipeline:
                     if not ok or frame is None:
                         raise RuntimeError("同步渲染视频帧数少于 tracks.jsonl 记录数")
                     next_video_frame += 1
-                    if (frame.shape[1], frame.shape[0]) != (row["width"], row["height"]):
+                    if not hasattr(frame, "shape") or len(frame.shape) < 2 or (frame.shape[1], frame.shape[0]) != (row["width"], row["height"]):
                         raise RuntimeError("同步渲染视频分辨率与 tracks.jsonl 记录不一致")
+                    # VideoWriter 不会对尺寸不匹配的帧抛异常，需主动校验以防输出静音/空帧 MP4。
+                    if (frame.shape[1], frame.shape[0]) != (width, height):
+                        raise RuntimeError("同步渲染视频实际帧分辨率与容器元数据不一致")
 
                 parsed_tracks = [
                     SimpleNamespace(
@@ -1032,6 +1092,9 @@ class ConflictPerceptionPipeline:
                 ]
 
                 def _resolve_live_ids(out_of_zone: set[int]) -> set[int]:
+                    # 复现 Ultralytics BYTETracker 在线存活池边界：
+                    # lost_stracks 在移除边界帧 (gap == track_buffer + 1) 仍保留 ID 参与次帧重关联，
+                    # 仅当缺席跨度严格大于 track_buffer + 1 或越出标定区时才从速度滤波器剪枝。
                     for t in parsed_tracks:
                         if t.track_id is not None:
                             last_seen_frame[t.track_id] = frame_idx
@@ -1058,7 +1121,7 @@ class ConflictPerceptionPipeline:
 
                 if show_window and render_frame is not None:
                     cv2.imshow("Campus Vehicle-Pedestrian Conflict System", render_frame)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                    if (cv2.waitKey(1) & 0xFF) in (ord("q"), ord("Q"), 27):
                         loop_state = "user_quit"
                         break
         except KeyboardInterrupt:
@@ -1072,6 +1135,8 @@ class ConflictPerceptionPipeline:
             loop_error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
+            # 必须在 resources.close() 关闭文件句柄前刷出仍在冷却/存续中的事件，
+            # 确保中途异常或 Ctrl+C 中断时已确认告警事件同样完整落盘。
             try:
                 self.event_tracker.flush(reason=loop_state)
                 _drain_alert_events()
@@ -1080,6 +1145,8 @@ class ConflictPerceptionPipeline:
             try:
                 resources.close()
             except BaseException as exc:
+                # 若主循环本身未出错而收尾关闭失败（如 VideoWriter 封装失败），记录关闭异常；
+                # 若主循环已抛错，则保留原始主异常以免被次生关闭异常掩盖。
                 close_exc = exc
                 if not main_loop_failed:
                     loop_state = "exception"

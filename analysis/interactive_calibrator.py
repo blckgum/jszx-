@@ -25,6 +25,8 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 def _read_calibration_image(src: Path) -> np.ndarray:
     """读取标定图片，兼容 Windows 含中文路径并校验解码结果。"""
+    # Windows 下 cv2.imread 基于 C 接口窄字符路径，目录或文件名含中文时常返回 None；
+    # 改由 np.fromfile 读入字节流再经 cv2.imdecode 解码可稳定兼容中文路径。
     try:
         raw = np.fromfile(str(src), dtype=np.uint8)
         image = cv2.imdecode(raw, cv2.IMREAD_COLOR) if raw.size > 0 else None
@@ -59,13 +61,15 @@ def run_interactive_calibration(
     if not src.is_file():
         raise FileNotFoundError(f"未找到标定底图或视频文件: {src}")
 
-    # 支持直接从图像或视频中抓取第 1 帧
+    # 支持直接从图像或视频中抓取第 1 帧；视频无论读帧成功与否都必须释放句柄。
     if src.suffix.lower() in IMAGE_SUFFIXES:
         image = _read_calibration_image(src)
     else:
         cap = cv2.VideoCapture(str(src))
-        ok, image = cap.read()
-        cap.release()
+        try:
+            ok, image = cap.read()
+        finally:
+            cap.release()
         if not ok or image is None:
             raise RuntimeError(f"无法从视频中解码读取首帧用于标定: {src}")
 
@@ -84,9 +88,6 @@ def run_interactive_calibration(
                 points.append((float(x), float(y)))
                 print(f"[*] 选取第 {len(points)}/4 个角点: 像素坐标 ({x}, {y})")
 
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.setMouseCallback(window_name, on_mouse)
-
         print("=" * 60)
         print("[*] 交互式空间标定窗口已打开:")
         print("    请用鼠标左键按顺时针依次点击道路地面的 4 个角点:")
@@ -94,50 +95,58 @@ def run_interactive_calibration(
         print("    按键盘 'R' 重置选点，点满 4 点后按 'Enter' 或 'Space' 保存退出，'Q' 取消。")
         print("=" * 60)
 
-        while True:
-            display = image.copy()
-            # 绘制已点击的点
-            for idx, pt in enumerate(points):
-                px, py = int(pt[0]), int(pt[1])
-                cv2.circle(display, (px, py), 6, (0, 0, 255), -1)
+        # 将窗口创建、鼠标回调绑定与主刷新循环整体放入 try...finally：
+        # 无论用户按 Q/Esc、点击窗口右上角关闭按钮还是途中出错，都确保销毁 GUI 窗口不挂起进程。
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.setMouseCallback(window_name, on_mouse)
+            while True:
+                display = image.copy()
+                # 绘制已点击的点
+                for idx, pt in enumerate(points):
+                    px, py = int(pt[0]), int(pt[1])
+                    cv2.circle(display, (px, py), 6, (0, 0, 255), -1)
+                    cv2.putText(
+                        display,
+                        f"P{idx+1}",
+                        (px + 8, py - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                    )
+
+                # 绘制闭合多边形轮廓
+                if len(points) >= 2:
+                    pts_arr = np.array(points, dtype=np.int32)
+                    cv2.polylines(display, [pts_arr], isClosed=(len(points) == 4), color=(0, 255, 0), thickness=2)
+
+                # 顶部操作提示
                 cv2.putText(
                     display,
-                    f"P{idx+1}",
-                    (px + 8, py - 8),
+                    f"Selected: {len(points)}/4 | Width: {width_m}m Length: {length_m}m",
+                    (16, 32),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 255),
+                    0.7,
+                    (255, 255, 255),
                     2,
                 )
 
-            # 绘制闭合多边形轮廓
-            if len(points) >= 2:
-                pts_arr = np.array(points, dtype=np.int32)
-                cv2.polylines(display, [pts_arr], isClosed=(len(points) == 4), color=(0, 255, 0), thickness=2)
-
-            # 顶部操作提示
-            cv2.putText(
-                display,
-                f"Selected: {len(points)}/4 | Width: {width_m}m Length: {length_m}m",
-                (16, 32),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 255),
-                2,
-            )
-
-            cv2.imshow(window_name, display)
-            key = cv2.waitKey(20) & 0xFF
-            if key == 27 or key == ord("q"):
-                cv2.destroyAllWindows()
-                raise KeyboardInterrupt("用户取消了交互式标定")
-            elif key == ord("r"):
-                points.clear()
-                print("[*] 已重置标定点，请重新选取 4 个角点。")
-            elif (key == 13 or key == 32) and len(points) == 4:
-                break
-
-        cv2.destroyAllWindows()
+                cv2.imshow(window_name, display)
+                key = cv2.waitKey(20) & 0xFF
+                # 用户点击窗口右上角关闭按钮不会向 waitKey 发送按键，需同时轮询 WND_PROP_VISIBLE < 1。
+                if (
+                    key in (27, ord("q"), ord("Q"))
+                    or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1
+                ):
+                    raise KeyboardInterrupt("用户取消了交互式标定")
+                elif key in (ord("r"), ord("R")):
+                    points.clear()
+                    print("[*] 已重置标定点，请重新选取 4 个角点。")
+                elif (key == 13 or key == 32) and len(points) == 4:
+                    break
+        finally:
+            cv2.destroyAllWindows()
 
     if len(points) != 4:
         raise ValueError("标定未完成，必须准确选取 4 个地面角点")
@@ -155,6 +164,7 @@ def run_interactive_calibration(
 
 
 def _parse_coord_pairs(raw: str, flag_name: str, expected_pairs: Optional[int] = None) -> List[Tuple[float, float]]:
+    # 将命令行逗号分隔坐标解析为成对有限浮点数，确保既满足偶数配对又拒绝 NaN/Inf。
     try:
         nums = [float(x.strip()) for x in raw.split(",")]
     except ValueError:
@@ -204,6 +214,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.error("--length 必须为有限正数")
     if (args.check_image_points is None) != (args.check_ground_points is None):
         parser.error("--check-image-points 与 --check-ground-points 必须成对提供")
+    if args.validation_output is not None and args.check_image_points is None:
+        parser.error("--validation-output 必须与 --check-image-points 和 --check-ground-points 一起使用")
+    if args.validation_output is not None:
+        # 防止误把验证报告路径设为标定 YAML 同路径，导致后续 JSON 写出覆写掉标定配置。
+        if Path(args.validation_output).expanduser().resolve() == Path(args.output).expanduser().resolve():
+            parser.error("--validation-output 不能与 --output 指向同一文件")
 
     pts = None
     if args.points is not None:
@@ -222,6 +238,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if len(check_img_pts) != len(check_gd_pts):
             parser.error("--check-image-points 与 --check-ground-points 点数必须一致")
 
+    # 提供了独立检查点时先不写盘：待误差检查全部通过后再持久化 YAML，
+    # 防止非法/重合检查点报错时提前覆写已有标定文件。
     calibrator = run_interactive_calibration(
         source_path=args.source,
         width_m=args.width,

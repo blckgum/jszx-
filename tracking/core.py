@@ -27,15 +27,18 @@ DEFAULT_TRACKER = ROOT / "configs" / "bytetrack.yaml"
 LIVE_STREAM_PREFIXES = ("rtsp://", "rtmp://", "http://", "https://")
 
 
+# 域名标签仅允许 ASCII 字母、数字及中间连接符，用于区分合法主机名与 URL 路径段。
 _DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?$")
 
 
 def _is_valid_port(port_str: str) -> bool:
+    # 仅接受 ASCII 数字端口，防止 Unicode 上标数字等通过 isdigit() 检查。
     return port_str.isascii() and port_str.isdigit() and 1 <= int(port_str) <= 65535
 
 
 def _is_valid_host_port(text: str) -> bool:
     """校验 text 是否为合法的 IPv4 / [IPv6] / localhost / 域名（可选 :端口）。"""
+    # 主机名与端口片段中绝不应出现路径分隔、查询符或空白字符。
     if not text or any(ch in text for ch in ("@", "/", "?", "#", "\\")) or any(ch.isspace() for ch in text):
         return False
     if text.startswith("["):
@@ -74,6 +77,7 @@ def _is_valid_host_port(text: str) -> bool:
         pass
     if host.lower() == "localhost":
         return True
+    # 要求域名至少包含一个点且末段不为纯数字，避免把普通路径片段误判为主机。
     if "." not in host or host.startswith(".") or host.endswith(".") or ".." in host:
         return False
     labels = host.split(".")
@@ -94,6 +98,9 @@ def redact_stream_url(url: str) -> str:
         host_port = split.netloc.rsplit("@", 1)[-1]
         return urlunsplit((split.scheme, f"***@{host_port}", split.path, split.query, split.fragment))
 
+    # 先按协议头后的首个 '/', '?', '#' 切出权威段（authority）；
+    # 注意密码中若未做百分号编码直接含 '[', '?', '#', '/'（如 RTSP 密码带特殊字符），
+    # 标准 urlsplit 可能误截断甚至抛 Invalid IPv6 URL，因此先手动扫描处理。
     scheme, rest = url.split("://", 1)
     delim_positions = [idx for idx in (rest.find("/"), rest.find("?"), rest.find("#")) if idx != -1]
     first_delim = min(delim_positions) if delim_positions else len(rest)
@@ -101,9 +108,13 @@ def redact_stream_url(url: str) -> str:
     suffix = rest[first_delim:]
 
     if "@" in authority:
+        # 密码中若额外出现 '@'（如 p@ss@host），取最右侧 '@' 作为凭据与主机的分界。
         _, host_port = authority.rsplit("@", 1)
         return f"{scheme}://***@{host_port}{suffix}"
 
+    # 兜底分支：authority 本身不像合法主机且后续文本仍含 '@'，说明凭据内可能含未编码的 '/', '?', '#'。
+    # 逐个尝试 '@'：仅当左侧含 ':'（符合 user:pass 形态）且右侧紧邻合法主机/端口时才脱敏，
+    # 从而避免把查询参数里的邮箱（如 ?email=a@b.com）误当作账号密码遮掩。
     if "@" in rest and not _is_valid_host_port(authority):
         search_start = 0
         while True:
@@ -126,6 +137,7 @@ def redact_stream_url(url: str) -> str:
 
 def normalize_session_source(source: str | int | Path) -> str:
     """归一化跟踪输入源标识：兼容摄像头索引、推流 URL 与本地文件路径。"""
+    # Python 中 bool 是 int 的子类，必须先拒绝布尔值，避免 True/False 被当作摄像头 1/0。
     if type(source) is bool:
         raise ValueError("输入源不能为布尔值")
     if type(source) is int:
@@ -136,10 +148,12 @@ def normalize_session_source(source: str | int | Path) -> str:
         stripped = source.strip()
         if not stripped:
             raise ValueError("输入源不能为空")
+        # 仅将 ASCII 纯数字视作摄像头索引；'²' 等 Unicode 数字不得误判为设备号。
         if stripped.isascii() and stripped.isdigit():
             return f"camera:{int(stripped)}"
         lower = stripped.lower()
         if lower.startswith(LIVE_STREAM_PREFIXES):
+            # 推流 URL 含 '?' 等非法 Windows 文件名字符，不能交给 Path.resolve()；同时必须脱敏凭据。
             return redact_stream_url(stripped)
         if lower.startswith("camera:"):
             idx_part = stripped.split(":", 1)[1].strip()
@@ -407,10 +421,6 @@ def track_video(source, *, weights=DEFAULT_WEIGHTS, tracker=DEFAULT_TRACKER, out
         if history is not None:
             history.reset()
 
-    if output_path is None:
-        if failure is not None:
-            raise failure
-        raise KeyboardInterrupt
     write_json(output_path / "summary.json", {
         "schema_version": 2, "session_id": session.session_id if session else None, "source": str(source),
         "weights": str(Path(weights).expanduser().resolve()),

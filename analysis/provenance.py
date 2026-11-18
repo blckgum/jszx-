@@ -23,6 +23,7 @@ PACKAGE_NAMES = {
 
 def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
     """分块计算文件 SHA256，避免把模型权重整体读入内存。"""
+    # 拒绝 bool（如 True 当 1 字节）及非正分块大小，防止极低效或异常读取。
     if type(chunk_size) is not int or chunk_size <= 0:
         raise ValueError("chunk_size 必须是正整数")
     digest = hashlib.sha256()
@@ -33,6 +34,7 @@ def sha256_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
 
 
 def file_fingerprint(path: str | Path | None) -> dict:
+    # 文件缺失、权限受限或路径未提供时仅标注状态，不阻断主流程运行。
     if path is None:
         return {"path": None, "status": "unavailable", "sha256": None, "size_bytes": None}
     try:
@@ -63,6 +65,7 @@ def package_versions() -> dict[str, str | None]:
 
 
 def git_state(repo_root: str | Path) -> dict:
+    # 即使运行目录脱离 Git 仓库、缺少 git 命令或超时，也降级返回 unavailable，确保不阻断分析主流程。
     try:
         root = Path(repo_root).resolve()
     except Exception:
@@ -104,6 +107,8 @@ def collect_provenance(
     object_policy: str | Path | None,
 ) -> dict:
     """只记录公开运行元数据和指定文件指纹，不读取环境变量或秘密。"""
+    # 只采集公开的 Python/包版本、CUDA 状态、Git 提交及输入文件指纹；
+    # 刻意不转储 os.environ，防止把终端里的代理口令或令牌写入 configuration.json。
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "environment": {

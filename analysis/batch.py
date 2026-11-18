@@ -35,10 +35,18 @@ def analyze_directory(
     **pipeline_kwargs,
 ) -> dict:
     """顺序分析目录下所有支持的视频文件，各自隔离状态并在异常视频处容错继续。"""
+    # 拒绝空字符串目录，防止 Path("") 解析为当前工作目录 '.'。
+    if isinstance(source_dir, str) and not source_dir.strip():
+        raise ValueError("批量分析输入目录不能为空")
+    # 同样拦截空白输出目录字符串，防止 Path("") 解析为 '.' 而把 batch_summary.json 写进当前工作目录。
+    if isinstance(output_dir, str) and not output_dir.strip():
+        raise ValueError("批量分析输出目录不能为空")
     src_dir = Path(source_dir).expanduser().resolve()
     if not src_dir.is_dir():
         raise ValueError(f"批量分析输入必须是已存在的本地目录: {src_dir}")
 
+    # 启动时一次性扫描顶层视频文件并按文件名排序，不递归扫描子目录，
+    # 避免输出目录在输入目录下时把生成的 annotated_conflict.mp4 再次当作输入。
     videos = sorted(
         (p for p in src_dir.iterdir() if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES),
         key=lambda p: p.name,
@@ -68,9 +76,11 @@ def analyze_directory(
         "results": [],
     }
     summary_path = out_root / "batch_summary.json"
+    # 启动即落盘并随每段视频处理完成增量刷新，确保异常中断时已完成进度仍可追溯。
     _write_batch_summary(summary_path, batch_summary)
 
     for idx, video in enumerate(videos):
+        # 序号前缀防止同名不同扩展名视频（如 a.mp4 与 a.avi）共用同一子目录而互相覆写。
         dest = out_root / f"{idx + 1:04d}_{video.stem}"
         entry: dict = {"source": str(video), "output": str(dest)}
         try:
@@ -97,6 +107,7 @@ def analyze_directory(
             batch_summary["total_caution_events"] += child["total_caution_events"]
             batch_summary["total_critical_conflicts"] += child["total_critical_conflicts"]
         except KeyboardInterrupt:
+            # 收到 Ctrl+C 时立刻停止后续视频，保留已完成结果并标记 interrupted。
             entry.update({"status": "interrupted", "stop_reason": "interrupt"})
             batch_summary["results"].append(entry)
             batch_summary["status"] = "interrupted"
@@ -104,6 +115,7 @@ def analyze_directory(
             _write_batch_summary(summary_path, batch_summary)
             break
         except Exception as exc:
+            # 单段视频损坏或解码失败只记入 results，不阻断队列中的下一段视频。
             entry.update({
                 "status": "failed",
                 "stop_reason": "error",
@@ -111,6 +123,7 @@ def analyze_directory(
             })
 
         batch_summary["results"].append(entry)
+        # 在 --show 模式下按 'q' 主动退出时终止整个批次，避免下一段视频再次弹出窗口。
         if entry.get("stop_reason") == "user_quit":
             batch_summary["status"] = "stopped"
         batch_summary["videos_not_processed"] = len(videos) - len(batch_summary["results"])
@@ -118,6 +131,7 @@ def analyze_directory(
         if batch_summary["status"] == "stopped":
             break
 
+    # 若队列全程未被 Ctrl+C 中断或 --show 主动退出，则根据是否存在单段失败定为 completed_with_errors / completed。
     if batch_summary["status"] == "running":
         has_failures = any(item["status"] == "failed" for item in batch_summary["results"])
         batch_summary["status"] = "completed_with_errors" if has_failures else "completed"

@@ -18,6 +18,7 @@ from .policy import ObjectPolicy, object_policy
 
 
 def _is_finite_number(value) -> bool:
+    # Python 中 bool 是 int 子类，需先排除布尔值避免 True/False 当数值通过校验。
     return (
         type(value) is not bool
         and isinstance(value, (int, float))
@@ -86,6 +87,8 @@ class TrackMotionTracker:
         self.stationary_min_frames = stationary_min_frames
         self.reliable_min_span_s = float(reliable_min_span_s)
         self.object_policies = object_policies
+        # 类别为车辆时，过滤误传入的 person/pedestrian 标签（含 Mock 占位对象），
+        # 避免把车辆的碰撞安全半径错误缩减成行人半径。
         if category in ("pedestrian", "person"):
             self.object_kind = object_policy(None, category, object_policies).kind
         else:
@@ -133,7 +136,7 @@ class TrackMotionTracker:
         # 非有限观测（如地平线附近的退化投影点）不进入历史，
         # 否则 NaN 经差分进入 EMA 后会使平滑速度永久不可恢复；
         # 读数回填最后有效位置，不把 NaN 暴露给下游渲染/研判
-        if not (math.isfinite(timestamp_s) and math.isfinite(x_m) and math.isfinite(y_m)):
+        if not (_is_finite_number(timestamp_s) and _is_finite_number(x_m) and _is_finite_number(y_m)):
             x_out, y_out = self._last_valid_xy if self._last_valid_xy is not None else (0.0, 0.0)
             return SpeedReading(
                 track_id=self.track_id,
@@ -221,7 +224,7 @@ class TrackMotionTracker:
         speed_kmh = speed_ms * 3.6
 
         # 行人微动阈值截断（静止站立摆动不计为移动速度）
-        if self.category == "pedestrian" and speed_kmh < 0.8:
+        if self.category in ("pedestrian", "person") and speed_kmh < 0.8:
             speed_ms, speed_kmh = 0.0, 0.0
         elif self.category == "vehicle" and speed_kmh < 1.0:
             speed_ms, speed_kmh = 0.0, 0.0
@@ -317,7 +320,7 @@ class SpeedEstimator:
             tracker = self.tracks[track_id]
             # 无效观测（非有限时间戳/坐标）在 tracker 内会早退不写历史，
             # 此处同样不得推进类别滞回计数——拒绝与忽略都必须无副作用
-            if math.isfinite(timestamp_s) and math.isfinite(x_m) and math.isfinite(y_m):
+            if _is_finite_number(timestamp_s) and _is_finite_number(x_m) and _is_finite_number(y_m):
                 if (
                     tracker._last_timestamp_s is not None
                     and timestamp_s <= tracker._last_timestamp_s
@@ -326,19 +329,28 @@ class SpeedEstimator:
                 # 跟踪 ID 沿用期间检测类别可能被纠正（如 person -> car），
                 # 但每帧观测可能抖动，需连续确认后才切换类别
                 tracker.observe_category(category, self.category_confirm_frames)
+                # 只有已确认类别切换后才同步刷新细分子类 object_kind，
+                # 防止单帧误检（如 car 闪现成 person）提前缩减车辆安全半径。
                 if tracker.category in ("pedestrian", "person"):
-                    tracker.object_kind = "pedestrian"
+                    tracker.object_kind = object_policy(
+                        None, tracker.category, tracker.object_policies
+                    ).kind
                 else:
                     has_valid_veh_kind = (
                         isinstance(object_kind, str)
                         and bool(object_kind.strip())
                         and object_kind.strip().lower() not in ("person", "pedestrian")
                     )
+                    ped_kind = object_policy(
+                        None, "pedestrian", tracker.object_policies
+                    ).kind
                     if category == tracker.category and has_valid_veh_kind:
                         tracker.object_kind = object_policy(
                             object_kind, tracker.category, tracker.object_policies
                         ).kind
-                    elif tracker.object_kind == "pedestrian":
+                    # 若确认类别已从行人切回车辆而本帧未带合法车型子类，需把原先的行人 kind
+                    # 恢复为默认机动车策略（同时兼容自定义策略 YAML 里的行人 kind 名称）。
+                    elif tracker.object_kind in ("pedestrian", ped_kind):
                         safe_kind = object_kind if has_valid_veh_kind else None
                         tracker.object_kind = object_policy(
                             safe_kind, tracker.category, tracker.object_policies
