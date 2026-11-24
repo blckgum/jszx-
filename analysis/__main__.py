@@ -214,6 +214,23 @@ def main(argv: list[str] | None = None):
         help="开启短时遮挡断轨缝合 (TrackletStitcher)，跨 ID 切换保留轨迹与事件连续性",
     )
     parser.add_argument(
+        "--include-cyclist-vru",
+        action="store_true",
+        help="将自行车与摩托车骑行者纳入弱势交通参与者 (VRU) 冲突研判",
+    )
+    parser.add_argument(
+        "--live-reconnect-attempts",
+        type=int,
+        default=3,
+        help="实时流断流后的最大连续重连次数（0 表示不重连），默认 3",
+    )
+    parser.add_argument(
+        "--live-reconnect-delay",
+        type=float,
+        default=1.0,
+        help="实时流重连等待间隔 (秒)，默认 1.0",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="是否开启本地桌面实时播放窗口",
@@ -258,6 +275,10 @@ def main(argv: list[str] | None = None):
         parser.error("--speed-limit 必须为正数")
     if not math.isfinite(args.parking_speed) or args.parking_speed < 0:
         parser.error("--parking-speed 必须为有限非负数")
+    if args.live_reconnect_attempts < 0:
+        parser.error("--live-reconnect-attempts 必须是 >= 0 的整数")
+    if not math.isfinite(args.live_reconnect_delay) or args.live_reconnect_delay < 0:
+        parser.error("--live-reconnect-delay 必须为有限非负数")
     if args.source is None and args.tracks is None:
         parser.error("必须至少指定 --source 或 --tracks")
     # 提前拒绝空白路径字符串：Python 中 Path("") 等价于当前目录 '.'，
@@ -379,6 +400,9 @@ def main(argv: list[str] | None = None):
         speed_model=args.speed_model,
         conflict_model=args.conflict_model,
         enable_stitching=args.enable_stitching,
+        include_cyclist_vru=args.include_cyclist_vru,
+        live_reconnect_attempts=args.live_reconnect_attempts,
+        live_reconnect_delay_s=args.live_reconnect_delay,
     )
 
     if source_is_dir:

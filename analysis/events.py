@@ -24,7 +24,7 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .conflict import ConflictAssessment, RiskLevel
+from .conflict import ConflictAssessment, RiskLevel, _is_finite_number
 
 
 EventKey = Tuple[int, Optional[int]]
@@ -46,6 +46,11 @@ class AlertEvent:
     alarm_frames: int              # 告警条件实际满足的帧数
     gap_frames: int = 0            # 事件存续期间被冷却窗吸收的静默帧总数
     end_reason: str = ""           # "cooldown" | "eof" | "max_frames" | "user_quit" | "interrupt" | "exception"
+    min_mttc_seconds: Optional[float] = None
+    max_drac_ms2: Optional[float] = None
+    min_pet_seconds: Optional[float] = None
+    max_collision_prob: Optional[float] = None
+    target_kind: str = "pedestrian"
 
     @property
     def kind(self) -> str:
@@ -77,6 +82,27 @@ class AlertEvent:
                 if self.min_ttc_seconds is not None
                 else None
             ),
+            "min_mttc_seconds": (
+                round(float(self.min_mttc_seconds), 3)
+                if self.min_mttc_seconds is not None
+                else None
+            ),
+            "max_drac_ms2": (
+                round(float(self.max_drac_ms2), 3)
+                if self.max_drac_ms2 is not None
+                else None
+            ),
+            "min_pet_seconds": (
+                round(float(self.min_pet_seconds), 3)
+                if self.min_pet_seconds is not None
+                else None
+            ),
+            "max_collision_prob": (
+                round(float(self.max_collision_prob), 4)
+                if self.max_collision_prob is not None
+                else None
+            ),
+            "target_kind": self.target_kind,
             "max_veh_speed_kmh": round(self.max_veh_speed_kmh, 1),
             "end_reason": self.end_reason,
         }
@@ -91,12 +117,58 @@ class _PendingStreak:
     peak: RiskLevel = RiskLevel.LEVEL_0_SAFE
     min_ttc: Optional[float] = None
     max_speed_kmh: float = 0.0
+    min_mttc_seconds: Optional[float] = None
+    max_drac_ms2: Optional[float] = None
+    min_pet_seconds: Optional[float] = None
+    max_collision_prob: Optional[float] = None
+    target_kind: str = "pedestrian"
 
     def reset(self):
         self.streak = 0
         self.peak = RiskLevel.LEVEL_0_SAFE
         self.min_ttc = None
         self.max_speed_kmh = 0.0
+        self.min_mttc_seconds = None
+        self.max_drac_ms2 = None
+        self.min_pet_seconds = None
+        self.max_collision_prob = None
+        self.target_kind = "pedestrian"
+
+
+def _accumulate_ssm_fields(
+    target: AlertEvent | _PendingStreak, assessment: ConflictAssessment
+) -> None:
+    """在挂起确认或事件存续期间累积有限 SSM 峰值指标与弱势目标类型。"""
+    raw_mttc = getattr(assessment, "mttc_seconds", None)
+    if raw_mttc is not None and _is_finite_number(raw_mttc):
+        val = float(raw_mttc)
+        if target.min_mttc_seconds is None or val < target.min_mttc_seconds:
+            target.min_mttc_seconds = val
+
+    raw_drac = getattr(assessment, "drac_ms2", None)
+    if raw_drac is not None and _is_finite_number(raw_drac):
+        val = float(raw_drac)
+        if target.max_drac_ms2 is None or val > target.max_drac_ms2:
+            target.max_drac_ms2 = val
+
+    raw_pet = getattr(assessment, "pet_seconds", None)
+    if raw_pet is not None and _is_finite_number(raw_pet):
+        val = float(raw_pet)
+        if target.min_pet_seconds is None or val < target.min_pet_seconds:
+            target.min_pet_seconds = val
+
+    raw_prob = getattr(assessment, "collision_prob", None)
+    if raw_prob is not None and _is_finite_number(raw_prob):
+        val = float(raw_prob)
+        if target.max_collision_prob is None or val > target.max_collision_prob:
+            target.max_collision_prob = val
+
+    raw_kind = getattr(assessment, "target_kind", None)
+    if isinstance(raw_kind, str) and raw_kind.strip():
+        clean_kind = raw_kind.strip()
+        # 优先保留已识别的非默认弱势目标类别（如 bicycle/motorcycle），防止瞬时默认字段回退覆盖。
+        if target.target_kind == "pedestrian" or clean_kind != "pedestrian":
+            target.target_kind = clean_kind
 
 
 @dataclass
@@ -181,11 +253,12 @@ class ConflictEventTracker:
                 ev.end_timestamp_s = timestamp_s
                 if c.risk_level > ev.peak_risk_level:
                     ev.peak_risk_level = c.risk_level
-                if c.ttc_seconds is not None and (
+                if c.ttc_seconds is not None and _is_finite_number(c.ttc_seconds) and (
                     ev.min_ttc_seconds is None or c.ttc_seconds < ev.min_ttc_seconds
                 ):
-                    ev.min_ttc_seconds = c.ttc_seconds
+                    ev.min_ttc_seconds = float(c.ttc_seconds)
                 ev.max_veh_speed_kmh = max(ev.max_veh_speed_kmh, c.veh_speed_kmh)
+                _accumulate_ssm_fields(ev, c)
                 ev.alarm_frames += 1
                 annotations[key] = ev.event_id
             else:
@@ -196,11 +269,12 @@ class ConflictEventTracker:
                 p.streak += 1
                 if c.risk_level > p.peak:
                     p.peak = c.risk_level
-                if c.ttc_seconds is not None and (
+                if c.ttc_seconds is not None and _is_finite_number(c.ttc_seconds) and (
                     p.min_ttc is None or c.ttc_seconds < p.min_ttc
                 ):
-                    p.min_ttc = c.ttc_seconds
+                    p.min_ttc = float(c.ttc_seconds)
                 p.max_speed_kmh = max(p.max_speed_kmh, c.veh_speed_kmh)
+                _accumulate_ssm_fields(p, c)
 
                 if p.streak >= self.confirm_frames:
                     st.event = AlertEvent(
@@ -215,6 +289,11 @@ class ConflictEventTracker:
                         min_ttc_seconds=p.min_ttc,
                         max_veh_speed_kmh=p.max_speed_kmh,
                         alarm_frames=p.streak,
+                        min_mttc_seconds=p.min_mttc_seconds,
+                        max_drac_ms2=p.max_drac_ms2,
+                        min_pet_seconds=p.min_pet_seconds,
+                        max_collision_prob=p.max_collision_prob,
+                        target_kind=p.target_kind,
                     )
                     self._next_event_id += 1
                     p.reset()

@@ -177,6 +177,13 @@ def validate_configuration(data):
             raise SchemaValidationError("configuration.conflict_model 必须是 cvm_circle 或 obb_ssm")
     if "enable_stitching" in data and type(data["enable_stitching"]) is not bool:
         raise SchemaValidationError("configuration.enable_stitching 必须是布尔值")
+    # 兼容骑行者 VRU 与实时流断流重连配置开关（旧版配置省略时保持向后兼容）。
+    if "include_cyclist_vru" in data and type(data["include_cyclist_vru"]) is not bool:
+        raise SchemaValidationError("configuration.include_cyclist_vru 必须是布尔值")
+    if "live_reconnect_attempts" in data:
+        _integer(data["live_reconnect_attempts"], "configuration.live_reconnect_attempts", minimum=0)
+    if "live_reconnect_delay_s" in data:
+        _finite_number(data["live_reconnect_delay_s"], "configuration.live_reconnect_delay_s", minimum=0)
 
     reproducibility = _mapping(data["reproducibility"], "configuration.reproducibility")
     _required(reproducibility, ("generated_at", "environment", "git", "artifacts"),
@@ -217,6 +224,9 @@ def validate_summary(data):
             _integer(data[key], f"summary.{key}", minimum=0)
     if "stitched_track_count" in data:
         _integer(data["stitched_track_count"], "summary.stitched_track_count", minimum=0)
+    # 兼容实时流重连次数统计字段。
+    if "live_reconnect_count" in data:
+        _integer(data["live_reconnect_count"], "summary.live_reconnect_count", minimum=0)
     return data
 
 
@@ -251,6 +261,10 @@ def validate_conflict_record(data):
     if "conflict_model" in assessment:
         if not isinstance(assessment["conflict_model"], str) or assessment["conflict_model"] not in {"cvm_circle", "obb_ssm"}:
             raise SchemaValidationError("conflict.conflict_model 必须是 cvm_circle 或 obb_ssm")
+    # 可选校验弱势对象类型（若存在且非 null，必须为非空白字符串）。
+    if "target_kind" in assessment and assessment["target_kind"] is not None:
+        if not isinstance(assessment["target_kind"], str) or not assessment["target_kind"].strip():
+            raise SchemaValidationError("conflict.target_kind 必须是非空字符串")
     return data
 
 
@@ -284,6 +298,15 @@ def validate_event_record(data):
         _finite_number(data["min_ttc_seconds"], "event.min_ttc_seconds", minimum=0)
     if not isinstance(data["end_reason"], str) or not data["end_reason"].strip():
         raise SchemaValidationError("event.end_reason 必须是非空字符串")
+    # 兼容可选事件级 SSM 极值与弱势目标类型，缺失时保持旧版 JSONL 100% 兼容。
+    if "target_kind" in data:
+        if not isinstance(data["target_kind"], str) or not data["target_kind"].strip():
+            raise SchemaValidationError("event.target_kind 必须是非空字符串")
+    for opt_num in ("min_mttc_seconds", "max_drac_ms2", "min_pet_seconds"):
+        if opt_num in data and data[opt_num] is not None:
+            _finite_number(data[opt_num], f"event.{opt_num}", minimum=0)
+    if "max_collision_prob" in data and data["max_collision_prob"] is not None:
+        _finite_number(data["max_collision_prob"], "event.max_collision_prob", minimum=0, maximum=1)
     return data
 
 

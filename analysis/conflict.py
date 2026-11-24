@@ -29,6 +29,9 @@ from .ssm import (
 )
 
 
+VRU_CYCLIST_KINDS = ("bicycle", "motorcycle")
+
+
 class RiskLevel(IntEnum):
     """预警严重等级枚举"""
     LEVEL_0_SAFE = 0       # 绿色：正常受控行驶，无冲突
@@ -56,6 +59,7 @@ class ConflictAssessment:
     pet_seconds: Optional[float] = None
     collision_prob: Optional[float] = None
     conflict_model: str = "cvm_circle"
+    target_kind: str = "pedestrian"
 
 
 def _is_finite_number(value) -> bool:
@@ -82,14 +86,22 @@ def build_conflict_maps(
 ) -> Tuple[Dict[int, ConflictAssessment], Dict[int, ConflictAssessment]]:
     """构建车辆侧与行人侧的 track_id -> 最高风险冲突映射；
     同一行人被多车关联时保留最高 risk_level、同级取最小 TTC"""
-    veh_map = {c.veh_track_id: c for c in conflicts}
+    veh_map: Dict[int, ConflictAssessment] = {}
     ped_map: Dict[int, ConflictAssessment] = {}
     for c in conflicts:
+        cur_v = veh_map.get(c.veh_track_id)
+        if cur_v is None or _conflict_sort_key(c) > _conflict_sort_key(cur_v):
+            veh_map[c.veh_track_id] = c
         if c.ped_track_id is None:
             continue
         cur = ped_map.get(c.ped_track_id)
         if cur is None or _conflict_sort_key(c) > _conflict_sort_key(cur):
             ped_map[c.ped_track_id] = c
+    # 若骑行者同时作为车辆侧与被撞目标侧出现且被撞风险更高，移除低优车辆侧条目以免下游 or 遮蔽高风险预警。
+    for tid, ped_conflict in ped_map.items():
+        veh_conflict = veh_map.get(tid)
+        if veh_conflict is not None and _conflict_sort_key(ped_conflict) > _conflict_sort_key(veh_conflict):
+            del veh_map[tid]
     return veh_map, ped_map
 
 
@@ -111,6 +123,7 @@ class ConflictAnalyzer:
         drac_caution_ms2: float = 2.0,
         pet_critical_s: float = 1.0,
         pet_caution_s: float = 2.0,
+        include_cyclist_vru: bool = False,
     ):
         if not _is_finite_number(speed_limit_kmh) or speed_limit_kmh <= 0:
             raise ValueError("speed_limit_kmh 必须为有限正数")
@@ -144,6 +157,9 @@ class ConflictAnalyzer:
             and 0 < pet_critical_s <= pet_caution_s
         ):
             raise ValueError("PET 阈值需满足 0 < pet_critical_s <= pet_caution_s")
+        # 严格用精确 type() 校验，避免 int(0/1) 或字符串混入布尔开关。
+        if type(include_cyclist_vru) is not bool:
+            raise ValueError("include_cyclist_vru 必须是布尔值")
 
         self.speed_limit_kmh = float(speed_limit_kmh)
         self.safe_radius_veh_m = float(safe_radius_veh_m)
@@ -159,12 +175,47 @@ class ConflictAnalyzer:
         self.drac_caution_ms2 = float(drac_caution_ms2)
         self.pet_critical_s = float(pet_critical_s)
         self.pet_caution_s = float(pet_caution_s)
+        self.include_cyclist_vru = include_cyclist_vru
         self.pet_tracker = PETTracker() if self.conflict_model == "obb_ssm" else None
 
     def reset(self) -> None:
         """重置冲突分析器内部状态（如 PET 网格历史），供复用实例跨运行隔离状态。"""
         if self.pet_tracker is not None:
             self.pet_tracker.reset()
+
+    def _resolve_target_meta(self, ped: SpeedReading) -> Tuple[ObjectPolicy, bool, str, str]:
+        """解析弱势目标策略、是否骑行者、落盘 target_kind 及告警称呼。"""
+        target_policy = object_policy(ped.object_kind, ped.category, self.object_policies)
+        is_cyclist = target_policy.kind in VRU_CYCLIST_KINDS
+        target_kind = target_policy.kind if is_cyclist else "pedestrian"
+        target_label = "骑行者" if is_cyclist else "行人"
+        return target_policy, is_cyclist, target_kind, target_label
+
+    def _is_reading_finite(self, reading: SpeedReading) -> bool:
+        """校验参与冲突评估的读数运动学字段是否全部为有限数值（含 obb_ssm 朝向与加速度）。"""
+        if not all(
+            _is_finite_number(v)
+            for v in (
+                reading.x_m,
+                reading.y_m,
+                reading.vx_ms,
+                reading.vy_ms,
+                reading.speed_ms,
+                reading.speed_kmh,
+            )
+        ):
+            return False
+        if self.conflict_model == "obb_ssm":
+            # obb_ssm 模式下同步校验朝向与加速度，None 按缺失回退默认逻辑兼容，NaN/Inf/bool 则整目标跳过。
+            raw_heading = getattr(reading, "heading_deg", None)
+            raw_ax = getattr(reading, "ax_ms2", 0.0)
+            raw_ay = getattr(reading, "ay_ms2", 0.0)
+            heading_chk = 0.0 if raw_heading is None else raw_heading
+            ax_chk = 0.0 if raw_ax is None else raw_ax
+            ay_chk = 0.0 if raw_ay is None else raw_ay
+            if not all(_is_finite_number(v) for v in (heading_chk, ax_chk, ay_chk)):
+                return False
+        return True
 
     def _is_vehicle_exempt(self, veh: SpeedReading) -> bool:
         """判断车辆是否因确认静止或停车区内低速挪动而豁免冲突研判。"""
@@ -199,12 +250,17 @@ class ConflictAnalyzer:
             return None
 
         vehicle_policy = object_policy(veh.object_kind, veh.category, self.object_policies)
+        target_policy, is_cyclist, target_kind, target_label = self._resolve_target_meta(ped)
         veh_radius_m = (
             self.safe_radius_veh_m
             if (self.object_policies is None and vehicle_policy.kind == "motor_vehicle")
             else vehicle_policy.safe_radius_veh_m
         )
-        critical_dist_m = veh_radius_m + self.safe_radius_ped_m
+        # 骑行者 (bicycle/motorcycle) 按其策略半径参与交互，常规行人沿用安全半径配置。
+        ped_radius_m = (
+            target_policy.safe_radius_veh_m if is_cyclist else self.safe_radius_ped_m
+        )
+        critical_dist_m = veh_radius_m + ped_radius_m
 
         dvx = ped.vx_ms - veh.vx_ms
         dvy = ped.vy_ms - veh.vy_ms
@@ -230,15 +286,16 @@ class ConflictAnalyzer:
         if min_dist <= critical_dist_m:
             if t_cpa <= self.ttc_critical_s:
                 level = RiskLevel.LEVEL_3_CRITICAL
-                desc = f"紧急碰撞危险! (TTC={t_cpa:.1f}s, 预计间距={min_dist:.1f}m)"
+                crit_prefix = f"紧急碰撞危险({target_label})!" if is_cyclist else "紧急碰撞危险!"
+                desc = f"{crit_prefix} (TTC={t_cpa:.1f}s, 预计间距={min_dist:.1f}m)"
             elif t_cpa <= self.ttc_caution_s:
                 level = RiskLevel.LEVEL_2_CAUTION
-                desc = f"注意减速礼让行人 (TTC={t_cpa:.1f}s, 轨迹汇聚)"
+                desc = f"注意减速礼让{target_label} (TTC={t_cpa:.1f}s, 轨迹汇聚)"
             else:
                 return None
         elif min_dist <= critical_dist_m * 1.5 and t_cpa <= self.ttc_caution_s:
             level = RiskLevel.LEVEL_2_CAUTION
-            desc = f"注意横穿行人 (预计间距={min_dist:.1f}m)"
+            desc = f"注意横穿{target_label} (预计间距={min_dist:.1f}m)"
         else:
             return None
 
@@ -255,6 +312,7 @@ class ConflictAnalyzer:
             conflict_ground_xy=(conflict_x, conflict_y),
             vehicle_kind=vehicle_policy.kind,
             conflict_model="cvm_circle",
+            target_kind=target_kind,
         )
 
     def _evaluate_pair_obb_ssm(
@@ -266,18 +324,20 @@ class ConflictAnalyzer:
         raw_ped_ax = getattr(ped, "ax_ms2", 0.0)
         raw_ped_ay = getattr(ped, "ay_ms2", 0.0)
         raw_veh_heading = getattr(veh, "heading_deg", None)
+        raw_ped_heading = getattr(ped, "heading_deg", None)
         veh_ax = 0.0 if raw_veh_ax is None else raw_veh_ax
         veh_ay = 0.0 if raw_veh_ay is None else raw_veh_ay
         ped_ax = 0.0 if raw_ped_ax is None else raw_ped_ax
         ped_ay = 0.0 if raw_ped_ay is None else raw_ped_ay
         # heading_deg 为 None 时允许回退速度矢量方向，但 NaN/Inf/bool 等无效值必须拦截。
         veh_heading_chk = 0.0 if raw_veh_heading is None else raw_veh_heading
+        ped_heading_chk = 0.0 if raw_ped_heading is None else raw_ped_heading
 
         if not all(
             _is_finite_number(v)
             for v in (
                 veh.x_m, veh.y_m, veh.vx_ms, veh.vy_ms, veh.speed_kmh, veh_heading_chk,
-                ped.x_m, ped.y_m, ped.vx_ms, ped.vy_ms, ped.speed_ms,
+                ped.x_m, ped.y_m, ped.vx_ms, ped.vy_ms, ped.speed_ms, ped_heading_chk,
                 veh_ax, veh_ay, ped_ax, ped_ay,
             )
         ):
@@ -292,14 +352,18 @@ class ConflictAnalyzer:
             return None
 
         vehicle_policy = object_policy(veh.object_kind, veh.category, self.object_policies)
-        ped_policy = object_policy(ped.object_kind, ped.category, self.object_policies)
+        ped_policy, is_cyclist, target_kind, target_label = self._resolve_target_meta(ped)
         veh_length_m = vehicle_policy.length_m
         veh_width_m = vehicle_policy.width_m
-        ped_radius_m = (
-            self.safe_radius_ped_m
-            if abs(self.safe_radius_ped_m - 0.8) > 1e-9
-            else 0.5 * max(ped_policy.length_m, ped_policy.width_m)
-        )
+        # 骑行者在 OBB-SSM 下使用自身外包半长作为交互半径，常规行人保持既有半径回退。
+        if is_cyclist:
+            ped_radius_m = 0.5 * max(ped_policy.length_m, ped_policy.width_m)
+        else:
+            ped_radius_m = (
+                self.safe_radius_ped_m
+                if abs(self.safe_radius_ped_m - 0.8) > 1e-9
+                else 0.5 * max(ped_policy.length_m, ped_policy.width_m)
+            )
 
         veh_vx, veh_vy = float(veh.vx_ms), float(veh.vy_ms)
         ped_vx, ped_vy = float(ped.vx_ms), float(ped.vy_ms)
@@ -382,8 +446,9 @@ class ConflictAnalyzer:
             if obb.collides and obb.t_enter is not None and obb.t_enter <= self.ttc_critical_s:
                 level = RiskLevel.LEVEL_2_CAUTION
                 t_eff: Optional[float] = obb.t_enter
+                brake_prefix = f"减速制动礼让{target_label}中" if is_cyclist else "减速制动礼让中"
                 desc = (
-                    f"减速制动礼让中 (MTTC安全, DRAC={drac:.2f}m/s^2, "
+                    f"{brake_prefix} (MTTC安全, DRAC={drac:.2f}m/s^2, "
                     f"净距={min_dist_out:.2f}m)"
                 )
             else:
@@ -414,13 +479,14 @@ class ConflictAnalyzer:
 
             drac_txt = f"{drac:.2f}" if drac is not None else "0.00"
             if level == RiskLevel.LEVEL_3_CRITICAL:
+                crit_prefix = f"紧急碰撞危险({target_label})!" if is_cyclist else "紧急碰撞危险!"
                 desc = (
-                    f"紧急碰撞危险! (OBB-TTC={t_eff:.2f}s, "
+                    f"{crit_prefix} (OBB-TTC={t_eff:.2f}s, "
                     f"DRAC={drac_txt}m/s^2, 净距={min_dist_out:.2f}m)"
                 )
             else:
                 desc = (
-                    f"注意减速礼让行人 (OBB-TTC={t_eff:.2f}s, "
+                    f"注意减速礼让{target_label} (OBB-TTC={t_eff:.2f}s, "
                     f"DRAC={drac_txt}m/s^2, 净距={min_dist_out:.2f}m)"
                 )
 
@@ -463,6 +529,7 @@ class ConflictAnalyzer:
             pet_seconds=None,
             collision_prob=prob,
             conflict_model="obb_ssm",
+            target_kind=target_kind,
         )
 
     def evaluate_pair(
@@ -484,37 +551,39 @@ class ConflictAnalyzer:
             if not _is_finite_number(timestamp_s) or float(timestamp_s) < 0.0:
                 raise ValueError("timestamp_s 必须为有限非负数")
 
-        vehicles = [r for r in readings if r.category == "vehicle"]
-        pedestrians = [r for r in readings if r.category in ("pedestrian", "person")]
+        # 无论默认模式还是 VRU 模式，所有进入冲突评估与 PET 网格的读数均先做有限字段校验。
+        valid_readings = [r for r in readings if self._is_reading_finite(r)]
+        pedestrians = [r for r in valid_readings if r.category in ("pedestrian", "person")]
+        cyclists: List[SpeedReading] = []
+        eval_entries: List[Tuple[SpeedReading, bool]] = []
+        for r in valid_readings:
+            if r.category == "vehicle":
+                pol = object_policy(r.object_kind, r.category, self.object_policies)
+                is_cyc = self.include_cyclist_vru and pol.kind in VRU_CYCLIST_KINDS
+                if is_cyc:
+                    cyclists.append(r)
+                eval_entries.append((r, is_cyc))
+            elif self.include_cyclist_vru and r.category in VRU_CYCLIST_KINDS:
+                cyclists.append(r)
+                eval_entries.append((r, True))
+
         ped_by_id = {p.track_id: p for p in pedestrians}
+        # 开启骑行者 VRU 时，非骑行者机动车与行人+骑行者评估；骑行者仅与行人评估以免与机动车双向重复告警。
+        vru_targets = pedestrians + cyclists if self.include_cyclist_vru else pedestrians
 
         pet_map: Dict[Tuple[int, int], float] = {}
         if self.conflict_model == "obb_ssm" and self.pet_tracker is not None and timestamp_s is not None:
-            pet_map = self.pet_tracker.update(readings, float(timestamp_s))
+            pet_map = self.pet_tracker.update(valid_readings, float(timestamp_s))
 
         assessments: List[ConflictAssessment] = []
 
-        for veh in vehicles:
-            # 跳过任意运动学字段非有限的车辆读数，防止 NaN 落入 LEVEL_0_SAFE 并在严格 JSON 落盘崩溃。
-            if not all(
-                _is_finite_number(v)
-                for v in (veh.x_m, veh.y_m, veh.vx_ms, veh.vy_ms, veh.speed_kmh)
-            ):
-                continue
-            if self.conflict_model == "obb_ssm":
-                # obb_ssm 模式下同步校验朝向与加速度，None 按缺失回退默认逻辑兼容，NaN/Inf/bool 则整车跳过。
-                raw_heading = getattr(veh, "heading_deg", None)
-                raw_ax = getattr(veh, "ax_ms2", 0.0)
-                raw_ay = getattr(veh, "ay_ms2", 0.0)
-                heading_chk = 0.0 if raw_heading is None else raw_heading
-                ax_chk = 0.0 if raw_ax is None else raw_ax
-                ay_chk = 0.0 if raw_ay is None else raw_ay
-                if not all(_is_finite_number(v) for v in (heading_chk, ax_chk, ay_chk)):
-                    continue
-
+        for veh, is_cyclist_actor in eval_entries:
             highest_conflict: Optional[ConflictAssessment] = None
+            targets = pedestrians if is_cyclist_actor else vru_targets
 
-            for ped in pedestrians:
+            for ped in targets:
+                if ped.track_id == veh.track_id:
+                    continue
                 conflict = self.evaluate_pair(veh, ped)
                 if conflict is not None:
                     if (
@@ -529,7 +598,11 @@ class ConflictAnalyzer:
                 for (v_id, p_id), pet_s in pet_map.items():
                     if v_id != veh.track_id:
                         continue
-                    if highest_conflict is not None and highest_conflict.ped_track_id == p_id:
+                    if (
+                        highest_conflict is not None
+                        and highest_conflict.ped_track_id == p_id
+                        and highest_conflict.target_kind == "pedestrian"
+                    ):
                         highest_conflict.pet_seconds = pet_s
                         if pet_s <= self.pet_critical_s and highest_conflict.risk_level < RiskLevel.LEVEL_3_CRITICAL:
                             highest_conflict.risk_level = RiskLevel.LEVEL_3_CRITICAL
@@ -592,7 +665,11 @@ class ConflictAnalyzer:
             veh_kind = object_policy(veh.object_kind, veh.category, self.object_policies).kind
             if highest_conflict is not None:
                 assessments.append(highest_conflict)
-            elif veh.category == "vehicle" and _is_finite_number(veh.speed_kmh) and veh.speed_kmh > self.speed_limit_kmh:
+            elif (
+                (veh.category == "vehicle" or veh.category in VRU_CYCLIST_KINDS)
+                and _is_finite_number(veh.speed_kmh)
+                and veh.speed_kmh > self.speed_limit_kmh
+            ):
                 assessments.append(
                     ConflictAssessment(
                         veh_track_id=veh.track_id,

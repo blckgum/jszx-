@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional
 
 import cv2
+import numpy as np
 
 from detection.core import DEFAULT_WEIGHTS, is_blank_path
 from tracking.core import (
@@ -39,7 +40,7 @@ from .conflict import (
     build_conflict_maps,
 )
 from .events import ConflictEventTracker
-from .policy import DEFAULT_OBJECT_POLICY_CONFIG, read_object_policy_config
+from .policy import DEFAULT_OBJECT_POLICY_CONFIG, object_policy, read_object_policy_config
 from .provenance import collect_provenance
 from .speed import SpeedEstimator, SpeedReading
 from .stitching import TrackletStitcher
@@ -173,6 +174,9 @@ class ConflictPerceptionPipeline:
         speed_model: str = "ema",
         conflict_model: str = "cvm_circle",
         enable_stitching: bool = False,
+        include_cyclist_vru: bool = False,
+        live_reconnect_attempts: int = 3,
+        live_reconnect_delay_s: float = 1.0,
     ):
         if type(speed_limit_kmh) not in (int, float) or not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
             raise ValueError("speed_limit_kmh 必须为有限正数")
@@ -244,6 +248,16 @@ class ConflictPerceptionPipeline:
             raise ValueError("conflict_model 必须是 'cvm_circle' 或 'obb_ssm'")
         if type(enable_stitching) is not bool:
             raise ValueError("enable_stitching 必须是布尔值")
+        if type(include_cyclist_vru) is not bool:
+            raise ValueError("include_cyclist_vru 必须是布尔值")
+        if type(live_reconnect_attempts) is not int or live_reconnect_attempts < 0:
+            raise ValueError("live_reconnect_attempts 必须是 >= 0 的整数")
+        if (
+            type(live_reconnect_delay_s) not in (int, float)
+            or not math.isfinite(live_reconnect_delay_s)
+            or live_reconnect_delay_s < 0
+        ):
+            raise ValueError("live_reconnect_delay_s 必须为有限非负数")
 
         self.calibrator = calibrator
         self.weights = weights
@@ -267,6 +281,9 @@ class ConflictPerceptionPipeline:
         self.speed_model = speed_model
         self.conflict_model = conflict_model
         self.enable_stitching = enable_stitching
+        self.include_cyclist_vru = include_cyclist_vru
+        self.live_reconnect_attempts = live_reconnect_attempts
+        self.live_reconnect_delay_s = float(live_reconnect_delay_s)
         self.window_size = window_size
         self.ema_alpha = ema_alpha
         self.ttc_critical_s = ttc_critical_s
@@ -302,6 +319,7 @@ class ConflictPerceptionPipeline:
             object_policies=self.object_policies,
             parking_zone_max_speed_kmh=self.parking_zone_max_speed_kmh,
             conflict_model=self.conflict_model,
+            include_cyclist_vru=self.include_cyclist_vru,
         )
         self.stitcher: Optional[TrackletStitcher] = (
             TrackletStitcher() if self.enable_stitching else None
@@ -350,6 +368,9 @@ class ConflictPerceptionPipeline:
             "speed_model": self.speed_model,
             "conflict_model": self.conflict_model,
             "enable_stitching": self.enable_stitching,
+            "include_cyclist_vru": self.include_cyclist_vru,
+            "live_reconnect_attempts": self.live_reconnect_attempts,
+            "live_reconnect_delay_s": self.live_reconnect_delay_s,
             "ema_alpha": self.ema_alpha,
             "window_size_frames": self.speed_estimator.window_size,
             "window_seconds": self.window_seconds,
@@ -415,6 +436,7 @@ class ConflictPerceptionPipeline:
                 object_policies=self.object_policies,
                 parking_zone_max_speed_kmh=self.parking_zone_max_speed_kmh,
                 conflict_model=self.conflict_model,
+                include_cyclist_vru=self.include_cyclist_vru,
             )
         else:
             reset_fn = getattr(self.conflict_analyzer, "reset", None)
@@ -670,6 +692,28 @@ class ConflictPerceptionPipeline:
             render_frame = frame.copy()
             self.visualizer.draw_calibrated_ground_zone(render_frame)
 
+            # OBB-SSM 模式下先渲染路面车辆旋转包围盒，避免遮挡后续轨迹与标签。
+            if self.conflict_model == "obb_ssm":
+                for r in speed_readings:
+                    if r.category != "vehicle":
+                        continue
+                    pol = object_policy(r.object_kind, r.category, self.object_policies)
+                    if pol.kind == "pedestrian":
+                        continue
+                    c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
+                    obb_color = (
+                        trajectory_color(c)
+                        if c is not None and c.risk_level >= RiskLevel.LEVEL_2_CAUTION
+                        else (0, 220, 180)
+                    )
+                    self.visualizer.draw_vehicle_obb(
+                        render_frame,
+                        r,
+                        length_m=pol.length_m,
+                        width_m=pol.width_m,
+                        color=obb_color,
+                    )
+
             for r in speed_readings:
                 c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
                 self.visualizer.draw_future_trajectory(
@@ -708,6 +752,55 @@ class ConflictPerceptionPipeline:
                 writer.write(render_frame)
 
         return frame_max_speed, render_frame
+
+    def _reconnect_live_capture(
+        self,
+        cap_holder: list,
+        capture_arg: int | str,
+        src_label: str,
+        expected_width: int,
+        expected_height: int,
+    ) -> tuple[bool, Optional[object]]:
+        """实时流断流后连续重连，校验打开状态、首帧解码及分辨率匹配。"""
+        for attempt in range(1, self.live_reconnect_attempts + 1):
+            old_cap = cap_holder[0]
+            if old_cap is not None:
+                try:
+                    old_cap.release()
+                finally:
+                    cap_holder[0] = None
+
+            if self.live_reconnect_delay_s > 0:
+                time.sleep(self.live_reconnect_delay_s)
+
+            print(
+                f"[!] 实时流断流，尝试第 {attempt}/{self.live_reconnect_attempts} 次重连: {src_label}"
+            )
+            new_cap = cv2.VideoCapture(capture_arg)
+            cap_holder[0] = new_cap
+            if not new_cap.isOpened():
+                try:
+                    new_cap.release()
+                finally:
+                    cap_holder[0] = None
+                continue
+
+            ok_re, frame_re = new_cap.read()
+            if (
+                not ok_re
+                or frame_re is None
+                or not hasattr(frame_re, "shape")
+                or len(frame_re.shape) < 2
+                or (frame_re.shape[1], frame_re.shape[0]) != (expected_width, expected_height)
+            ):
+                try:
+                    new_cap.release()
+                finally:
+                    cap_holder[0] = None
+                continue
+
+            return True, frame_re
+        return False, None
 
     def process_video(
         self,
@@ -765,10 +858,17 @@ class ConflictPerceptionPipeline:
             _write_initialization_failure(exc)
             raise exc
 
-        # ExitStack 统一登记资源生命周期：初始化阶段（模型加载、编码器、
-        # 文件打开）与主循环异常都保证释放，不存在半初始化泄漏路径
+        # ExitStack 统一登记资源生命周期：通过可变句柄容器跟踪重连后的最新采集对象，
+        # 确保初始化阶段与主循环异常都能正确释放当前存活的 cap。
+        cap_holder = [cap]
+
+        def _release_active_cap():
+            active_cap = cap_holder[0]
+            if active_cap is not None:
+                active_cap.release()
+
         resources = ExitStack()
-        resources.callback(cap.release)
+        resources.callback(_release_active_cap)
         try:
             raw_fps = cap.get(cv2.CAP_PROP_FPS)
             if is_live_stream:
@@ -862,6 +962,7 @@ class ConflictPerceptionPipeline:
             return live
 
         frame_idx = 0
+        live_reconnect_count = 0
         t_start = time.perf_counter()
         src_display = src_label if is_live_stream else Path(src_label).name
 
@@ -884,13 +985,33 @@ class ConflictPerceptionPipeline:
 
                 ok, frame = cap.read()
                 if not ok or frame is None:
-                    break
+                    # 仅实时流在断流后触发有界重连；本地视频文件遇 EOF 或坏帧直接结束。
+                    if is_live_stream and self.live_reconnect_attempts > 0:
+                        reconnected, frame_re = self._reconnect_live_capture(
+                            cap_holder, capture_arg, src_label, width, height
+                        )
+                        if not reconnected or frame_re is None:
+                            break
+                        cap = cap_holder[0]
+                        frame = frame_re
+                        live_reconnect_count += 1
+                    else:
+                        break
                 # OpenCV VideoWriter 遇到与初始化尺寸不一致的帧只会警告并静默丢帧，
                 # 必须显式校验解码帧分辨率与容器元数据一致，避免悄悄写出空视频。
                 if not hasattr(frame, "shape") or len(frame.shape) < 2 or (frame.shape[1], frame.shape[0]) != (width, height):
                     raise RuntimeError("实际解码帧分辨率与视频元数据不一致")
 
-                pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                raw_pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+                pts_ms = (
+                    float(raw_pts_ms)
+                    if (
+                        type(raw_pts_ms) is not bool
+                        and not isinstance(raw_pts_ms, np.bool_)
+                        and isinstance(raw_pts_ms, (int, float, np.integer, np.floating))
+                    )
+                    else float("nan")
+                )
                 timestamp_s, time_kind = video_clock.timestamp(frame_idx, pts_ms)
 
                 frame_record = session.process(frame, timestamp_s, time_kind)
@@ -965,6 +1086,7 @@ class ConflictPerceptionPipeline:
                         "frames_processed": frame_idx,
                         "elapsed_seconds": round(max(0.0, time.perf_counter() - t_start), 2),
                         "max_observed_speed_kmh": round(max_observed_speed_kmh, 1),
+                        "live_reconnect_count": live_reconnect_count,
                     })
                 except Exception:
                     pass
@@ -1004,6 +1126,7 @@ class ConflictPerceptionPipeline:
             "stitched_track_count": (
                 self.stitcher.stitched_track_count if self.stitcher is not None else 0
             ),
+            "live_reconnect_count": live_reconnect_count,
         }
 
         self._write_summary_file(out_dir, summary)
@@ -1335,6 +1458,7 @@ class ConflictPerceptionPipeline:
             "stitched_track_count": (
                 self.stitcher.stitched_track_count if self.stitcher is not None else 0
             ),
+            "live_reconnect_count": 0,
         }
         self._write_summary_file(out_dir, summary)
         return summary

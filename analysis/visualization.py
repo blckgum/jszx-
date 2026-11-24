@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -19,6 +20,66 @@ import numpy as np
 from .calibration import RoadCalibrator
 from .conflict import ConflictAssessment, RiskLevel, build_conflict_maps
 from .speed import SpeedReading
+
+
+def _is_finite_real(value) -> bool:
+    """判断值是否为有限实数（显式排除 bool 与 np.bool_）。"""
+    if value is None or type(value) is bool or isinstance(value, np.bool_):
+        return False
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return math.isfinite(float(value))
+    return False
+
+
+def _sanitize_finite_or_zero(value) -> float:
+    """将可选物理量（如加速度）过滤为有限 float，无效值安全回退 0.0。"""
+    return float(value) if _is_finite_real(value) else 0.0
+
+
+def _resolve_heading_rad(reading) -> float:
+    """解析车辆航向角（弧度）：优先使用有效 heading_deg，无效时按速度矢量或 0 回退。"""
+    raw_heading = getattr(reading, "heading_deg", None)
+    if _is_finite_real(raw_heading):
+        return math.radians(float(raw_heading))
+    vx = _sanitize_finite_or_zero(getattr(reading, "vx_ms", 0.0))
+    vy = _sanitize_finite_or_zero(getattr(reading, "vy_ms", 0.0))
+    # 静止或微速噪声下 atan2 方向不稳定，回退默认 0 弧度。
+    if math.hypot(vx, vy) > 1e-6:
+        return math.atan2(vy, vx)
+    return 0.0
+
+
+def _conflict_target_vru_kind(conflict: Optional[ConflictAssessment]) -> Optional[str]:
+    """当冲突对象非传统行人（如骑行者 VRU）时返回其类型名，否则返回 None。"""
+    if conflict is None:
+        return None
+    raw_kind = getattr(conflict, "target_kind", "pedestrian")
+    if isinstance(raw_kind, str):
+        clean = raw_kind.strip()
+        if clean and clean != "pedestrian":
+            return clean
+    return None
+
+
+def _format_ssm_summary(conflict: Optional[ConflictAssessment]) -> str:
+    """提取并格式化可选 SSM 替代安全指标为紧凑单行摘要；全 None 时返回空字符串。"""
+    if conflict is None:
+        return ""
+    parts: List[str] = []
+    mttc = getattr(conflict, "mttc_seconds", None)
+    if _is_finite_real(mttc):
+        parts.append(f"MTTC:{float(mttc):.1f}s")
+    drac = getattr(conflict, "drac_ms2", None)
+    if _is_finite_real(drac):
+        parts.append(f"DRAC:{float(drac):.1f}")
+    pet = getattr(conflict, "pet_seconds", None)
+    if _is_finite_real(pet):
+        parts.append(f"PET:{float(pet):.1f}s")
+    prob = getattr(conflict, "collision_prob", None)
+    if _is_finite_real(prob):
+        pct = int(round(max(0.0, min(1.0, float(prob))) * 100.0))
+        parts.append(f"P:{pct}%")
+    return "  ".join(parts)
 
 
 def trajectory_color(conflict: Optional[ConflictAssessment]) -> Tuple[int, int, int]:
@@ -48,20 +109,23 @@ class EnhancedConflictVisualizer:
 
     def _project_ground_point(self, x: float, y: float) -> Optional[Tuple[int, int]]:
         """优先调用 ground_to_pixel_checked 投射地面点，缺失时安全回退 ground_to_pixel。"""
+        if not (_is_finite_real(x) and _is_finite_real(y)):
+            return None
+        fx, fy = float(x), float(y)
         # 优先使用带相机前方检查与地平线溢出防护的接口，防止折返画到天空或触发 OpenCV int32 溢出；
         # 同时也兼容仅提供旧版 ground_to_pixel() 的自定义/Mock 标定对象。
         checked_fn = getattr(self.calibrator, "ground_to_pixel_checked", None)
         if callable(checked_fn):
-            pt = checked_fn(x, y)
-            if pt is None:
+            pt = checked_fn(fx, fy)
+            if pt is None or not (_is_finite_real(pt[0]) and _is_finite_real(pt[1])):
                 return None
             u, v = int(pt[0]), int(pt[1])
             if abs(u) > 1_000_000 or abs(v) > 1_000_000:
                 return None
             return (u, v)
 
-        pt = self.calibrator.ground_to_pixel(x, y)
-        if pt is None:
+        pt = self.calibrator.ground_to_pixel(fx, fy)
+        if pt is None or not (_is_finite_real(pt[0]) and _is_finite_real(pt[1])):
             return None
         u, v = int(pt[0]), int(pt[1])
         # 旧版接口把无效点和负坐标都编码成 (-1, -1)，这里统一拦截。
@@ -100,9 +164,24 @@ class EnhancedConflictVisualizer:
         steps: int = 5,
         color: Tuple[int, int, int] = (0, 255, 0),
     ):
-        """在地面物理平面上外推并投射未来运动轨迹虚线"""
+        """在地面物理平面上外推并投射未来运动轨迹虚线（支持二阶加速度外推）"""
         if not reading.is_reliable or reading.speed_ms < 0.3:
             return
+        if not (
+            _is_finite_real(reading.x_m)
+            and _is_finite_real(reading.y_m)
+            and _is_finite_real(reading.vx_ms)
+            and _is_finite_real(reading.vy_ms)
+        ):
+            return
+
+        x0 = float(reading.x_m)
+        y0 = float(reading.y_m)
+        vx = float(reading.vx_ms)
+        vy = float(reading.vy_ms)
+        # 仅在提供有限加速度（如 Kalman 模式）时叠加 0.5*a*t^2；EMA 或缺失/无效值退化为 0.0。
+        ax_ms2 = _sanitize_finite_or_zero(getattr(reading, "ax_ms2", 0.0))
+        ay_ms2 = _sanitize_finite_or_zero(getattr(reading, "ay_ms2", 0.0))
 
         dt = horizon_s / steps
         # 出画点将轨迹拆成独立线段，避免跨越不可见区域画出弦线
@@ -112,8 +191,9 @@ class EnhancedConflictVisualizer:
         h, w = frame.shape[:2]
         for i in range(steps + 1):
             t = i * dt
-            future_x = reading.x_m + reading.vx_ms * t
-            future_y = reading.y_m + reading.vy_ms * t
+            half_t2 = 0.5 * t * t
+            future_x = x0 + vx * t + ax_ms2 * half_t2
+            future_y = y0 + vy * t + ay_ms2 * half_t2
             pt = self._project_ground_point(future_x, future_y)
             if pt is not None and 0 <= pt[0] < w and 0 <= pt[1] < h:
                 current.append(pt)
@@ -132,6 +212,71 @@ class EnhancedConflictVisualizer:
         if last_visible is not None:
             cv2.circle(frame, last_visible, 4, color, -1)
 
+    def draw_vehicle_obb(
+        self,
+        frame: np.ndarray,
+        reading: SpeedReading,
+        length_m: float,
+        width_m: float,
+        color: Tuple[int, int, int] = (0, 220, 180),
+    ):
+        """依据车辆接地中心与航向角绘制地面旋转包围盒 (OBB) 与车头朝向指示线。"""
+        if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
+            return
+        if not (
+            _is_finite_real(getattr(reading, "x_m", None))
+            and _is_finite_real(getattr(reading, "y_m", None))
+            and _is_finite_real(length_m)
+            and _is_finite_real(width_m)
+        ):
+            return
+        length_f = float(length_m)
+        width_f = float(width_m)
+        if length_f <= 0.0 or width_f <= 0.0:
+            return
+
+        cx = float(reading.x_m)
+        cy = float(reading.y_m)
+        heading_rad = _resolve_heading_rad(reading)
+        cos_h = math.cos(heading_rad)
+        sin_h = math.sin(heading_rad)
+        half_l = 0.5 * length_f
+        half_w = 0.5 * width_f
+
+        # 车体局部基向量：前向 (cos_h, sin_h)，左法向 (-sin_h, cos_h)
+        corners_ground = (
+            (cx + half_l * cos_h - half_w * sin_h, cy + half_l * sin_h + half_w * cos_h),
+            (cx + half_l * cos_h + half_w * sin_h, cy + half_l * sin_h - half_w * cos_h),
+            (cx - half_l * cos_h + half_w * sin_h, cy - half_l * sin_h - half_w * cos_h),
+            (cx - half_l * cos_h - half_w * sin_h, cy - half_l * sin_h + half_w * cos_h),
+        )
+        front_mid_ground = (cx + half_l * cos_h, cy + half_l * sin_h)
+
+        corner_pts = [self._project_ground_point(gx, gy) for gx, gy in corners_ground]
+        center_pt = self._project_ground_point(cx, cy)
+        front_mid_pt = self._project_ground_point(*front_mid_ground)
+        all_pts = [*corner_pts, center_pt, front_mid_pt]
+        if any(pt is None for pt in all_pts):
+            return
+
+        h, w = frame.shape[:2]
+        # 允许车体角点局部擦边出画，但拦截落点严重越界或近地平线畸变。
+        if any(pt[0] < -w or pt[0] > 2 * w or pt[1] < -h or pt[1] > 2 * h for pt in all_pts):
+            return
+
+        poly = np.array(corner_pts, dtype=np.int32)
+        cv2.polylines(frame, [poly], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+        if center_pt != front_mid_pt:
+            cv2.arrowedLine(
+                frame,
+                center_pt,
+                front_mid_pt,
+                color,
+                2,
+                line_type=cv2.LINE_AA,
+                tipLength=0.3,
+            )
+
     def draw_speed_badge(
         self,
         frame: np.ndarray,
@@ -143,6 +288,7 @@ class EnhancedConflictVisualizer:
         """在目标检测框上方绘制测速与状态徽章"""
         x1, y1, x2, y2 = map(int, box_xyxy)
 
+        vru_kind = _conflict_target_vru_kind(conflict)
         # 确认与未确认告警视觉语义区分：已确认 "!"+E#n，未确认瞬时量 "?"
         mark = "!" if event_id is not None else "?"
         if conflict and conflict.risk_level == RiskLevel.LEVEL_3_CRITICAL:
@@ -159,6 +305,10 @@ class EnhancedConflictVisualizer:
         else:
             color = self.COLOR_SAFE
             label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h"
+
+        # 涉及非行人弱势交通参与者（如骑行者）时标注 [VRU]。
+        if vru_kind is not None:
+            label += " [VRU]"
 
         # 已通过事件状态机确认的告警携带 event_id，与未确认瞬时帧区分
         if event_id is not None:
@@ -193,40 +343,53 @@ class EnhancedConflictVisualizer:
         提供时按 provisional（未确认瞬时帧）/confirmed（已确认事件）区分标注"""
         h, w = frame.shape[:2]
 
-        # 确定当前帧最高风险等级：依次按 风险级别 -> 是否已通过事件确认 -> 最小 TTC 排序，
+        # 确定当前帧最高风险等级：依次按 风险级别 -> 是否已通过事件确认 -> 最小 TTC -> 最小 PET 排序，
         # 确保已确认告警不会被同等级、刚冒头的瞬时更小 TTC 闪断掩盖。
         max_level = RiskLevel.LEVEL_0_SAFE
         primary_conflict: Optional[ConflictAssessment] = None
-        best_key: Optional[Tuple[int, int, float]] = None
+        best_key: Optional[Tuple[int, int, float, float]] = None
         for c in conflicts:
             if c.risk_level <= RiskLevel.LEVEL_0_SAFE:
                 continue
             eid = (event_ids or {}).get((c.veh_track_id, c.ped_track_id))
+            pet_val = getattr(c, "pet_seconds", None)
             key = (
                 int(c.risk_level),
                 1 if eid is not None else 0,
                 -(c.ttc_seconds if c.ttc_seconds is not None else 999.0),
+                -(float(pet_val) if _is_finite_real(pet_val) else 999.0),
             )
             if best_key is None or key > best_key:
                 best_key = key
                 primary_conflict = c
                 max_level = c.risk_level
 
-        # 头部横幅尺寸
-        banner_h = 48
+        ssm_summary = _format_ssm_summary(primary_conflict)
+        vru_kind = _conflict_target_vru_kind(primary_conflict)
+        if primary_conflict is not None and vru_kind is not None:
+            target_desc = f"[VRU] {vru_kind} #{primary_conflict.ped_track_id}"
+        elif primary_conflict is not None:
+            target_desc = f"Ped #{primary_conflict.ped_track_id}"
+        else:
+            target_desc = ""
+
+        # 头部横幅尺寸：存在 SSM 指标时扩展至双行以展示紧凑汇总，未启用时保持原 48px 布局。
+        banner_h = 74 if ssm_summary else 48
         overlay = frame.copy()
 
         if max_level == RiskLevel.LEVEL_3_CRITICAL:
             bg_color = (0, 0, 180)
             ttc_str = f"{primary_conflict.ttc_seconds:.1f}s" if primary_conflict.ttc_seconds is not None else "N/A"
-            banner_text = f"CRITICAL CONFLICT ALERT: Veh #{primary_conflict.veh_track_id} <-> Ped #{primary_conflict.ped_track_id} | TTC: {ttc_str} | BRAKE NOW!"
+            banner_text = f"CRITICAL CONFLICT ALERT: Veh #{primary_conflict.veh_track_id} <-> {target_desc} | TTC: {ttc_str} | BRAKE NOW!"
         elif max_level == RiskLevel.LEVEL_2_CAUTION:
             bg_color = (0, 120, 220)
             ttc_str = f"{primary_conflict.ttc_seconds:.1f}s" if primary_conflict.ttc_seconds is not None else "N/A"
-            banner_text = f"CAUTION: Trajectory Convergence (Veh #{primary_conflict.veh_track_id} <-> Ped #{primary_conflict.ped_track_id} | TTC: {ttc_str})"
+            banner_text = f"CAUTION: Trajectory Convergence (Veh #{primary_conflict.veh_track_id} <-> {target_desc} | TTC: {ttc_str})"
         elif max_level == RiskLevel.LEVEL_1_SPEEDING:
             bg_color = (0, 180, 210)
             banner_text = f"SPEED LIMIT WARNING: Veh #{primary_conflict.veh_track_id} @ {primary_conflict.veh_speed_kmh:.1f} km/h (Limit: {self.speed_limit_kmh:g} km/h)"
+            if vru_kind is not None:
+                banner_text += " [VRU]"
         else:
             bg_color = (40, 140, 40)
             banner_text = f"CAMPUS ROAD TRAFFIC MONITOR: Normal Flow | Speed Limit: {self.speed_limit_kmh:g} km/h | Safe"
@@ -241,18 +404,30 @@ class EnhancedConflictVisualizer:
             prefix = f"[EVT#{eid} CONFIRMED] " if eid is not None else "[PROVISIONAL] "
             banner_text = prefix + banner_text
 
-        cv2.rectangle(overlay, (0, 0), (w, banner_h), bg_color, -1)
+        cv2.rectangle(overlay, (0, 0), (w, min(h, banner_h)), bg_color, -1)
         cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+        main_y = 30 if ssm_summary else 32
         cv2.putText(
             frame,
             banner_text,
-            (16, 32),
+            (16, main_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (255, 255, 255),
             2,
             cv2.LINE_AA,
         )
+        if ssm_summary:
+            cv2.putText(
+                frame,
+                ssm_summary,
+                (16, 58),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (230, 245, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     def draw_conflict_link(
         self, frame: np.ndarray, conflict: ConflictAssessment, reading_map: Dict[int, SpeedReading]
