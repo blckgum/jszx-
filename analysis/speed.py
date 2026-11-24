@@ -36,6 +36,38 @@ def _validate_estimator_mode(estimator_mode: str) -> str:
     return estimator_mode
 
 
+def _validate_category(category: str) -> str:
+    """校验目标类别必须为非空白字符串，统一 ema 与 kalman 模式校验口径。"""
+    if type(category) is not str or not category.strip():
+        raise ValueError("category 必须是非空字符串")
+    return category.strip()
+
+
+def _validate_motion_params(
+    window_size: int,
+    ema_alpha: float,
+    speed_limit_kmh: float,
+    stationary_speed_ms: float,
+    stationary_min_frames: int,
+    reliable_min_span_s: float,
+    estimator_mode: str,
+) -> str:
+    """统一校验 TrackMotionTracker 与 SpeedEstimator 共享的运动学滤波器参数。"""
+    if type(window_size) is not int or window_size < 3:
+        raise ValueError("window_size 必须是 >= 3 的整数帧数")
+    if not _is_finite_number(ema_alpha) or not (0 < ema_alpha <= 1):
+        raise ValueError("ema_alpha 必须在 (0, 1] 区间")
+    if not _is_finite_number(speed_limit_kmh) or speed_limit_kmh <= 0:
+        raise ValueError("speed_limit_kmh 必须为有限正数")
+    if not _is_finite_number(stationary_speed_ms) or stationary_speed_ms <= 0:
+        raise ValueError("stationary_speed_ms 必须为有限正数")
+    if type(stationary_min_frames) is not int or stationary_min_frames < 1:
+        raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
+    if not _is_finite_number(reliable_min_span_s) or reliable_min_span_s < 0:
+        raise ValueError("reliable_min_span_s 必须为有限非负数")
+    return _validate_estimator_mode(estimator_mode)
+
+
 @dataclass
 class SpeedReading:
     """单目标速度研判数据模型"""
@@ -80,22 +112,19 @@ class TrackMotionTracker:
         object_policies: dict[str, ObjectPolicy] | None = None,
         estimator_mode: str = "ema",
     ):
-        if type(window_size) is not int or window_size < 3:
-            raise ValueError("window_size 必须是 >= 3 的整数帧数")
-        if not _is_finite_number(ema_alpha) or not (0 < ema_alpha <= 1):
-            raise ValueError("ema_alpha 必须在 (0, 1] 区间")
-        if not _is_finite_number(speed_limit_kmh) or speed_limit_kmh <= 0:
-            raise ValueError("speed_limit_kmh 必须为有限正数")
-        if not _is_finite_number(stationary_speed_ms) or stationary_speed_ms <= 0:
-            raise ValueError("stationary_speed_ms 必须为有限正数")
-        if type(stationary_min_frames) is not int or stationary_min_frames < 1:
-            raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
-        if not _is_finite_number(reliable_min_span_s) or reliable_min_span_s < 0:
-            raise ValueError("reliable_min_span_s 必须为有限非负数")
-        _validate_estimator_mode(estimator_mode)
+        _validate_motion_params(
+            window_size=window_size,
+            ema_alpha=ema_alpha,
+            speed_limit_kmh=speed_limit_kmh,
+            stationary_speed_ms=stationary_speed_ms,
+            stationary_min_frames=stationary_min_frames,
+            reliable_min_span_s=reliable_min_span_s,
+            estimator_mode=estimator_mode,
+        )
+        clean_category = _validate_category(category)
 
         self.track_id = track_id
-        self.category = category
+        self.category = clean_category
         self.window_size = window_size
         self.ema_alpha = float(ema_alpha)
         self.speed_limit_kmh = float(speed_limit_kmh)
@@ -106,8 +135,8 @@ class TrackMotionTracker:
         self.estimator_mode = estimator_mode
         # 类别为车辆时，过滤误传入的 person/pedestrian 标签（含 Mock 占位对象），
         # 避免把车辆的碰撞安全半径错误缩减成行人半径。
-        if category in ("pedestrian", "person"):
-            self.object_kind = object_policy(None, category, object_policies).kind
+        if clean_category in ("pedestrian", "person"):
+            self.object_kind = object_policy(None, clean_category, object_policies).kind
         else:
             safe_kind = (
                 object_kind
@@ -116,7 +145,7 @@ class TrackMotionTracker:
                 and object_kind.strip().lower() not in ("person", "pedestrian")
                 else None
             )
-            self.object_kind = object_policy(safe_kind, category, object_policies).kind
+            self.object_kind = object_policy(safe_kind, clean_category, object_policies).kind
 
         # 历史物理轨迹窗口: deque of (timestamp_s, x_m, y_m)
         self.history: deque[Tuple[float, float, float]] = deque(maxlen=window_size)
@@ -128,7 +157,7 @@ class TrackMotionTracker:
 
         # 卡尔曼滤波器实例（仅 kalman 模式创建）
         self._kalman: Optional[ConstantAccelerationKalman2D] = (
-            ConstantAccelerationKalman2D(category=category)
+            ConstantAccelerationKalman2D(category=clean_category)
             if estimator_mode == "kalman"
             else None
         )
@@ -144,18 +173,21 @@ class TrackMotionTracker:
 
     def observe_category(self, category: str, confirm_frames: int = 3):
         """按连续 N 帧确认机制更新类别，抑制 person/vehicle 检测抖动"""
-        if category == self.category:
+        # 提前统一校验非空白字符串类别，确保 ema/kalman 行为一致且异常时不污染待确认状态
+        clean_category = _validate_category(category)
+        if clean_category == self.category:
             self._pending_category, self._pending_count = None, 0
             return
-        if category == self._pending_category:
+        if clean_category == self._pending_category:
             self._pending_count += 1
         else:
-            self._pending_category, self._pending_count = category, 1
+            self._pending_category, self._pending_count = clean_category, 1
         if self._pending_count >= confirm_frames:
-            self.category = category
-            self._pending_category, self._pending_count = None, 0
+            # 先校验并同步更新卡尔曼先验再修改 self.category，保障异常时状态原子不变
             if self._kalman is not None:
-                self._kalman.set_category(category)
+                self._kalman.set_category(clean_category)
+            self.category = clean_category
+            self._pending_category, self._pending_count = None, 0
 
     def _kalman_extras(self) -> Tuple[float, float, Optional[float], Optional[Tuple[float, float, float, float]]]:
         """读取卡尔曼加速度与位置不确定度；未初始化或 EMA 模式返回默认值。"""
@@ -381,21 +413,17 @@ class SpeedEstimator:
         reliable_min_span_s: float = 0.2,
         estimator_mode: str = "ema",
     ):
-        if not _is_finite_number(ema_alpha) or not (0 < ema_alpha <= 1):
-            raise ValueError("ema_alpha 必须在 (0, 1] 区间")
-        if type(window_size) is not int or window_size < 3:
-            raise ValueError("window_size 必须是 >= 3 的整数帧数")
-        if not _is_finite_number(speed_limit_kmh) or speed_limit_kmh <= 0:
-            raise ValueError("speed_limit_kmh 必须为有限正数")
-        if not _is_finite_number(stationary_speed_ms) or stationary_speed_ms <= 0:
-            raise ValueError("stationary_speed_ms 必须为有限正数")
-        if type(stationary_min_frames) is not int or stationary_min_frames < 1:
-            raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
+        _validate_motion_params(
+            window_size=window_size,
+            ema_alpha=ema_alpha,
+            speed_limit_kmh=speed_limit_kmh,
+            stationary_speed_ms=stationary_speed_ms,
+            stationary_min_frames=stationary_min_frames,
+            reliable_min_span_s=reliable_min_span_s,
+            estimator_mode=estimator_mode,
+        )
         if type(category_confirm_frames) is not int or category_confirm_frames < 1:
             raise ValueError("category_confirm_frames 必须是 >= 1 的整数帧数")
-        if not _is_finite_number(reliable_min_span_s) or reliable_min_span_s < 0:
-            raise ValueError("reliable_min_span_s 必须为有限非负数")
-        _validate_estimator_mode(estimator_mode)
 
         self.speed_limit_kmh = float(speed_limit_kmh)
         self.window_size = window_size
@@ -461,7 +489,7 @@ class SpeedEstimator:
                     ped_kind = object_policy(
                         None, "pedestrian", tracker.object_policies
                     ).kind
-                    if category == tracker.category and has_valid_veh_kind:
+                    if category.strip() == tracker.category and has_valid_veh_kind:
                         tracker.object_kind = object_policy(
                             object_kind, tracker.category, tracker.object_policies
                         ).kind

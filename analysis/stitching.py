@@ -18,17 +18,21 @@ import numpy as np
 
 
 def _is_finite_number(value: Any) -> bool:
-    """精确校验有限数值，拒绝 bool 伪装成 int/float。"""
+    """精确校验有限数值，兼容 NumPy 数值标量并拒绝 bool/np.bool_ 伪装。"""
+    # 显式排除 Python bool 与 np.bool_，再兼容 Python/NumPy 实数标量
+    if isinstance(value, (bool, np.bool_)):
+        return False
     return (
-        type(value) is not bool
-        and isinstance(value, (int, float))
-        and math.isfinite(value)
+        isinstance(value, (int, float, np.integer, np.floating))
+        and math.isfinite(float(value))
     )
 
 
 def _is_positive_int(value: Any) -> bool:
-    """精确校验正整数，拒绝 bool。"""
-    return type(value) is int and value >= 1
+    """精确校验正整数，兼容 NumPy 整数标量并拒绝 bool/np.bool_。"""
+    if isinstance(value, (bool, np.bool_)):
+        return False
+    return isinstance(value, (int, np.integer)) and int(value) >= 1
 
 
 def _normalize_category(category: Any) -> str:
@@ -126,13 +130,19 @@ def _extract_observation(obs: Any) -> Optional[TrackObservation]:
         else:
             raise ValueError("观测元组长度必须为 4 或 5")
     elif isinstance(obs, dict):
-        raw_id = obs.get("raw_track_id", obs.get("track_id"))
+        # 显式传入 raw_track_id=None 时仍按约定回退读取 track_id，保留 0/False 以触发校验报错
+        raw_id = obs.get("raw_track_id")
+        if raw_id is None:
+            raw_id = obs.get("track_id")
         category = obs.get("category")
         object_kind = obs.get("object_kind", "")
         x_m = obs.get("x_m")
         y_m = obs.get("y_m")
     else:
-        raw_id = getattr(obs, "raw_track_id", getattr(obs, "track_id", None))
+        # 对象属性 raw_track_id 显式为 None 时同样回退读取 track_id
+        raw_id = getattr(obs, "raw_track_id", None)
+        if raw_id is None:
+            raw_id = getattr(obs, "track_id", None)
         category = getattr(obs, "category", None)
         object_kind = getattr(obs, "object_kind", "")
         x_m = getattr(obs, "x_m", None)
@@ -144,19 +154,25 @@ def _extract_observation(obs: Any) -> Optional[TrackObservation]:
         raise ValueError("raw_track_id 必须为正整数")
     norm_cat = _normalize_category(category)
     kind_str = object_kind.strip() if isinstance(object_kind, str) else ""
-    if type(x_m) is bool or type(y_m) is bool:
+    if isinstance(x_m, (bool, np.bool_)) or isinstance(y_m, (bool, np.bool_)):
         raise ValueError("观测地面坐标 x_m/y_m 不能为布尔值")
-    if not (isinstance(x_m, (int, float)) and isinstance(y_m, (int, float))):
+    # 兼容 Python 与 NumPy 整数/浮点标量，转换为 float 后校验有限性
+    if not (
+        isinstance(x_m, (int, float, np.integer, np.floating))
+        and isinstance(y_m, (int, float, np.integer, np.floating))
+    ):
         raise ValueError("观测地面坐标 x_m/y_m 必须为数值")
-    if not (math.isfinite(x_m) and math.isfinite(y_m)):
+    x_val = float(x_m)
+    y_val = float(y_m)
+    if not (math.isfinite(x_val) and math.isfinite(y_val)):
         return None
 
     return TrackObservation(
         raw_track_id=int(raw_id),
         category=norm_cat,
         object_kind=kind_str,
-        x_m=float(x_m),
-        y_m=float(y_m),
+        x_m=x_val,
+        y_m=y_val,
     )
 
 
@@ -386,10 +402,18 @@ class TrackletStitcher:
         seen_cids_this_frame: set[int] = set()
         unknown_obs: List[TrackObservation] = []
 
-        # 1) 已知 raw_track_id 直接映射到已有 canonical_id；若同帧发生意外碰撞则转入新轨迹处理
+        # 1) 已知 raw_track_id 直接映射到已有 canonical_id；若同帧碰撞或当前所有权不再归本 raw_id 则转入新轨迹处理
         for obs in parsed:
             known_cid = self._raw_to_canonical.get(obs.raw_track_id)
-            if known_cid is None or known_cid in seen_cids_this_frame:
+            active_tr = self._active_tracks.get(known_cid) if known_cid is not None else None
+            lost_tr = self._lost_tracks.get(known_cid) if known_cid is not None else None
+            # 核对活跃/丢失池所有权，严禁被取代的旧 raw_id 免检抢占其他 raw_id 正在或刚持有的 canonical_id
+            if (
+                known_cid is None
+                or known_cid in seen_cids_this_frame
+                or (active_tr is not None and active_tr.raw_track_id != obs.raw_track_id)
+                or (lost_tr is not None and lost_tr.raw_track_id != obs.raw_track_id)
+            ):
                 unknown_obs.append(obs)
                 continue
 
@@ -442,6 +466,14 @@ class TrackletStitcher:
             tr = self._lost_tracks.pop(lost_cid)
             self._advance_observation_state(tr, obs, ts)
             self._active_tracks[lost_cid] = tr
+            # 清理所有先前指向该 lost_cid 的旧 raw_track_id 键，防止旧 ID 复活后免检复用或抢占
+            stale_raw_ids = [
+                old_raw
+                for old_raw, mapped_cid in self._raw_to_canonical.items()
+                if mapped_cid == lost_cid and old_raw != raw_id
+            ]
+            for old_raw in stale_raw_ids:
+                del self._raw_to_canonical[old_raw]
             self._raw_to_canonical[raw_id] = lost_cid
             self._raw_to_canonical.move_to_end(raw_id)
             id_map[raw_id] = lost_cid
@@ -494,11 +526,13 @@ class TrackletStitcher:
             raise ValueError("canonical_id 必须为正整数")
         if not _is_finite_number(timestamp_s):
             raise ValueError("timestamp_s 必须为有限数值")
+        # 统一转为 Python int，防止 NumPy 整数键混入内部字典与集合
+        cid_key = int(canonical_id)
         ts = float(timestamp_s)
 
         # 独立调用 update_kinematics 时，将时间戳落后于当前帧的其余活跃轨迹归入丢失池
         for cid in list(self._active_tracks.keys()):
-            if cid != canonical_id and self._active_tracks[cid].last_seen_s < ts:
+            if cid != cid_key and self._active_tracks[cid].last_seen_s < ts:
                 self._lost_tracks[cid] = self._active_tracks.pop(cid)
         self._purge_expired_and_bound_lost(ts)
 
@@ -509,7 +543,8 @@ class TrackletStitcher:
         ax_ms2 = getattr(reading, "ax_ms2", 0.0)
         ay_ms2 = getattr(reading, "ay_ms2", 0.0)
         raw_reliable = getattr(reading, "is_reliable", False)
-        is_reliable = raw_reliable if type(raw_reliable) is bool else False
+        # 兼容 Python bool 与 NumPy np.bool_ 标量
+        is_reliable = bool(raw_reliable) if isinstance(raw_reliable, (bool, np.bool_)) else False
         pos_cov = _parse_cov_2x2(getattr(reading, "pos_cov_m2", None))
 
         if not all(_is_finite_number(v) for v in (x_m, y_m, vx_ms, vy_ms)):
@@ -523,25 +558,25 @@ class TrackletStitcher:
         raw_kind = getattr(reading, "object_kind", "")
         kind_str = raw_kind.strip() if isinstance(raw_kind, str) else ""
 
-        if canonical_id in self._active_tracks:
-            tr = self._active_tracks[canonical_id]
-        elif canonical_id in self._lost_tracks:
-            tr = self._lost_tracks.pop(canonical_id)
-            self._active_tracks[canonical_id] = tr
+        if cid_key in self._active_tracks:
+            tr = self._active_tracks[cid_key]
+        elif cid_key in self._lost_tracks:
+            tr = self._lost_tracks.pop(cid_key)
+            self._active_tracks[cid_key] = tr
         else:
-            self._used_canonical_ids.add(canonical_id)
-            if canonical_id >= self._next_canonical_id:
-                self._next_canonical_id = canonical_id + 1
+            self._used_canonical_ids.add(cid_key)
+            if cid_key >= self._next_canonical_id:
+                self._next_canonical_id = cid_key + 1
             tr = _TrackletState(
-                canonical_id=canonical_id,
-                raw_track_id=canonical_id,
+                canonical_id=cid_key,
+                raw_track_id=cid_key,
                 category=norm_cat,
                 object_kind=kind_str,
                 x_m=float(x_m),
                 y_m=float(y_m),
                 last_seen_s=ts,
             )
-            self._active_tracks[canonical_id] = tr
+            self._active_tracks[cid_key] = tr
 
         tr.x_m = float(x_m)
         tr.y_m = float(y_m)
@@ -560,7 +595,13 @@ class TrackletStitcher:
 
     def resolve_canonical_id(self, raw_track_id: int) -> int:
         """查询已知 raw_track_id 对应的 canonical_id，未知时原样返回。"""
-        return self._raw_to_canonical.get(raw_track_id, raw_track_id)
+        # 兼容 NumPy 整数标量查询并统一返回 Python int
+        key = (
+            int(raw_track_id)
+            if isinstance(raw_track_id, np.integer) and not isinstance(raw_track_id, np.bool_)
+            else raw_track_id
+        )
+        return self._raw_to_canonical.get(key, key)
 
     def retained_canonical_ids(self, timestamp_s: Optional[float] = None) -> set[int]:
         """返回当前仍在活跃池或未过期丢失池中的全部 canonical_id，供测速器保活。"""

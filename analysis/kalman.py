@@ -25,6 +25,22 @@ _H_OBS = np.array(
 _I6 = np.eye(6, dtype=np.float64)
 
 
+def _contains_bool_value(value) -> bool:
+    """递归检查 ndarray（含 object 类型）与嵌套列表/元组中是否包含 Python bool 或 np.bool_。"""
+    if isinstance(value, (bool, np.bool_)):
+        return True
+    if isinstance(value, np.ndarray):
+        if value.dtype == bool or np.issubdtype(value.dtype, np.bool_):
+            return True
+        if value.dtype.hasobject:
+            # object 数组内部可能混入 Python bool、np.bool_ 或嵌套列表/ndarray，需逐元素递归排查
+            return any(_contains_bool_value(item) for item in value.flat)
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_contains_bool_value(item) for item in value)
+    return False
+
+
 def _validate_positive_float(value, label: str) -> float:
     """校验有限正浮点数，显式拒绝布尔值、NaN 和 Inf。"""
     if type(value) is bool or isinstance(value, np.bool_):
@@ -187,32 +203,41 @@ class ConstantAccelerationKalman2D:
         """校验 2x2 观测协方差是否有限、对称且正定；否则回退各向同性默认协方差。"""
         if obs_cov_m2 is None:
             return self._default_R.copy()
-        if isinstance(obs_cov_m2, (bool, np.bool_)):
-            return self._default_R.copy()
-        if isinstance(obs_cov_m2, np.ndarray) and (
-            obs_cov_m2.dtype == bool or np.issubdtype(obs_cov_m2.dtype, np.bool_)
-        ):
+        # 在 np.asarray(..., dtype=np.float64) 前递归拦截 object 数组及嵌套序列/ndarray 中的布尔值
+        if _contains_bool_value(obs_cov_m2):
             return self._default_R.copy()
         try:
-            # 拦截 Python 列表/嵌套序列中的 bool 元素
-            if isinstance(obs_cov_m2, (list, tuple)):
-                for row in obs_cov_m2:
-                    if isinstance(row, (list, tuple)) and any(
-                        type(el) is bool or isinstance(el, np.bool_) for el in row
-                    ):
-                        return self._default_R.copy()
             arr = np.asarray(obs_cov_m2, dtype=np.float64)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return self._default_R.copy()
 
         if arr.shape != (2, 2) or not np.isfinite(arr).all():
             return self._default_R.copy()
-        scale_ref = max(1.0, abs(float(arr[0, 1])), abs(float(arr[1, 0])))
-        if abs(float(arr[0, 1] - arr[1, 0])) > 1e-6 * scale_ref:
+
+        # 拦截极小或超大尺度协方差，避免行列式上溢为 inf-inf=nan 绕过正定检查
+        max_abs = float(np.max(np.abs(arr)))
+        if not math.isfinite(max_abs) or max_abs <= 1e-12 or max_abs > 1e12:
             return self._default_R.copy()
-        r_mat = 0.5 * (arr + arr.T)
-        det = float(r_mat[0, 0] * r_mat[1, 1] - r_mat[0, 1] * r_mat[1, 0])
-        if r_mat[0, 0] <= 1e-12 or r_mat[1, 1] <= 1e-12 or det <= 1e-18:
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            scale_ref = max(1.0, abs(float(arr[0, 1])), abs(float(arr[1, 0])))
+            diff_off = abs(float(arr[0, 1] - arr[1, 0]))
+            if not math.isfinite(diff_off) or diff_off > 1e-6 * scale_ref:
+                return self._default_R.copy()
+            r_mat = 0.5 * (arr + arr.T)
+            if not np.isfinite(r_mat).all():
+                return self._default_R.copy()
+            # 先按 max_abs 归一化再计算 scaled_det，抑制病态与大尺度数值误差
+            scaled = r_mat / max_abs
+            scaled_det = float(scaled[0, 0] * scaled[1, 1] - scaled[0, 1] * scaled[1, 0])
+            det = float(r_mat[0, 0] * r_mat[1, 1] - r_mat[0, 1] * r_mat[1, 0])
+
+        if (
+            r_mat[0, 0] <= 1e-12
+            or r_mat[1, 1] <= 1e-12
+            or not (math.isfinite(scaled_det) and scaled_det > 1e-12)
+            or not (math.isfinite(det) and det > 1e-18)
+        ):
             return self._default_R.copy()
         return r_mat
 
@@ -230,19 +255,55 @@ class ConstantAccelerationKalman2D:
         p_mat[:2, :2] = r_mat
         return p_mat
 
-    def _clamp_physical_kinematics(self):
-        """按矢量模长软限幅速度与加速度，保持运动方向不变。"""
-        v_mag = math.hypot(float(self._x[2]), float(self._x[3]))
-        if v_mag > self.max_speed_ms:
-            scale = self.max_speed_ms / v_mag
-            self._x[2] *= scale
-            self._x[3] *= scale
+    def _reset_to_observation(
+        self,
+        ts: float,
+        zx: float,
+        zy: float,
+        r_mat: np.ndarray,
+    ) -> bool:
+        """将滤波器安全重置为以当前有限观测为中心的初始状态与协方差。"""
+        self._x[:] = (zx, zy, 0.0, 0.0, 0.0, 0.0)
+        self._P = self._build_reset_cov(r_mat)
+        self._last_timestamp_s = ts
+        self._update_count = 1
+        self._consecutive_rejects = 0
+        self._last_rejected_obs = None
+        self.last_d2 = 0.0
+        self.last_accepted = True
+        return True
 
-        a_mag = math.hypot(float(self._x[4]), float(self._x[5]))
-        if a_mag > self.max_accel_ms2:
-            scale = self.max_accel_ms2 / a_mag
-            self._x[4] *= scale
-            self._x[5] *= scale
+    @staticmethod
+    def _clamp_vec2(vx: float, vy: float, max_norm: float) -> Optional[Tuple[float, float]]:
+        """按矢量模长限幅二维分量，先归一化最大分量以防 hypot 上溢导致 inf*0=nan。"""
+        if not (math.isfinite(vx) and math.isfinite(vy)):
+            return None
+        max_c = max(abs(vx), abs(vy))
+        if max_c <= 0.0:
+            return vx, vy
+        nx, ny = vx / max_c, vy / max_c
+        unit_mag = math.hypot(nx, ny)
+        if max_c > max_norm / unit_mag:
+            scale = max_norm / unit_mag
+            return nx * scale, ny * scale
+        return vx, vy
+
+    def _clamp_physical_kinematics(self, state: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        """按矢量模长软限幅速度与加速度，保持运动方向不变；若传入候选状态含非有限值则返回 None。"""
+        target = self._x if state is None else state
+        with np.errstate(over="ignore", invalid="ignore"):
+            v_clamped = self._clamp_vec2(float(target[2]), float(target[3]), self.max_speed_ms)
+            a_clamped = self._clamp_vec2(float(target[4]), float(target[5]), self.max_accel_ms2)
+        if v_clamped is None or a_clamped is None:
+            if state is None:
+                # 兜底清理就地状态中的非有限分量，防止污染后续步
+                target[2], target[3] = (0.0, 0.0) if v_clamped is None else v_clamped
+                target[4], target[5] = (0.0, 0.0) if a_clamped is None else a_clamped
+                return target
+            return None
+        target[2], target[3] = v_clamped
+        target[4], target[5] = a_clamped
+        return target
 
     def update(
         self,
@@ -262,33 +323,36 @@ class ConstantAccelerationKalman2D:
         r_mat = self._resolve_obs_cov(obs_cov_m2)
 
         if self._update_count == 0 or self._last_timestamp_s is None:
-            self._x[:] = (zx, zy, 0.0, 0.0, 0.0, 0.0)
-            self._P = self._build_reset_cov(r_mat)
-            self._last_timestamp_s = ts
-            self._update_count = 1
-            self._consecutive_rejects = 0
-            self._last_rejected_obs = None
-            self.last_d2 = 0.0
-            self.last_accepted = True
-            return True
+            return self._reset_to_observation(ts, zx, zy, r_mat)
 
         dt_s = ts - self._last_timestamp_s
-        f_mat = _transition_matrix(dt_s)
-        q_mat = _process_noise_matrix(dt_s, self.jerk_std_ms3)
+        with np.errstate(over="ignore", invalid="ignore"):
+            f_mat = _transition_matrix(dt_s)
+            q_mat = _process_noise_matrix(dt_s, self.jerk_std_ms3)
 
-        x_pred = f_mat @ self._x
-        p_pred = f_mat @ self._P @ f_mat.T + q_mat
-        p_pred = 0.5 * (p_pred + p_pred.T)
+            x_pred = f_mat @ self._x
+            p_pred = f_mat @ self._P @ f_mat.T + q_mat
+            p_pred = 0.5 * (p_pred + p_pred.T)
 
-        z_vec = np.array([zx, zy], dtype=np.float64)
-        y_res = z_vec - x_pred[:2]
-        s_mat = p_pred[:2, :2] + r_mat
-        s_mat = 0.5 * (s_mat + s_mat.T)
+        # 极端 dt（如 1e80）导致预测状态或协方差溢出时，先验失效，安全重置到当前有限观测
+        if not (np.isfinite(x_pred).all() and np.isfinite(p_pred).all()):
+            return self._reset_to_observation(ts, zx, zy, r_mat)
 
-        try:
-            s_inv_y = np.linalg.solve(s_mat, y_res)
-            d2 = float(y_res @ s_inv_y)
-        except np.linalg.LinAlgError:
+        with np.errstate(over="ignore", invalid="ignore"):
+            z_vec = np.array([zx, zy], dtype=np.float64)
+            y_res = z_vec - x_pred[:2]
+            s_mat = p_pred[:2, :2] + r_mat
+            s_mat = 0.5 * (s_mat + s_mat.T)
+
+            if np.isfinite(y_res).all() and np.isfinite(s_mat).all():
+                try:
+                    s_inv_y = np.linalg.solve(s_mat, y_res)
+                    d2 = float(y_res @ s_inv_y)
+                except np.linalg.LinAlgError:
+                    d2 = float("inf")
+            else:
+                d2 = float("inf")
+        if not math.isfinite(d2):
             d2 = float("inf")
         self.last_d2 = d2
 
@@ -298,10 +362,12 @@ class ConstantAccelerationKalman2D:
         ):
             self._consecutive_rejects += 1
             if self._consecutive_rejects < self.max_consecutive_rejects:
+                x_cand = self._clamp_physical_kinematics(x_pred.copy())
+                if x_cand is None or not (np.isfinite(x_cand).all() and np.isfinite(p_pred).all()):
+                    return self._reset_to_observation(ts, zx, zy, r_mat)
                 self._last_rejected_obs = (ts, zx, zy)
-                self._x = x_pred
+                self._x = x_cand
                 self._P = p_pred
-                self._clamp_physical_kinematics()
                 self._last_timestamp_s = ts
                 self.last_accepted = False
                 return False
@@ -313,12 +379,23 @@ class ConstantAccelerationKalman2D:
                 prev_ts, prev_x, prev_y = self._last_rejected_obs
                 dt_rej = ts - prev_ts
                 if dt_rej > 1e-4:
-                    vx0 = (zx - prev_x) / dt_rej
-                    vy0 = (zy - prev_y) / dt_rej
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        vx0 = (zx - prev_x) / dt_rej
+                        vy0 = (zy - prev_y) / dt_rej
+                    if not (math.isfinite(vx0) and math.isfinite(vy0)):
+                        # 极值坐标差分上溢时先减半求差并按限速缩放方向，防止 inf*0=nan
+                        dx_half = 0.5 * zx - 0.5 * prev_x
+                        dy_half = 0.5 * zy - 0.5 * prev_y
+                        clamped_v = self._clamp_vec2(dx_half, dy_half, self.max_speed_ms)
+                        vx0, vy0 = (0.0, 0.0) if clamped_v is None else clamped_v
                     has_vel_init = True
-            self._x[:] = (zx, zy, vx0, vy0, 0.0, 0.0)
-            self._clamp_physical_kinematics()
-            self._P = self._build_reset_cov(r_mat)
+            x_cand = np.array([zx, zy, vx0, vy0, 0.0, 0.0], dtype=np.float64)
+            x_cand = self._clamp_physical_kinematics(x_cand)
+            p_cand = self._build_reset_cov(r_mat)
+            if x_cand is None or not (np.isfinite(x_cand).all() and np.isfinite(p_cand).all()):
+                return self._reset_to_observation(ts, zx, zy, r_mat)
+            self._x = x_cand
+            self._P = p_cand
             self._last_timestamp_s = ts
             self._consecutive_rejects = 0
             self._last_rejected_obs = None
@@ -329,20 +406,46 @@ class ConstantAccelerationKalman2D:
         self._consecutive_rejects = 0
         self._last_rejected_obs = None
 
+        if not (np.isfinite(y_res).all() and np.isfinite(s_mat).all()):
+            # 极值坐标导致残差或新息矩阵溢出时安全保留有限预测状态，不污染滤波器
+            x_cand = self._clamp_physical_kinematics(x_pred.copy())
+            if x_cand is None or not np.isfinite(s_mat).all():
+                return self._reset_to_observation(ts, zx, zy, r_mat)
+            self._x = x_cand
+            self._P = p_pred
+            self._last_timestamp_s = ts
+            self.last_accepted = False
+            return False
+
         # Joseph 形式协方差更新: P = (I - K H) P (I - K H)^T + K R K^T
-        ph_t = p_pred @ _H_OBS.T
-        try:
-            k_gain = np.linalg.solve(s_mat.T, ph_t.T).T
-        except np.linalg.LinAlgError:
-            k_gain = ph_t @ np.linalg.pinv(s_mat)
+        with np.errstate(over="ignore", invalid="ignore"):
+            ph_t = p_pred @ _H_OBS.T
+            try:
+                k_gain = np.linalg.solve(s_mat.T, ph_t.T).T
+            except np.linalg.LinAlgError:
+                k_gain = ph_t @ np.linalg.pinv(s_mat)
 
-        i_kh = _I6 - k_gain @ _H_OBS
-        p_upd = i_kh @ p_pred @ i_kh.T + k_gain @ r_mat @ k_gain.T
-        p_upd = 0.5 * (p_upd + p_upd.T)
+            i_kh = _I6 - k_gain @ _H_OBS
+            p_upd = i_kh @ p_pred @ i_kh.T + k_gain @ r_mat @ k_gain.T
+            p_upd = 0.5 * (p_upd + p_upd.T)
+            x_upd = x_pred + k_gain @ y_res
 
-        self._x = x_pred + k_gain @ y_res
+        x_cand = self._clamp_physical_kinematics(x_upd)
+        # 提交前校验有限性：极端观测导致状态上溢则退回有限预测，协方差上溢则安全重置
+        if not np.isfinite(p_upd).all():
+            return self._reset_to_observation(ts, zx, zy, r_mat)
+        if x_cand is None or not np.isfinite(x_cand).all():
+            x_fallback = self._clamp_physical_kinematics(x_pred.copy())
+            if x_fallback is None or not np.isfinite(x_fallback).all():
+                return self._reset_to_observation(ts, zx, zy, r_mat)
+            self._x = x_fallback
+            self._P = p_pred
+            self._last_timestamp_s = ts
+            self.last_accepted = False
+            return False
+
+        self._x = x_cand
         self._P = p_upd
-        self._clamp_physical_kinematics()
         self._last_timestamp_s = ts
         self._update_count += 1
         self.last_accepted = True
@@ -358,12 +461,16 @@ class ConstantAccelerationKalman2D:
         if dt == 0.0:
             return float(self._x[0]), float(self._x[1]), self._P[:2, :2].copy()
 
-        f_mat = _transition_matrix(dt)
-        q_mat = _process_noise_matrix(dt, self.jerk_std_ms3)
-        x_pred = f_mat @ self._x
-        p_pred = f_mat @ self._P @ f_mat.T + q_mat
-        pos_cov = 0.5 * (p_pred[:2, :2] + p_pred[:2, :2].T)
-        return float(x_pred[0]), float(x_pred[1]), pos_cov
+        with np.errstate(over="ignore", invalid="ignore"):
+            f_mat = _transition_matrix(dt)
+            q_mat = _process_noise_matrix(dt, self.jerk_std_ms3)
+            x_pred = f_mat @ self._x
+            p_pred = f_mat @ self._P @ f_mat.T + q_mat
+            pos_cov = 0.5 * (p_pred[:2, :2] + p_pred[:2, :2].T)
+        px, py = float(x_pred[0]), float(x_pred[1])
+        if not (math.isfinite(px) and math.isfinite(py) and np.isfinite(pos_cov).all()):
+            raise ValueError("dt_s 过大导致前向预测状态数值溢出")
+        return px, py, pos_cov
 
     @property
     def position_xy(self) -> Tuple[float, float]:
@@ -384,8 +491,11 @@ class ConstantAccelerationKalman2D:
     @property
     def pos_std_m(self) -> float:
         """二维欧氏位置标准差 sqrt(P_xx + P_yy)（单位：米）。"""
-        var_sum = float(self._P[0, 0] + self._P[1, 1])
-        return math.sqrt(max(0.0, var_sum))
+        # 用各分量平方根求 hypot 避免超大有限方差直接相加时触发上溢
+        return math.hypot(
+            math.sqrt(max(0.0, float(self._P[0, 0]))),
+            math.sqrt(max(0.0, float(self._P[1, 1]))),
+        )
 
     @property
     def update_count(self) -> int:

@@ -405,16 +405,30 @@ class ConflictPerceptionPipeline:
 
     def _configure_conflict_and_stitcher(self):
         """每次处理新视频或新轨迹流前重置冲突分析器与缝合器状态，防止跨运行串状态。"""
-        self.conflict_analyzer = ConflictAnalyzer(
-            speed_limit_kmh=self.speed_limit_kmh,
-            ttc_critical_s=self.ttc_critical_s,
-            ttc_caution_s=self.ttc_caution_s,
-            horizon_s=self.horizon_s,
-            object_policies=self.object_policies,
-            parking_zone_max_speed_kmh=self.parking_zone_max_speed_kmh,
-            conflict_model=self.conflict_model,
-        )
-        self.stitcher = TrackletStitcher() if self.enable_stitching else None
+        # 优先复用既有 conflict_analyzer 实例并调用 reset()，保留调用方或单测预先挂载的 mock
+        if self.conflict_analyzer is None:
+            self.conflict_analyzer = ConflictAnalyzer(
+                speed_limit_kmh=self.speed_limit_kmh,
+                ttc_critical_s=self.ttc_critical_s,
+                ttc_caution_s=self.ttc_caution_s,
+                horizon_s=self.horizon_s,
+                object_policies=self.object_policies,
+                parking_zone_max_speed_kmh=self.parking_zone_max_speed_kmh,
+                conflict_model=self.conflict_model,
+            )
+        else:
+            reset_fn = getattr(self.conflict_analyzer, "reset", None)
+            if callable(reset_fn):
+                reset_fn()
+
+        # 开启缝合时复用并重置既有 stitcher 实例；关闭缝合时置为 None
+        if self.enable_stitching:
+            if self.stitcher is None:
+                self.stitcher = TrackletStitcher()
+            else:
+                self.stitcher.reset()
+        else:
+            self.stitcher = None
 
     @staticmethod
     def _write_summary_file(out_dir: Path, payload: dict):
@@ -665,7 +679,16 @@ class ConflictPerceptionPipeline:
             for t in tracks:
                 if t.track_id is None:
                     continue
-                eff_id = id_map.get(t.track_id, t.track_id) if self.enable_stitching else t.track_id
+                if self.enable_stitching and self.stitcher is not None:
+                    # 仅对本帧通过标定区筛选并完成缝合映射的区内目标渲染徽章，禁止区外旧 raw_id 回退撞名
+                    if t.track_id not in id_map:
+                        continue
+                    eff_id = id_map[t.track_id]
+                else:
+                    # 未开启缝合时同样跳过已进入 out_of_zone_ids 的标定区外目标
+                    if t.track_id in out_of_zone_ids:
+                        continue
+                    eff_id = t.track_id
                 r = reading_map.get(eff_id)
                 if r:
                     c = conflict_map.get(eff_id) or ped_conflict_map.get(eff_id)

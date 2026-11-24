@@ -23,6 +23,7 @@ from .ssm import (
     PETTracker,
     compute_drac,
     compute_mttc,
+    compute_obb_accel_entry_time,
     compute_obb_swept_ttc,
     estimate_collision_probability,
 )
@@ -67,11 +68,12 @@ def _is_finite_number(value) -> bool:
 
 
 def _conflict_sort_key(c: ConflictAssessment):
-    """冲突项比较键：先按风险等级，同等级按 TTC 越小越紧急"""
-    # 用 is not None 判断而非布尔真值，确保 ttc_seconds == 0.0 不会被误回退成 999.0。
+    """冲突项比较键：先按风险等级，同等级先按 TTC、再按 PET 越小越紧急"""
+    # 用 is not None 判断而非布尔真值，确保 ttc_seconds/pet_seconds == 0.0 不会被误回退成 999.0。
     return (
         int(c.risk_level),
         -(c.ttc_seconds if c.ttc_seconds is not None else 999.0),
+        -(c.pet_seconds if c.pet_seconds is not None else 999.0),
     )
 
 
@@ -158,6 +160,11 @@ class ConflictAnalyzer:
         self.pet_critical_s = float(pet_critical_s)
         self.pet_caution_s = float(pet_caution_s)
         self.pet_tracker = PETTracker() if self.conflict_model == "obb_ssm" else None
+
+    def reset(self) -> None:
+        """重置冲突分析器内部状态（如 PET 网格历史），供复用实例跨运行隔离状态。"""
+        if self.pet_tracker is not None:
+            self.pet_tracker.reset()
 
     def _is_vehicle_exempt(self, veh: SpeedReading) -> bool:
         """判断车辆是否因确认静止或停车区内低速挪动而豁免冲突研判。"""
@@ -258,15 +265,18 @@ class ConflictAnalyzer:
         raw_veh_ay = getattr(veh, "ay_ms2", 0.0)
         raw_ped_ax = getattr(ped, "ax_ms2", 0.0)
         raw_ped_ay = getattr(ped, "ay_ms2", 0.0)
+        raw_veh_heading = getattr(veh, "heading_deg", None)
         veh_ax = 0.0 if raw_veh_ax is None else raw_veh_ax
         veh_ay = 0.0 if raw_veh_ay is None else raw_veh_ay
         ped_ax = 0.0 if raw_ped_ax is None else raw_ped_ax
         ped_ay = 0.0 if raw_ped_ay is None else raw_ped_ay
+        # heading_deg 为 None 时允许回退速度矢量方向，但 NaN/Inf/bool 等无效值必须拦截。
+        veh_heading_chk = 0.0 if raw_veh_heading is None else raw_veh_heading
 
         if not all(
             _is_finite_number(v)
             for v in (
-                veh.x_m, veh.y_m, veh.vx_ms, veh.vy_ms, veh.speed_kmh, veh.heading_deg,
+                veh.x_m, veh.y_m, veh.vx_ms, veh.vy_ms, veh.speed_kmh, veh_heading_chk,
                 ped.x_m, ped.y_m, ped.vx_ms, ped.vy_ms, ped.speed_ms,
                 veh_ax, veh_ay, ped_ax, ped_ay,
             )
@@ -293,10 +303,10 @@ class ConflictAnalyzer:
 
         veh_vx, veh_vy = float(veh.vx_ms), float(veh.vy_ms)
         ped_vx, ped_vy = float(ped.vx_ms), float(ped.vy_ms)
-        veh_speed_vec = math.hypot(veh_vx, veh_vy)
+        # 保留静止/刚起步车辆上游提供的有效 heading_deg，仅在缺失 (None) 时回退速度矢量方向。
         heading_rad = (
-            math.radians(float(veh.heading_deg))
-            if veh_speed_vec > 0.2
+            math.radians(float(raw_veh_heading))
+            if raw_veh_heading is not None
             else math.atan2(veh_vy, veh_vx)
         )
 
@@ -342,35 +352,39 @@ class ConflictAnalyzer:
         )
         drac = compute_drac(dx, dy, dvx, dvy, critical_dist_obb)
 
-        # 若等速外推未撞击，但存在加速度骤增，核查二阶外推在 mttc 时刻是否侵入扩展 OBB；
-        # 窄路平行会车（横向始终大于 hy 且无指向性加速）会在此处被自然过滤为安全。
-        accel_enters_obb = False
-        if not obb.collides and mttc is not None and (dax * dax + day * day) > 1e-6:
+        # 若等速外推未撞击且存在相对加速度，在 [0, horizon_s] 内精确求解二阶轨迹进入扩展 OBB 的最早时刻。
+        accel_entry_t: Optional[float] = None
+        if not obb.collides and (dax * dax + day * day) > 1e-6:
             alx = cos_h * dax + sin_h * day
             aly = -sin_h * dax + cos_h * day
-            px_acc = obb.local_pos_xy[0] + obb.local_vel_xy[0] * mttc + 0.5 * alx * (mttc ** 2)
-            py_acc = obb.local_pos_xy[1] + obb.local_vel_xy[1] * mttc + 0.5 * aly * (mttc ** 2)
-            hx_exp, hy_exp = obb.expanded_half_extents_xy
-            if abs(px_acc) <= hx_exp and abs(py_acc) <= hy_exp:
-                accel_enters_obb = True
+            accel_entry_t = compute_obb_accel_entry_time(
+                obb.local_pos_xy,
+                obb.local_vel_xy,
+                (alx, aly),
+                obb.expanded_half_extents_xy,
+                self.horizon_s,
+            )
+        accel_enters_obb = accel_entry_t is not None
 
         if not obb.collides and not accel_enters_obb:
             return None
 
-        # 安全制动降级：已明显减速且刹停距离足够（mttc=None）同时所需减速度低于注意阈值。
+        # 安全制动降级：已明显减速且刹停距离足够（mttc=None 且二阶未侵入 OBB）同时所需减速度低于注意阈值。
         is_safe_braking = (
             mttc is None
+            and not accel_enters_obb
             and a_c < -0.5
             and drac is not None
             and drac < self.drac_caution_ms2
         )
+        min_dist_out = 0.0 if accel_enters_obb else obb.min_clearance_m
         if is_safe_braking:
             if obb.collides and obb.t_enter is not None and obb.t_enter <= self.ttc_critical_s:
                 level = RiskLevel.LEVEL_2_CAUTION
                 t_eff: Optional[float] = obb.t_enter
                 desc = (
                     f"减速制动礼让中 (MTTC安全, DRAC={drac:.2f}m/s^2, "
-                    f"净距={obb.min_clearance_m:.2f}m)"
+                    f"净距={min_dist_out:.2f}m)"
                 )
             else:
                 return None
@@ -379,8 +393,8 @@ class ConflictAnalyzer:
                 assert obb.t_enter is not None
                 t_eff = mttc if (mttc is not None and mttc < obb.t_enter) else obb.t_enter
             else:
-                assert mttc is not None
-                t_eff = mttc
+                assert accel_entry_t is not None
+                t_eff = accel_entry_t
 
             if t_eff <= self.ttc_critical_s:
                 level = RiskLevel.LEVEL_3_CRITICAL
@@ -402,15 +416,20 @@ class ConflictAnalyzer:
             if level == RiskLevel.LEVEL_3_CRITICAL:
                 desc = (
                     f"紧急碰撞危险! (OBB-TTC={t_eff:.2f}s, "
-                    f"DRAC={drac_txt}m/s^2, 净距={obb.min_clearance_m:.2f}m)"
+                    f"DRAC={drac_txt}m/s^2, 净距={min_dist_out:.2f}m)"
                 )
             else:
                 desc = (
                     f"注意减速礼让行人 (OBB-TTC={t_eff:.2f}s, "
-                    f"DRAC={drac_txt}m/s^2, 净距={obb.min_clearance_m:.2f}m)"
+                    f"DRAC={drac_txt}m/s^2, 净距={min_dist_out:.2f}m)"
                 )
 
-        t_eval = mttc if mttc is not None else (t_eff if t_eff is not None else obb.t_min_clearance)
+        if accel_enters_obb:
+            assert accel_entry_t is not None
+            # 二阶加速侵入场景至少推进到侵入时刻，避免 1D MTTC 提前在 OBB 外部评估碰撞概率。
+            t_eval = mttc if (mttc is not None and mttc >= accel_entry_t) else accel_entry_t
+        else:
+            t_eval = mttc if mttc is not None else (t_eff if t_eff is not None else obb.t_min_clearance)
         conflict_x = float(veh.x_m) + veh_vx * t_eval + 0.5 * float(veh_ax) * (t_eval ** 2)
         conflict_y = float(veh.y_m) + veh_vy * t_eval + 0.5 * float(veh_ay) * (t_eval ** 2)
 
@@ -418,14 +437,15 @@ class ConflictAnalyzer:
         ped_cov = getattr(ped, "pos_cov_m2", None)
         try:
             prob = estimate_collision_probability(
-                dx, dy, dvx, dvy, t_eval, critical_dist_obb, veh_cov, ped_cov
+                dx, dy, dvx, dvy, t_eval, critical_dist_obb, veh_cov, ped_cov,
+                dax=dax, day=day,
             )
         except ValueError:
             prob = estimate_collision_probability(
-                dx, dy, dvx, dvy, t_eval, critical_dist_obb, None, None
+                dx, dy, dvx, dvy, t_eval, critical_dist_obb, None, None,
+                dax=dax, day=day,
             )
 
-        min_dist_out = 0.0 if accel_enters_obb else obb.min_clearance_m
         return ConflictAssessment(
             veh_track_id=veh.track_id,
             ped_track_id=ped.track_id,
@@ -481,6 +501,16 @@ class ConflictAnalyzer:
                 for v in (veh.x_m, veh.y_m, veh.vx_ms, veh.vy_ms, veh.speed_kmh)
             ):
                 continue
+            if self.conflict_model == "obb_ssm":
+                # obb_ssm 模式下同步校验朝向与加速度，None 按缺失回退默认逻辑兼容，NaN/Inf/bool 则整车跳过。
+                raw_heading = getattr(veh, "heading_deg", None)
+                raw_ax = getattr(veh, "ax_ms2", 0.0)
+                raw_ay = getattr(veh, "ay_ms2", 0.0)
+                heading_chk = 0.0 if raw_heading is None else raw_heading
+                ax_chk = 0.0 if raw_ax is None else raw_ax
+                ay_chk = 0.0 if raw_ay is None else raw_ay
+                if not all(_is_finite_number(v) for v in (heading_chk, ax_chk, ay_chk)):
+                    continue
 
             highest_conflict: Optional[ConflictAssessment] = None
 
@@ -504,9 +534,6 @@ class ConflictAnalyzer:
                         if pet_s <= self.pet_critical_s and highest_conflict.risk_level < RiskLevel.LEVEL_3_CRITICAL:
                             highest_conflict.risk_level = RiskLevel.LEVEL_3_CRITICAL
                             highest_conflict.risk_desc = f"紧急近距擦碰险情 (PET={pet_s:.2f}s)"
-                        elif pet_s <= self.pet_caution_s and highest_conflict.risk_level < RiskLevel.LEVEL_2_CAUTION:
-                            highest_conflict.risk_level = RiskLevel.LEVEL_2_CAUTION
-                            highest_conflict.risk_desc = f"注意近距跨迹险情 (PET={pet_s:.2f}s)"
                         continue
 
                     if pet_s > self.pet_caution_s:

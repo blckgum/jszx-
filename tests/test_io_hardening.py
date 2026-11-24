@@ -769,6 +769,120 @@ class CliSchemaEvaluateHardeningTests(unittest.TestCase):
             )
             self.assertEqual(gt_res["event_accuracy"]["tp"], 0)
 
+    def test_pipeline_reuses_analyzer_mock_and_resets_pet_and_stitcher_across_runs(self):
+        # 验证连续多轮 process_tracks / process_video 会复用 conflict_analyzer 与 stitcher 实例，
+        # 既保留运行时前挂接的 mock，又在每轮运行前通过 reset() 清空 PET 与缝合器状态
+        from analysis.schema import load_jsonl_strict
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calib = _sample_calibrator()
+            pipe = ConflictPerceptionPipeline(
+                calibrator=calib,
+                conflict_model="obb_ssm",
+                enable_stitching=True,
+                fps=10.0,
+            )
+            self.assertTrue(callable(getattr(pipe.conflict_analyzer, "reset", None)))
+            orig_analyzer = pipe.conflict_analyzer
+            orig_stitcher = pipe.stitcher
+
+            # 第一轮包含车辆断轨缝合与行经 y=10m 网格，在 stitcher 与 PETTracker 中留下运行态
+            tracks_r1 = root / "tracks_r1.jsonl"
+            _write_tracks_jsonl(tracks_r1, [
+                _make_track_row(0, 0.0, [_make_target_dict(1, 100.0)], width=300, height=200),
+                _make_track_row(1, 0.1, [], width=300, height=200),
+                _make_track_row(2, 0.2, [_make_target_dict(5, 109.0)], width=300, height=200),
+            ])
+            # 第二轮时间戳从 0.0 重新开始，将行人置于第一轮车辆经过的 y=10m 网格，车辆位于远端 y=18.9m
+            tracks_r2 = root / "tracks_r2.jsonl"
+            _write_tracks_jsonl(tracks_r2, [
+                _make_track_row(
+                    0, 0.0,
+                    [
+                        _make_target_dict(2, 100.0, cls_name="person", cat="pedestrian"),
+                        _make_target_dict(3, 180.0, cls_name="car", cat="vehicle"),
+                    ],
+                    width=300, height=200,
+                ),
+                _make_track_row(
+                    1, 0.1,
+                    [
+                        _make_target_dict(2, 100.0, cls_name="person", cat="pedestrian"),
+                        _make_target_dict(3, 180.0, cls_name="car", cat="vehicle"),
+                    ],
+                    width=300, height=200,
+                ),
+            ])
+
+            with mock.patch.object(
+                pipe.conflict_analyzer,
+                "analyze_frame",
+                wraps=pipe.conflict_analyzer.analyze_frame,
+            ) as spy_analyze:
+                sum_r1 = pipe.process_tracks(tracks_r1, root / "out_t1")
+                sum_r2 = pipe.process_tracks(tracks_r2, root / "out_t2")
+                self.assertEqual(spy_analyze.call_count, 5)
+            self.assertIs(pipe.conflict_analyzer, orig_analyzer)
+            self.assertIs(pipe.stitcher, orig_stitcher)
+            self.assertGreaterEqual(sum_r1["stitched_track_count"], 1)
+            self.assertEqual(sum_r2["stitched_track_count"], 0)
+
+            # 第二轮冲突评估不得跨轮命中第一轮车辆的 PET 占用记录
+            r2_conflicts = load_jsonl_strict(root / "out_t2" / "conflicts.jsonl")
+            self.assertTrue(all(item["assessment"]["pet_seconds"] is None for item in r2_conflicts))
+            self.assertIsNotNone(pipe.conflict_analyzer.pet_tracker)
+            for visits in pipe.conflict_analyzer.pet_tracker._cell_visits.values():
+                self.assertNotIn(1, visits)
+                self.assertNotIn(5, visits)
+
+            # 再验证 process_video 连续两轮同样保留 mock 且重置 PET / stitcher 状态
+            vpath = root / "clip.mp4"
+            _write_dummy_video(vpath, n_frames=2, fps=10.0, size=(300, 200))
+            rec_r1 = SimpleNamespace(
+                tracks=[
+                    SimpleNamespace(
+                        track_id=1, category="vehicle", class_name="car",
+                        bbox_xyxy=(100.0, 70.0, 140.0, 100.0), anchor_xy=(120.0, 100.0),
+                    )
+                ]
+            )
+            rec_r2 = SimpleNamespace(
+                tracks=[
+                    SimpleNamespace(
+                        track_id=2, category="pedestrian", class_name="person",
+                        bbox_xyxy=(100.0, 70.0, 140.0, 100.0), anchor_xy=(120.0, 100.0),
+                    ),
+                    SimpleNamespace(
+                        track_id=3, category="vehicle", class_name="car",
+                        bbox_xyxy=(100.0, 150.0, 140.0, 180.0), anchor_xy=(120.0, 180.0),
+                    ),
+                ]
+            )
+
+            def _make_fake_session(record):
+                sess = mock.Mock()
+                sess.process.return_value = record
+                sess.retained_ids.side_effect = lambda: {t.track_id for t in record.tracks}
+                return sess
+
+            with mock.patch.object(
+                pipe.conflict_analyzer,
+                "analyze_frame",
+                wraps=pipe.conflict_analyzer.analyze_frame,
+            ) as spy_video_analyze:
+                with mock.patch("analysis.pipeline.TrackingSession", return_value=_make_fake_session(rec_r1)):
+                    pipe.process_video(vpath, root / "out_v1")
+                with mock.patch("analysis.pipeline.TrackingSession", return_value=_make_fake_session(rec_r2)):
+                    pipe.process_video(vpath, root / "out_v2")
+                self.assertEqual(spy_video_analyze.call_count, 4)
+            self.assertIs(pipe.conflict_analyzer, orig_analyzer)
+            self.assertIs(pipe.stitcher, orig_stitcher)
+            v2_conflicts = load_jsonl_strict(root / "out_v2" / "conflicts.jsonl")
+            self.assertTrue(all(item["assessment"]["pet_seconds"] is None for item in v2_conflicts))
+            for visits in pipe.conflict_analyzer.pet_tracker._cell_visits.values():
+                self.assertNotIn(1, visits)
+
     def test_video_and_tracks_reject_empty_paths_frame_size_mismatch_and_bool_gt(self):
         from analysis.batch import analyze_directory
         from analysis.evaluate import evaluate_ground_truth

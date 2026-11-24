@@ -152,7 +152,7 @@ def _segment_aabb_min_clearance(
     if hit is not None:
         return (0.0, hit[0])
 
-    # 距离平方函数分段二次且处处凸，拐点仅出现在穿过边界 x=+-hx 或 y=+-hy 处。
+    # 距离平方函数分段二次且处处凸，分段边界/断点仅出现在穿过边界 x=+-hx 或 y=+-hy 处。
     raw_knots = [0.0, horizon_s]
     for p_i, v_i, h_i in ((px, vx, hx), (py, vy, hy)):
         if abs(v_i) > 1e-12:
@@ -288,6 +288,122 @@ def compute_obb_swept_ttc(
     )
 
 
+def _solve_quadratic_nonneg(
+    c2: float, c1: float, c0: float, t_lo: float, t_hi: float
+) -> list[Tuple[float, float]]:
+    """求解区间 [t_lo, t_hi] 内满足 c2*t^2 + c1*t + c0 >= 0 的闭合时间区间集合。"""
+    if t_lo > t_hi:
+        return []
+    if abs(c2) <= 1e-12:
+        if abs(c1) <= 1e-12:
+            # 退化为常数项，允许极微小的浮点舍入误差落在边界上。
+            return [(t_lo, t_hi)] if c0 >= -1e-12 else []
+        t_root = (-c0 / c1) + 0.0
+        if c1 > 0.0:
+            lo = max(t_lo, t_root)
+            return [(lo, t_hi)] if lo <= t_hi else []
+        hi = min(t_hi, t_root)
+        return [(t_lo, hi)] if t_lo <= hi else []
+
+    disc = c1 * c1 - 4.0 * c2 * c0
+    tol = 1e-12 * max(1.0, c1 * c1, abs(4.0 * c2 * c0))
+    if -tol <= disc < 0.0:
+        disc = 0.0
+    if disc < 0.0:
+        # 无实根时抛物线不变号：开口向上恒满足，开口向下恒不满足。
+        return [(t_lo, t_hi)] if c2 > 0.0 else []
+
+    if disc == 0.0:
+        r1 = r2 = (-c1 / (2.0 * c2)) + 0.0
+    else:
+        sqrt_disc = math.sqrt(disc)
+        # 采用数值稳定求根形式，防止小加速度系数下发生有效数字相消。
+        q = -0.5 * (c1 + math.copysign(sqrt_disc, c1))
+        if abs(q) > 1e-18:
+            r_a = (q / c2) + 0.0
+            r_b = (c0 / q) + 0.0
+        else:
+            r_a = ((-c1 - sqrt_disc) / (2.0 * c2)) + 0.0
+            r_b = ((-c1 + sqrt_disc) / (2.0 * c2)) + 0.0
+        r1, r2 = (r_a, r_b) if r_a <= r_b else (r_b, r_a)
+
+    if c2 > 0.0:
+        # 开口向上对应两段外侧区间 (-inf, r1] U [r2, +inf)，相接时合并为单区间。
+        intervals: list[Tuple[float, float]] = []
+        if t_lo <= r1:
+            intervals.append((t_lo, min(t_hi, r1)))
+        if r2 <= t_hi:
+            right_lo = max(t_lo, r2)
+            if intervals and right_lo <= intervals[-1][1] + 1e-12:
+                intervals[-1] = (intervals[-1][0], t_hi)
+            else:
+                intervals.append((right_lo, t_hi))
+        return intervals
+
+    # 开口向下对应单段闭区间 [r1, r2]。
+    lo = max(t_lo, r1)
+    hi = min(t_hi, r2)
+    return [(lo, hi)] if lo <= hi else []
+
+
+def _intersect_interval_lists(
+    a_list: Sequence[Tuple[float, float]],
+    b_list: Sequence[Tuple[float, float]],
+) -> list[Tuple[float, float]]:
+    """计算两组有序不相交闭区间列表的交集，返回有序闭区间列表。"""
+    result: list[Tuple[float, float]] = []
+    i = 0
+    j = 0
+    while i < len(a_list) and j < len(b_list):
+        a0, a1 = a_list[i]
+        b0, b1 = b_list[j]
+        lo = max(a0, b0)
+        hi = min(a1, b1)
+        if lo <= hi:
+            result.append((lo, hi))
+        if a1 < b1:
+            i += 1
+        else:
+            j += 1
+    return result
+
+
+def compute_obb_accel_entry_time(
+    local_pos_xy: Sequence[float],
+    local_vel_xy: Sequence[float],
+    local_acc_xy: Sequence[float],
+    half_extents_xy: Sequence[float],
+    horizon_s: float,
+) -> Optional[float]:
+    """在 [0, horizon_s] 内闭合解析求解二阶相对轨迹进入 [-hx, hx] x [-hy, hy] 的最早时刻。"""
+    px, py = _validate_vec2(local_pos_xy, "local_pos_xy")
+    vx, vy = _validate_vec2(local_vel_xy, "local_vel_xy")
+    ax, ay = _validate_vec2(local_acc_xy, "local_acc_xy")
+    hx_raw, hy_raw = _validate_vec2(half_extents_xy, "half_extents_xy")
+    hx = _validate_non_negative_float(hx_raw, "half_extents_xy[0]")
+    hy = _validate_non_negative_float(hy_raw, "half_extents_xy[1]")
+    horizon = _validate_positive_float(horizon_s, "horizon_s")
+
+    # 分别求解 X/Y 轴二次不等式 |p + v*t + 0.5*a*t^2| <= h 在 [0, horizon] 内的区间并集（各至多两段）。
+    x_lower = _solve_quadratic_nonneg(0.5 * ax, vx, px + hx, 0.0, horizon)
+    x_upper = _solve_quadratic_nonneg(-0.5 * ax, -vx, hx - px, 0.0, horizon)
+    x_intervals = _intersect_interval_lists(x_lower, x_upper)
+    if not x_intervals:
+        return None
+
+    y_lower = _solve_quadratic_nonneg(0.5 * ay, vy, py + hy, 0.0, horizon)
+    y_upper = _solve_quadratic_nonneg(-0.5 * ay, -vy, hy - py, 0.0, horizon)
+    y_intervals = _intersect_interval_lists(y_lower, y_upper)
+    if not y_intervals:
+        return None
+
+    # 求 X/Y 区间集合交集，返回最早侵入时刻。
+    xy_intervals = _intersect_interval_lists(x_intervals, y_intervals)
+    if not xy_intervals:
+        return None
+    return xy_intervals[0][0] + 0.0
+
+
 def compute_mttc(
     dx: float,
     dy: float,
@@ -404,12 +520,14 @@ def estimate_collision_probability(
     safe_radius_m: float,
     pos_cov_veh_2x2=None,
     pos_cov_ped_2x2=None,
+    dax: float = 0.0,
+    day: float = 0.0,
 ) -> Optional[float]:
     """基于相对位置协方差与特征正交分解+高斯-勒让德积分，计算 [0, 1] 确定性碰撞概率。"""
     safe_r = _validate_positive_float(safe_radius_m, "safe_radius_m")
     if t_eval is None:
         return None
-    if not all(_is_finite_number(v) for v in (dx, dy, dvx, dvy, t_eval)):
+    if not all(_is_finite_number(v) for v in (dx, dy, dvx, dvy, dax, day, t_eval)):
         return None
     t_f = float(t_eval)
     if t_f < 0.0:
@@ -420,7 +538,15 @@ def estimate_collision_probability(
     motion_var = (0.15 * t_f) ** 2
     sigma_rel = sigma_veh + sigma_ped + motion_var * np.eye(2, dtype=float)
 
-    mu = np.array([float(dx) + float(dvx) * t_f, float(dy) + float(dvy) * t_f], dtype=float)
+    # 纳入相对加速度的二阶外推均值位置，避免急加速/制动场景沿用一阶等速位置导致概率失真。
+    half_t2 = 0.5 * (t_f ** 2)
+    mu = np.array(
+        [
+            float(dx) + float(dvx) * t_f + float(dax) * half_t2,
+            float(dy) + float(dvy) * t_f + float(day) * half_t2,
+        ],
+        dtype=float,
+    )
     eigvals, eigvecs = np.linalg.eigh(sigma_rel)
     if float(eigvals[1]) <= 1e-12:
         return 1.0 if float(np.hypot(mu[0], mu[1])) <= safe_r else 0.0
@@ -492,6 +618,13 @@ class PETTracker:
         self._last_track_pos: Dict[int, Tuple[float, float, float]] = {}
         self._last_timestamp_s: Optional[float] = None
 
+    def reset(self) -> None:
+        """清空所有网格占用与轨迹缓存状态，保留配置参数以便实例复用。"""
+        self._cell_visits.clear()
+        self._active_cells_by_track.clear()
+        self._last_track_pos.clear()
+        self._last_timestamp_s = None
+
     def _grid_cell(self, x_m: float, y_m: float) -> Tuple[int, int]:
         return (math.floor(x_m / self.cell_size_m), math.floor(y_m / self.cell_size_m))
 
@@ -549,6 +682,10 @@ class PETTracker:
 
         near_misses: Dict[Tuple[int, int], float] = {}
         current_cells_by_track: Dict[int, set[Tuple[int, int]]] = {}
+        # 第一阶段：遍历本帧全部有效目标，更新网格占用并记录本帧步进触及的时间区间（与输入顺序无关）。
+        frame_intervals: Dict[
+            Tuple[int, int], list[Tuple[int, str, float, float, float]]
+        ] = {}
 
         for r in readings:
             cat = getattr(r, "category", None)
@@ -586,25 +723,47 @@ class PETTracker:
                         category=norm_cat, first_t=first_cell_ts, last_t=last_cell_ts
                     )
                     entry_t = first_cell_ts
+                frame_intervals.setdefault(cell, []).append(
+                    (tid, norm_cat, first_cell_ts, last_cell_ts, entry_t)
+                )
 
-                # 与同一网格内的异类占用历史比对时间差，取进入时间减去先离去者的最后占用时间。
-                for other_tid, other_visit in visits.items():
-                    if other_visit.category == norm_cat:
+            current_cells_by_track[tid] = curr_active
+            self._last_track_pos[tid] = (ts, x_f, y_f)
+
+        # 第二阶段：与输入顺序无关地比对同帧区间与历史访客占用。
+        for cell, entries in frame_intervals.items():
+            visits = self._cell_visits[cell]
+            frame_tids = {item[0] for item in entries}
+
+            # (a) 本帧同时触及同一网格的异类目标：以本帧连续占用区间 [entry, last] 对称求间隔，
+            # 既兼容跨帧驻留未离格目标与过路目标的 0.0s 重叠，也保证 [ped, car] 与 [car, ped] 结果完全一致。
+            n_entries = len(entries)
+            for idx_a in range(n_entries):
+                tid_a, cat_a, _first_a, last_a, entry_a = entries[idx_a]
+                for idx_b in range(idx_a + 1, n_entries):
+                    tid_b, cat_b, _first_b, last_b, entry_b = entries[idx_b]
+                    if cat_a == cat_b or tid_a == tid_b:
                         continue
-                    if other_visit.last_t <= entry_t:
-                        pet = entry_t - other_visit.last_t
-                    elif ts == other_visit.last_t or cell in self._active_cells_by_track.get(other_tid, set()):
-                        pet = 0.0
-                    else:
-                        continue
+                    pet = max(0.0, max(entry_a, entry_b) - min(last_a, last_b))
                     if 0.0 <= pet <= self.max_pet_s:
-                        pair = (tid, other_tid) if norm_cat == "vehicle" else (other_tid, tid)
+                        pair = (tid_a, tid_b) if cat_a == "vehicle" else (tid_b, tid_a)
                         prev_min = near_misses.get(pair)
                         if prev_min is None or pet < prev_min:
                             near_misses[pair] = pet
 
-            current_cells_by_track[tid] = curr_active
-            self._last_track_pos[tid] = (ts, x_f, y_f)
+            # (b) 历史访客（本帧未触及该网格）：仅计算先到离格后另一方稍晚进入的 PET，
+            # 并跳过 other_visit.last_t > entry_t 的过期重叠条目。
+            for tid, norm_cat, _first_cell_ts, _last_cell_ts, entry_t in entries:
+                for other_tid, other_visit in visits.items():
+                    if other_tid in frame_tids or other_visit.category == norm_cat:
+                        continue
+                    if other_visit.last_t <= entry_t:
+                        pet = entry_t - other_visit.last_t
+                        if 0.0 <= pet <= self.max_pet_s:
+                            pair = (tid, other_tid) if norm_cat == "vehicle" else (other_tid, tid)
+                            prev_min = near_misses.get(pair)
+                            if prev_min is None or pet < prev_min:
+                                near_misses[pair] = pet
 
         # 未在本帧出现的轨迹清除活跃格标记，若稍后重入同一网格则开启新一次驻留计数。
         self._active_cells_by_track = current_cells_by_track

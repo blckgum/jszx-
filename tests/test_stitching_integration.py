@@ -238,6 +238,123 @@ class TestTrackletStitcher(unittest.TestCase):
         self.assertEqual(pairs_expired, [])
         self.assertEqual(st_pool.lost_count, 0)
 
+    def test_revived_raw_id_cannot_hijack_active_stitched_canonical_id(self):
+        # 验证旧 raw_id 复活后不得抢占已被新 raw_id 缝合继承的活跃 canonical_id
+        st = TrackletStitcher(max_gap_s=1.0, max_distance_m=3.5, max_mahalanobis=3.5)
+        id_map, pairs = st.resolve_frame([(1, "vehicle", "car", 3.0, 1.0)], 0.0)
+        self.assertEqual(id_map, {1: 1})
+        self.assertEqual(pairs, [])
+
+        st.resolve_frame([], 0.2)
+        id_map, pairs = st.resolve_frame([(5, "vehicle", "car", 3.0, 2.5)], 0.3)
+        self.assertEqual(id_map, {5: 1})
+        self.assertEqual(pairs, [(5, 1)])
+        self.assertNotIn(1, st._raw_to_canonical)
+
+        # 旧 raw_id=1 作为行人复活且在输入列表中排在 raw_id=5 之前时，仍不得抢占 canonical_id=1
+        id_map, pairs = st.resolve_frame(
+            [(1, "pedestrian", "person", 9.0, 9.0), (5, "vehicle", "car", 3.0, 3.0)],
+            0.4,
+        )
+        self.assertEqual(pairs, [])
+        self.assertEqual(id_map[5], 1)
+        self.assertNotEqual(id_map[1], 1)
+        self.assertEqual(id_map, {1: 2, 5: 1})
+
+        # 即使极端场景下人为残留旧映射，步骤 1 的活跃所有权核对也必须阻止抢占
+        st_stale = TrackletStitcher(max_gap_s=1.0, max_distance_m=3.5, max_mahalanobis=3.5)
+        st_stale.resolve_frame([(1, "vehicle", "car", 3.0, 1.0)], 0.0)
+        st_stale.resolve_frame([], 0.2)
+        st_stale.resolve_frame([(5, "vehicle", "car", 3.0, 2.5)], 0.3)
+        st_stale._raw_to_canonical[1] = 1
+        id_map_stale, _ = st_stale.resolve_frame(
+            [(1, "pedestrian", "person", 9.0, 9.0), (5, "vehicle", "car", 3.0, 3.0)],
+            0.4,
+        )
+        self.assertEqual(id_map_stale[5], 1)
+        self.assertNotEqual(id_map_stale[1], 1)
+
+    def test_numpy_scalars_and_explicit_none_raw_track_id_fallback(self):
+        # 验证构造参数、观测坐标/ID 与运动学更新兼容 NumPy 标量并拒绝 np.bool_
+        st = TrackletStitcher(
+            max_gap_s=np.float32(1.5),
+            max_distance_m=np.float64(3.5),
+            max_mahalanobis=np.float32(3.5),
+            max_lost_pool=np.int64(16),
+        )
+        with self.assertRaises(ValueError):
+            TrackletStitcher(max_gap_s=np.bool_(True))
+        with self.assertRaises(ValueError):
+            TrackletStitcher(max_lost_pool=np.bool_(True))
+
+        # 显式传入 raw_track_id=None 时应正确回退读取 track_id，且兼容 NumPy 数值标量
+        obs_batch = [
+            (np.int64(1), "vehicle", "car", np.float32(3.0), np.float64(1.0)),
+            {
+                "raw_track_id": None,
+                "track_id": np.int64(2),
+                "category": "vehicle",
+                "object_kind": "car",
+                "x_m": np.float32(5.0),
+                "y_m": np.float64(2.0),
+            },
+            SimpleNamespace(
+                raw_track_id=None,
+                track_id=np.int64(3),
+                category="pedestrian",
+                object_kind="person",
+                x_m=np.float32(6.0),
+                y_m=np.float32(8.0),
+            ),
+        ]
+        id_map, pairs = st.resolve_frame(obs_batch, np.float64(0.1))
+        self.assertEqual(id_map, {1: 1, 2: 2, 3: 3})
+        self.assertEqual(pairs, [])
+        self.assertEqual(st.resolve_canonical_id(np.int64(2)), 2)
+
+        # update_kinematics 与 retained_canonical_ids 同样支持 NumPy 标量
+        st.update_kinematics(
+            np.int64(1),
+            SimpleNamespace(
+                x_m=np.float32(3.0),
+                y_m=np.float32(1.0),
+                vx_ms=np.float64(0.0),
+                vy_ms=np.float32(6.0),
+                ax_ms2=np.float32(0.0),
+                ay_ms2=np.float32(0.0),
+                is_reliable=np.bool_(True),
+                category="vehicle",
+                object_kind="car",
+                pos_cov_m2=(np.float32(0.04), 0.0, 0.0, np.float32(0.16)),
+            ),
+            np.float64(0.1),
+        )
+        self.assertIn(1, st.retained_canonical_ids(np.float64(0.1)))
+
+        # 显式传入 0/False 与 np.bool_ 仍必须抛 ValueError，不可被当作 None 掩盖
+        for bad_obs in (
+            {"raw_track_id": False, "track_id": 2, "category": "vehicle", "x_m": 1.0, "y_m": 2.0},
+            {"raw_track_id": 0, "track_id": 2, "category": "vehicle", "x_m": 1.0, "y_m": 2.0},
+            (1, "vehicle", "car", np.bool_(True), 2.0),
+            SimpleNamespace(raw_track_id=np.bool_(True), category="vehicle", x_m=1.0, y_m=2.0),
+        ):
+            with self.assertRaises(ValueError):
+                st.resolve_frame([bad_obs], 0.2)
+        with self.assertRaises(ValueError):
+            st.resolve_frame([], np.bool_(True))
+
+        # 显式 raw_track_id=None 且坐标为 NaN 时仍安全跳过；reset() 后状态全部归零
+        skip_map, skip_pairs = st.resolve_frame(
+            [{"raw_track_id": None, "track_id": 4, "category": "vehicle", "x_m": np.float32("nan"), "y_m": 2.0}],
+            0.25,
+        )
+        self.assertEqual((skip_map, skip_pairs), ({}, []))
+        st.reset()
+        self.assertEqual(st.active_count, 0)
+        self.assertEqual(st.lost_count, 0)
+        self.assertEqual(st.stitched_track_count, 0)
+        self.assertEqual(st.resolve_frame([(1, "vehicle", "car", 1.0, 1.0)], 0.0)[0], {1: 1})
+
 
 class TestEndToEndKalmanOBBStitchingReplay(unittest.TestCase):
     def _write_synthetic_tracks_with_occlusion(self, tracks_path: Path, calib: RoadCalibrator):
@@ -374,7 +491,7 @@ class TestEndToEndKalmanOBBStitchingReplay(unittest.TestCase):
                 })
             writer.release()
             tracks_path.write_text(
-                "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                "\n".join(json.dumps(r, ensure_ascii=False, allow_nan=False) for r in rows) + "\n",
                 encoding="utf-8",
             )
 
@@ -413,6 +530,85 @@ class TestEndToEndKalmanOBBStitchingReplay(unittest.TestCase):
             self.assertTrue(post_switch_badges)
             # 确认缝合确实在视频渲染运行中触发
             self.assertGreaterEqual(load_json_strict(out_dir / "summary.json")["stitched_track_count"], 1)
+
+    def test_out_of_zone_revived_raw_id_does_not_steal_stitched_badge(self):
+        # 验证标定区外复活的旧 raw_id 不得盗用区内已缝合目标的速度徽章与告警编号
+        calib = _perspective_calibrator()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            calib_path = root / "calib.yaml"
+            calib.to_yaml(calib_path)
+            tracks_path = root / "tracks.jsonl"
+            video_path = root / "sync_badge.mp4"
+
+            writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (1000, 640))
+            self.assertTrue(writer.isOpened())
+            rows = []
+            out_u, out_v = _project_ground_to_pixel(calib, 3.0, -3.5)
+            self.assertFalse(calib.is_in_zone(3.0, -3.5, margin_m=2.0))
+            out_box_expect = (out_u - 18.0, out_v - 36.0, out_u + 18.0, out_v)
+
+            for idx in range(4):
+                writer.write(np.zeros((640, 1000, 3), dtype=np.uint8))
+                ts = round(idx * 0.1, 6)
+                targets = []
+                u_p, v_p = _project_ground_to_pixel(calib, 3.2, 12.0)
+                targets.append(_make_track_target(10, u_p, v_p, class_name="person", category="pedestrian"))
+                if idx == 0:
+                    u_v, v_v = _project_ground_to_pixel(calib, 3.0, 4.0)
+                    targets.append(_make_track_target(2, u_v, v_v, class_name="car", category="vehicle"))
+                elif idx == 2:
+                    u_v, v_v = _project_ground_to_pixel(calib, 3.0, 5.6)
+                    targets.append(_make_track_target(9, u_v, v_v, class_name="car", category="vehicle"))
+                elif idx == 3:
+                    # 帧 3：raw_id=9 在区内继续持 canonical_id=2，同时旧 raw_id=2 出现在标定区外
+                    u_v, v_v = _project_ground_to_pixel(calib, 3.0, 6.4)
+                    targets.append(_make_track_target(9, u_v, v_v, class_name="car", category="vehicle"))
+                    targets.append(_make_track_target(2, out_u, out_v, class_name="car", category="vehicle"))
+                rows.append({
+                    "schema_version": 1,
+                    "session_id": "sess-outzone-badge",
+                    "source": str(video_path),
+                    "frame_index": idx,
+                    "timestamp_s": ts,
+                    "timestamp_source": "video_pts",
+                    "width": 1000,
+                    "height": 640,
+                    "tracks": targets,
+                })
+            writer.release()
+            tracks_path.write_text(
+                "\n".join(json.dumps(r, ensure_ascii=False, allow_nan=False) for r in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            frame_badge_records = []
+            from analysis.visualization import EnhancedConflictVisualizer
+
+            orig_badge = EnhancedConflictVisualizer.draw_speed_badge
+
+            def _spy_badge(viz_self, frame, box_xyxy, reading, conflict=None, event_id=None):
+                frame_badge_records.append((tuple(box_xyxy), reading.track_id))
+                return orig_badge(viz_self, frame, box_xyxy, reading, conflict, event_id=event_id)
+
+            out_dir = root / "out_badge"
+            with mock.patch.object(EnhancedConflictVisualizer, "draw_speed_badge", new=_spy_badge):
+                rc = analysis_main([
+                    "--tracks", str(tracks_path),
+                    "--source", str(video_path),
+                    "--calib", str(calib_path),
+                    "--output", str(out_dir),
+                    "--enable-stitching",
+                ])
+            self.assertEqual(rc, 0)
+            self.assertGreaterEqual(load_json_strict(out_dir / "summary.json")["stitched_track_count"], 1)
+
+            # 统计第 3 帧中 canonical_id=2 的徽章渲染次数：整个 4 帧仅在帧 0、2、3 各绘制 1 次（共 3 次），
+            # 且所有绘制框坐标均不得命中区外 raw_id=2 的框
+            veh_badges = [box for box, tid in frame_badge_records if tid == 2]
+            self.assertEqual(len(veh_badges), 3)
+            for box in veh_badges:
+                self.assertNotEqual(tuple(round(x, 3) for x in box), tuple(round(x, 3) for x in out_box_expect))
 
     def test_invalid_pipeline_and_cli_model_options_rejected(self):
         calib = _perspective_calibrator()

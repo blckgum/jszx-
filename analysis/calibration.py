@@ -20,16 +20,45 @@ import numpy as np
 import yaml
 
 
+def _is_finite_real(value) -> bool:
+    """判断输入是否为非布尔的有限实数（兼容 Python 与 NumPy 整数/浮点标量）。"""
+    # Python 中 bool 继承自 int，需先显式排除 bool 与 np.bool_
+    if isinstance(value, (bool, np.bool_)):
+        return False
+    if not isinstance(value, (int, float, np.integer, np.floating)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
 def _validate_finite_float(value, label: str) -> float:
     """校验有限浮点数，显式拒绝布尔值、NaN 和 Inf。"""
     if type(value) is bool or isinstance(value, np.bool_):
         raise ValueError(f"{label}不能为布尔值")
-    if not isinstance(value, (int, float, np.integer, np.floating)):
+    if not _is_finite_real(value):
         raise ValueError(f"{label}必须为有限数值")
-    fval = float(value)
-    if not math.isfinite(fval):
-        raise ValueError(f"{label}必须为有限数值")
-    return fval
+    return float(value)
+
+
+def _compute_ground_bounds(
+    points: List[Tuple[float, float]], label: str = "ground_points"
+) -> Tuple[float, float, float, float, float, float]:
+    """计算二维地面点包络 (min_x, max_x, min_y, max_y, width_m, length_m) 并校验非退化跨度。"""
+    xs = [pt[0] for pt in points]
+    ys = [pt[1] for pt in points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    width_m = max_x - min_x
+    length_m = max_y - min_y
+    if (
+        not (math.isfinite(width_m) and math.isfinite(length_m))
+        or width_m <= 1e-6
+        or length_m <= 1e-6
+    ):
+        raise ValueError(f"{label} 的物理跨度必须为正数（不可全部共线或重合）")
+    return float(min_x), float(max_x), float(min_y), float(max_y), float(width_m), float(length_m)
 
 
 def _validate_point_2d(pt, label: str) -> Tuple[float, float]:
@@ -141,15 +170,10 @@ def _validate_polygon_2d(poly, name: str = "多边形") -> List[Tuple[float, flo
 
 
 def _point_in_polygon(x: float, y: float, polygon: List[Tuple[float, float]]) -> bool:
-    if (
-        isinstance(x, bool)
-        or isinstance(y, bool)
-        or not isinstance(x, (int, float))
-        or not isinstance(y, (int, float))
-        or not (math.isfinite(x) and math.isfinite(y))
-        or len(polygon) < 3
-    ):
+    if not (_is_finite_real(x) and _is_finite_real(y)) or len(polygon) < 3:
         return False
+    # 统一转为 Python float，确保 NumPy 标量（如 np.float32）可正常参与几何判定
+    px, py = float(x), float(y)
     n = len(polygon)
     # 先做边段最近点距离检查：落在多边形边界上（1e-9 米容差内）一律视为在区域内，
     # 避免射线法在顶点或水平边上的浮点边界歧义。
@@ -159,11 +183,11 @@ def _point_in_polygon(x: float, y: float, polygon: List[Tuple[float, float]]) ->
         dx, dy = x2 - x1, y2 - y1
         seg_len_sq = dx * dx + dy * dy
         if seg_len_sq <= 1e-18:
-            if math.hypot(x - x1, y - y1) <= 1e-9:
+            if math.hypot(px - x1, py - y1) <= 1e-9:
                 return True
         else:
-            t = max(0.0, min(1.0, ((x - x1) * dx + (y - y1) * dy) / seg_len_sq))
-            if math.hypot(x - (x1 + t * dx), y - (y1 + t * dy)) <= 1e-9:
+            t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / seg_len_sq))
+            if math.hypot(px - (x1 + t * dx), py - (y1 + t * dy)) <= 1e-9:
                 return True
     # 标准射线法（Ray-Casting）：仅当边跨越水平线 y 时才求交点，因此必有 yj != yi，不会除零。
     inside = False
@@ -171,7 +195,7 @@ def _point_in_polygon(x: float, y: float, polygon: List[Tuple[float, float]]) ->
     for i in range(n):
         xi, yi = polygon[i]
         xj, yj = polygon[j]
-        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
             inside = not inside
         j = i
     return inside
@@ -492,23 +516,18 @@ class RoadCalibrator:
             for idx, pt in enumerate(ground_points)
         ]
 
-        xs = [pt[0] for pt in parsed_gd]
-        ys = [pt[1] for pt in parsed_gd]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        width_m = max_x - min_x
-        length_m = max_y - min_y
-        if not (math.isfinite(width_m) and math.isfinite(length_m)) or width_m <= 1e-6 or length_m <= 1e-6:
-            raise ValueError("ground_points 的物理跨度必须为正数（不可全部共线或重合）")
+        min_x, max_x, min_y, max_y, width_m, length_m = _compute_ground_bounds(
+            parsed_gd, label="ground_points"
+        )
 
         obj = cls.__new__(cls)
         obj.name = name
         obj.synthetic = synthetic
         obj.synthetic_field_missing = False
         obj.source_path = None
-        obj.width_m = float(width_m)
-        obj.length_m = float(length_m)
-        obj._zone_bounds = (float(min_x), float(max_x), float(min_y), float(max_y))
+        obj.width_m = width_m
+        obj.length_m = length_m
+        obj._zone_bounds = (min_x, max_x, min_y, max_y)
         obj.image_points = parsed_img
         obj.ground_points = parsed_gd
         obj.parking_zones = parsed_parking_zones
@@ -542,6 +561,13 @@ class RoadCalibrator:
             inlier_indices = list(range(len(parsed_img)))
 
         inlier_ground_pts = [parsed_gd[i] for i in inlier_indices]
+        # 必须仅依据 RANSAC 留存内点重算物理宽高与区域边界，防止外点撑大 is_in_zone() 与配置快照
+        in_min_x, in_max_x, in_min_y, in_max_y, in_width_m, in_length_m = _compute_ground_bounds(
+            inlier_ground_pts, label="RANSAC 内点地面坐标"
+        )
+        obj.width_m = in_width_m
+        obj.length_m = in_length_m
+        obj._zone_bounds = (in_min_x, in_max_x, in_min_y, in_max_y)
         obj._finalize_homography(h_mat, inlier_ground_pts)
 
         sq_errors: List[float] = []
@@ -624,6 +650,12 @@ class RoadCalibrator:
 
         raw_camera_matrix = data.get("camera_matrix")
         raw_dist_coeffs = data.get("dist_coeffs")
+        # 无论进入 4 点还是 >4 点对应点分支，均先校验 width_m 与 length_m 为非 bool 有限正数
+        w_val = _validate_finite_float(data["width_m"], "width_m ")
+        l_val = _validate_finite_float(data["length_m"], "length_m ")
+        if w_val <= 0.0 or l_val <= 0.0:
+            raise ValueError("道路的实际物理宽度和长度必须为大于 0 的有限正数（单位：米）")
+
         raw_ground_points = data.get("ground_points")
         use_corresp = False
         if raw_ground_points is not None:
@@ -633,23 +665,19 @@ class RoadCalibrator:
                 tuple(p) if isinstance(p, (list, tuple)) else p
                 for p in raw_ground_points
             ]
+            if len(gd_pts) != len(img_pts):
+                raise ValueError(f"标定文件 {path} 的 image_points 与 ground_points 数量不一致")
             if len(img_pts) > 4:
                 use_corresp = True
-            elif len(img_pts) == 4 and len(gd_pts) == 4:
-                try:
-                    w_val = _validate_finite_float(data["width_m"], "width_m ")
-                    l_val = _validate_finite_float(data["length_m"], "length_m ")
-                    expected_rect = [(0.0, 0.0), (w_val, 0.0), (w_val, l_val), (0.0, l_val)]
-                    parsed_gd = [_validate_point_2d(p, "ground_points") for p in gd_pts]
-                    if any(
-                        math.hypot(gx - ex, gy - ey) > 1e-6
-                        for (gx, gy), (ex, ey) in zip(parsed_gd, expected_rect)
-                    ):
-                        use_corresp = True
-                except ValueError:
-                    use_corresp = False
-            elif len(gd_pts) != len(img_pts):
-                raise ValueError(f"标定文件 {path} 的 image_points 与 ground_points 数量不一致")
+            elif len(img_pts) == 4:
+                # 显式提供 4 个 ground_points 时直接校验并抛出异常，避免静默吞错掩盖损坏字段
+                expected_rect = [(0.0, 0.0), (w_val, 0.0), (w_val, l_val), (0.0, l_val)]
+                parsed_gd = [_validate_point_2d(p, "ground_points") for p in gd_pts]
+                if any(
+                    math.hypot(gx - ex, gy - ey) > 1e-6
+                    for (gx, gy), (ex, ey) in zip(parsed_gd, expected_rect)
+                ):
+                    use_corresp = True
 
         if use_corresp:
             raw_ransac = data.get("use_ransac", False)
@@ -723,17 +751,37 @@ class RoadCalibrator:
 
         return path
 
+    def _project_undistorted_pixel(
+        self, u_p: float, v_p: float
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """将针孔像素坐标通过 K^-1 转归一化射线并调用 cv2.projectPoints，返回 (proj, jac)。"""
+        with np.errstate(over="ignore", invalid="ignore"):
+            ray = self._camera_matrix_inv_np @ np.array([u_p, v_p, 1.0], dtype=np.float64).reshape(3, 1)
+            rz = float(ray[2, 0])
+            if not math.isfinite(rz) or abs(rz) < 1e-8:
+                return None
+            rx = float(ray[0, 0] / rz)
+            ry = float(ray[1, 0] / rz)
+            if not (math.isfinite(rx) and math.isfinite(ry)):
+                return None
+            obj_pt = np.array([[[rx, ry, 1.0]]], dtype=np.float64)
+            try:
+                proj, cv_jac = cv2.projectPoints(
+                    obj_pt,
+                    np.zeros((3, 1), dtype=np.float64),
+                    np.zeros((3, 1), dtype=np.float64),
+                    self._camera_matrix_np,
+                    self._dist_coeffs_np,
+                )
+            except cv2.error:
+                return None
+        return proj, cv_jac
+
     def pixel_to_ground(self, u: float, v: float) -> Tuple[float, float]:
         """
         核心几何变换：将图像像素坐标 (u, v) 映射为道路实际米制坐标 (X, Y)
         """
-        if (
-            isinstance(u, (bool, np.bool_))
-            or isinstance(v, (bool, np.bool_))
-            or not isinstance(u, (int, float, np.integer, np.floating))
-            or not isinstance(v, (int, float, np.integer, np.floating))
-            or not (math.isfinite(u) and math.isfinite(v))
-        ):
+        if not (_is_finite_real(u) and _is_finite_real(v)):
             return float("nan"), float("nan")
         undist = self._undistort_uv(float(u), float(v))
         if undist is None:
@@ -756,13 +804,7 @@ class RoadCalibrator:
 
     def pixel_to_ground_jacobian(self, u: float, v: float) -> Optional[np.ndarray]:
         """计算 pixel_to_ground(u, v) 关于输入像素 (u, v) 的解析 2x2 雅可比矩阵 J。"""
-        if (
-            isinstance(u, (bool, np.bool_))
-            or isinstance(v, (bool, np.bool_))
-            or not isinstance(u, (int, float, np.integer, np.floating))
-            or not isinstance(v, (int, float, np.integer, np.floating))
-            or not (math.isfinite(u) and math.isfinite(v))
-        ):
+        if not (_is_finite_real(u) and _is_finite_real(v)):
             return None
 
         undist = self._undistort_uv(float(u), float(v))
@@ -779,24 +821,10 @@ class RoadCalibrator:
             j_kinv = _homography_jacobian(self._camera_matrix_inv_np, u_p, v_p)
             if j_kinv is None:
                 return None
-            ray = self._camera_matrix_inv_np @ np.array([u_p, v_p, 1.0], dtype=np.float64).reshape(3, 1)
-            rz = float(ray[2, 0])
-            if not math.isfinite(rz) or abs(rz) < 1e-8:
+            projected = self._project_undistorted_pixel(u_p, v_p)
+            if projected is None:
                 return None
-            obj_pt = np.array(
-                [[[float(ray[0, 0] / rz), float(ray[1, 0] / rz), 1.0]]],
-                dtype=np.float64,
-            )
-            try:
-                _, cv_jac = cv2.projectPoints(
-                    obj_pt,
-                    np.zeros((3, 1), dtype=np.float64),
-                    np.zeros((3, 1), dtype=np.float64),
-                    self._camera_matrix_np,
-                    self._dist_coeffs_np,
-                )
-            except cv2.error:
-                return None
+            _, cv_jac = projected
             # projectPoints 雅可比第 3..4 列对应平移动态 [tx, ty] (Z=1 时即归一化射线坐标导数)
             j_dist_ray = cv_jac[:, 3:5].astype(np.float64)
             j_fwd = j_dist_ray @ j_kinv
@@ -843,13 +871,7 @@ class RoadCalibrator:
         """逆向几何变换：将道路米制坐标 (X, Y) 投射回图像像素坐标 (u, v)；
         对非有限输入、相机主平面后方点及近地平线溢出坐标返回 None。
         """
-        if (
-            isinstance(x, (bool, np.bool_))
-            or isinstance(y, (bool, np.bool_))
-            or not isinstance(x, (int, float, np.integer, np.floating))
-            or not isinstance(y, (int, float, np.integer, np.floating))
-            or not (math.isfinite(x) and math.isfinite(y))
-        ):
+        if not (_is_finite_real(x) and _is_finite_real(y)):
             return None
         p_g = np.array([float(x), float(y), 1.0], dtype=np.float64).reshape(3, 1)
         with np.errstate(over="ignore", invalid="ignore"):
@@ -875,25 +897,10 @@ class RoadCalibrator:
             return None
 
         if self._camera_matrix_np is not None and self._dist_coeffs_np is not None:
-            ray = self._camera_matrix_inv_np @ np.array([u_f, v_f, 1.0], dtype=np.float64).reshape(3, 1)
-            rz = float(ray[2, 0])
-            if not math.isfinite(rz) or abs(rz) < 1e-8:
+            projected = self._project_undistorted_pixel(u_f, v_f)
+            if projected is None:
                 return None
-            obj_pt = np.array(
-                [[[float(ray[0, 0] / rz), float(ray[1, 0] / rz), 1.0]]],
-                dtype=np.float64,
-            )
-            with np.errstate(over="ignore", invalid="ignore"):
-                try:
-                    proj, _ = cv2.projectPoints(
-                        obj_pt,
-                        np.zeros((3, 1), dtype=np.float64),
-                        np.zeros((3, 1), dtype=np.float64),
-                        self._camera_matrix_np,
-                        self._dist_coeffs_np,
-                    )
-                except cv2.error:
-                    return None
+            proj, _ = projected
             u_f = float(proj[0, 0, 0])
             v_f = float(proj[0, 0, 1])
             if (
@@ -915,18 +922,14 @@ class RoadCalibrator:
 
     def is_in_zone(self, x: float, y: float, margin_m: float = 2.0) -> bool:
         """判断目标地面坐标是否处于重点受控监测区域内（带冗余边距缓冲）"""
-        if (
-            isinstance(x, bool)
-            or isinstance(y, bool)
-            or not isinstance(x, (int, float))
-            or not isinstance(y, (int, float))
-            or not (math.isfinite(x) and math.isfinite(y))
-        ):
+        if not (_is_finite_real(x) and _is_finite_real(y) and _is_finite_real(margin_m)):
             return False
+        # 统一转为 Python float，兼容 NumPy 标量输入
+        fx, fy, fm = float(x), float(y), float(margin_m)
         min_x, max_x, min_y, max_y = self._zone_bounds
         return (
-            (min_x - margin_m <= x <= max_x + margin_m)
-            and (min_y - margin_m <= y <= max_y + margin_m)
+            (min_x - fm <= fx <= max_x + fm)
+            and (min_y - fm <= fy <= max_y + fm)
         )
 
     def add_parking_zone_pixels(

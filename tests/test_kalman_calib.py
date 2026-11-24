@@ -7,6 +7,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -188,7 +189,6 @@ class TestMultiPointAndDistortionCalibration(unittest.TestCase):
             self.assertTrue(np.allclose(loaded.H, cal.H, atol=1e-6))
 
     def test_from_correspondences_ransac_rejects_gross_outliers(self):
-        rng = np.random.default_rng(7)
         gd_pts = [
             (float(x), float(y))
             for x in (0.5, 2.0, 4.0, 5.5)
@@ -223,6 +223,108 @@ class TestMultiPointAndDistortionCalibration(unittest.TestCase):
             gx2, gy2 = loaded.pixel_to_ground(test_u, test_v)
             self.assertAlmostEqual(gx2, 3.0, delta=1e-3)
             self.assertAlmostEqual(gy2, 7.5, delta=1e-3)
+
+    def test_from_correspondences_ransac_bounds_exclude_outliers_and_check_inlier_span(self):
+        # 12 组 6m x 15m 对应点中注入 2 个远距地面粗差外点，确认外点不撑大区域边界与快照宽高
+        gd_pts = [
+            (float(x), float(y))
+            for x in (0.0, 2.0, 4.0, 6.0)
+            for y in (0.0, 7.5, 15.0)
+        ]
+        img_pts = self._project_ground_points(gd_pts)
+        gd_corrupt = list(gd_pts)
+        gd_corrupt[1] = (100.0, 200.0)
+        gd_corrupt[10] = (-50.0, -80.0)
+
+        cal = RoadCalibrator.from_correspondences(
+            img_pts, gd_corrupt, use_ransac=True, ransac_reproj_threshold_m=0.5
+        )
+        self.assertEqual(cal.inlier_count, 10)
+        self.assertAlmostEqual(cal.width_m, 6.0, places=6)
+        self.assertAlmostEqual(cal.length_m, 15.0, places=6)
+        self.assertEqual(cal._zone_bounds, (0.0, 6.0, 0.0, 15.0))
+        self.assertFalse(cal.is_in_zone(90.0, 190.0))
+        self.assertFalse(cal.is_in_zone(-40.0, -70.0))
+        self.assertTrue(cal.is_in_zone(3.0, 7.5))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ypath = Path(tmpdir) / "ransac_bounds.yaml"
+            cal.to_yaml(ypath)
+            loaded = RoadCalibrator.from_yaml(ypath)
+            self.assertAlmostEqual(loaded.width_m, 6.0, places=6)
+            self.assertAlmostEqual(loaded.length_m, 15.0, places=6)
+            self.assertFalse(loaded.is_in_zone(90.0, 190.0))
+
+        # 若内点本身全共线（仅靠外点撑开跨度），RANSAC 后也应被内点跨度或单应性检验拒绝
+        collinear_inliers = [(3.0, float(i)) for i in range(10)] + [(10.0, 0.0), (0.0, 10.0)]
+        with self.assertRaises(ValueError):
+            RoadCalibrator.from_correspondences(
+                img_pts, collinear_inliers, use_ransac=True, ransac_reproj_threshold_m=0.5
+            )
+
+    def test_from_yaml_strict_ground_points_width_and_numpy_scalar_zone_checks(self):
+        # 1. 显式提供 4 个损坏 ground_points 时不再静默吞错
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bad_gd_yaml = root / "bad_gd4.yaml"
+            bad_gd_yaml.write_text(
+                "name: bad_gd4\n"
+                "synthetic: false\n"
+                "width_m: 6.0\n"
+                "length_m: 15.0\n"
+                "image_points: [[400,300],[880,300],[1150,680],[130,680]]\n"
+                'ground_points: [[0,0],["bad",0],[6,15],[0,15]]\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                RoadCalibrator.from_yaml(bad_gd_yaml)
+
+            # 2. >4 点对应点分支同样拦截 bool/非正/非有限 width_m 与 length_m
+            gd6 = [(0.0, 0.0), (6.0, 0.0), (6.0, 15.0), (0.0, 15.0), (3.0, 7.5), (1.5, 10.0)]
+            img6 = self._project_ground_points(gd6)
+            for bad_key, bad_val in (
+                ("width_m", "true"),
+                ("width_m", "-1.0"),
+                ("length_m", "0.0"),
+                ("length_m", ".nan"),
+            ):
+                p = root / f"bad_{bad_key}_{bad_val}.yaml"
+                payload = {
+                    "name": "bad_corresp_dims",
+                    "synthetic": False,
+                    "width_m": 6.0,
+                    "length_m": 15.0,
+                    "image_points": [list(pt) for pt in img6],
+                    "ground_points": [list(pt) for pt in gd6],
+                }
+                text = yaml.safe_dump(payload, sort_keys=False).replace(
+                    f"{bad_key}: {payload[bad_key]}",
+                    f"{bad_key}: {bad_val}",
+                )
+                p.write_text(text, encoding="utf-8")
+                with self.subTest(bad_key=bad_key, bad_val=bad_val):
+                    with self.assertRaises(ValueError):
+                        RoadCalibrator.from_yaml(p)
+
+        # 3. is_in_zone / is_in_parking_zone 及投影接口统一支持 NumPy 标量并拒绝 bool/np.bool_
+        cal = RoadCalibrator(
+            self.base_img,
+            6.0,
+            15.0,
+            parking_zones=[[(0.0, 0.0), (2.0, 0.0), (2.0, 4.0), (0.0, 4.0)]],
+        )
+        self.assertTrue(cal.is_in_zone(np.float32(3.0), np.int64(5)))
+        self.assertFalse(cal.is_in_zone(np.bool_(True), np.float32(5.0)))
+        self.assertFalse(cal.is_in_zone(np.float32(3.0), np.float32(5.0), margin_m=True))
+        self.assertTrue(cal.is_in_parking_zone(np.float32(1.0), np.int64(2)))
+        self.assertFalse(cal.is_in_parking_zone(np.bool_(True), np.float32(2.0)))
+        gx, gy = cal.pixel_to_ground(np.float32(640.0), np.int64(490))
+        self.assertTrue(math.isfinite(gx) and math.isfinite(gy))
+        self.assertTrue(math.isnan(cal.pixel_to_ground(np.bool_(True), 490.0)[0]))
+        self.assertIsNotNone(cal.pixel_to_ground_jacobian(np.float32(640.0), np.int64(490)))
+        self.assertIsNone(cal.pixel_to_ground_jacobian(np.bool_(False), 490.0))
+        self.assertIsNotNone(cal.ground_to_pixel_checked(np.float32(3.0), np.int64(7)))
+        self.assertIsNone(cal.ground_to_pixel_checked(np.bool_(True), 7.0))
 
     def test_from_correspondences_rejects_degenerate_and_invalid_inputs(self):
         gd4 = [(0.0, 0.0), (6.0, 0.0), (6.0, 15.0), (0.0, 15.0)]
@@ -407,18 +509,44 @@ class TestConstantAccelerationKalman2D(unittest.TestCase):
         self.assertTrue(np.all(np.linalg.eigvalsh(kf.pos_cov_2x2) > 0.0))
         self.assertGreater(kf.pos_std_m, 0.0)
 
-        # 传入非正定/非对称/NaN/bool 观测协方差时应安全回退默认 R，不污染滤波状态
-        for bad_cov in (
+        # 传入非正定/非对称/NaN/bool/嵌套bool/极大奇异协方差时应安全回退默认 R，不污染滤波状态且无警告
+        bad_cov_cases = [
             np.array([[float("nan"), 0.0], [0.0, 0.1]]),
+            np.array([[float("inf"), 0.0], [0.0, 0.1]]),
             np.array([[-0.1, 0.0], [0.0, 0.1]]),
             np.array([[0.1, 0.5], [0.0, 0.1]]),
+            np.array([[1.0, 1e12], [-1e12, 1.0]]),
             np.eye(3),
             [[True, 0.0], [0.0, 0.1]],
-        ):
+            [[np.bool_(True), 0.0], [0.0, 0.1]],
+            np.array([[True, 0.0], [0.0, 0.1]], dtype=object),
+            [np.array([True, False]), np.array([False, True])],
+            (np.array([1.0, 0.0], dtype=object), [0.0, np.bool_(False)]),
+            np.array([[1e160, 2e160], [2e160, 1e160]]),
+            np.array([[1e13, 0.0], [0.0, 1e13]]),
+            np.array([[1e-13, 0.0], [0.0, 1e-13]]),
+            np.array([[1.0, 1.0], [1.0, 1.0 + 1e-13]]),
+        ]
+        for bad_cov in bad_cov_cases:
             t_next = 0.4 + 0.04
             kf_clone = kf.clone()
-            self.assertTrue(kf_clone.update(t_next, 3.0, 2.0 + 5.0 * t_next, obs_cov_m2=bad_cov))
-            self.assertTrue(math.isfinite(kf_clone.pos_std_m))
+            with self.subTest(bad_cov=repr(bad_cov)):
+                self.assertTrue(kf_clone.update(t_next, 3.0, 2.0 + 5.0 * t_next, obs_cov_m2=bad_cov))
+                self.assertTrue(np.isfinite(kf_clone._x).all())
+                self.assertTrue(np.isfinite(kf_clone._P).all())
+                self.assertTrue(np.all(np.linalg.eigvalsh(kf_clone._P) > 0.0))
+
+        # 首帧即传入极值奇异或 object-bool 协方差也必须严格回退为 _default_R
+        for bad_init_cov in (
+            np.array([[True, 0.0], [0.0, 0.1]], dtype=object),
+            [np.array([True, False]), np.array([False, True])],
+            np.array([[1e160, 2e160], [2e160, 1e160]]),
+        ):
+            kf_init = ConstantAccelerationKalman2D(default_pos_std_m=0.35)
+            self.assertTrue(kf_init.update(0.0, 0.0, 0.0, obs_cov_m2=bad_init_cov))
+            self.assertTrue(np.allclose(kf_init.pos_cov_2x2, kf_init._default_R))
+            self.assertTrue(kf_init.update(0.1, 1.0, 1.0, obs_cov_m2=bad_init_cov))
+            self.assertTrue(np.all(np.linalg.eigvalsh(kf_init._P) > 0.0))
 
     def test_mahalanobis_outlier_gate_and_maneuver_reset(self):
         kf = ConstantAccelerationKalman2D(category="vehicle", default_pos_std_m=0.35, gate_chi2=25.0)
@@ -472,6 +600,48 @@ class TestConstantAccelerationKalman2D(unittest.TestCase):
             kf.predict_at(-0.1)
         with self.assertRaises(ValueError):
             ConstantAccelerationKalman2D(jerk_std_ms3=True)
+
+    def test_extreme_coordinates_and_dt_never_overflow_or_poison_state(self):
+        # 1. 预热前极值坐标 (1e308) 上溢不得触发 RuntimeWarning 或 NaN 污染状态
+        kf_coord = ConstantAccelerationKalman2D()
+        self.assertTrue(kf_coord.update(0.0, 0.0, 0.0))
+        kf_coord.update(0.1, 1e308, 0.0)
+        self.assertTrue(np.isfinite(kf_coord._x).all())
+        self.assertTrue(np.isfinite(kf_coord._P).all())
+        self.assertTrue(np.all(np.linalg.eigvalsh(kf_coord._P) > 0.0))
+        self.assertTrue(kf_coord.update(0.2, 1.0, 0.0))
+        self.assertTrue(np.isfinite(kf_coord._x).all())
+
+        # 2. 极端时间步长 dt (1e80) 预测协方差溢出时安全重置且状态恒有限
+        kf_dt = ConstantAccelerationKalman2D()
+        self.assertTrue(kf_dt.update(0.0, 0.0, 0.0))
+        self.assertTrue(kf_dt.update(1e80, 1.0, 1.0))
+        self.assertEqual(kf_dt.position_xy, (1.0, 1.0))
+        self.assertTrue(np.isfinite(kf_dt._x).all())
+        self.assertTrue(np.isfinite(kf_dt._P).all())
+        self.assertTrue(np.all(np.linalg.eigvalsh(kf_dt._P) > 0.0))
+        with self.assertRaises(ValueError):
+            kf_dt.predict_at(1e80)
+
+        # 3. 连续拒收触发机动重置时跨正负 1e308 差值不得产生 NaN
+        kf_reset = ConstantAccelerationKalman2D(min_updates_for_gate=3, max_consecutive_rejects=3)
+        for i in range(4):
+            self.assertTrue(kf_reset.update(i * 0.1, 0.0, 0.0))
+        self.assertFalse(kf_reset.update(0.4, -1e308, 0.0))
+        self.assertFalse(kf_reset.update(0.5, -1e308, 0.0))
+        self.assertTrue(kf_reset.update(0.6, 1e308, 0.0))
+        self.assertTrue(np.isfinite(kf_reset._x).all())
+        self.assertTrue(np.isfinite(kf_reset._P).all())
+        self.assertLessEqual(math.hypot(*kf_reset.velocity_xy), kf_reset.max_speed_ms + 1e-6)
+
+        # 4. _clamp_physical_kinematics 对 1e308 分量保持方向并避免 hypot 溢出
+        kf_clamp = ConstantAccelerationKalman2D(max_speed_ms=20.0, max_accel_ms2=5.0)
+        kf_clamp._x[2:] = (1e308, 1e308, 1e308, -1e308)
+        kf_clamp._clamp_physical_kinematics()
+        self.assertTrue(np.isfinite(kf_clamp._x).all())
+        self.assertAlmostEqual(kf_clamp.velocity_xy[0], kf_clamp.velocity_xy[1], places=6)
+        self.assertAlmostEqual(math.hypot(*kf_clamp.velocity_xy), 20.0, places=6)
+        self.assertAlmostEqual(math.hypot(*kf_clamp.acceleration_xy), 5.0, places=6)
 
 
 class TestSpeedEstimatorKalmanAndTransfer(unittest.TestCase):
@@ -597,6 +767,42 @@ class TestSpeedEstimatorKalmanAndTransfer(unittest.TestCase):
         # 同 ID 迁移幂等
         self.assertTrue(est.transfer_track_state(42, 42))
         self.assertEqual(est.tracks[42].track_id, 42)
+
+    def test_observe_category_is_atomic_and_consistent_across_modes(self):
+        # ema 与 kalman 模式均在构造与 observe_category 时拒绝空白/非字符串类别且保持原子性
+        for mode in ("ema", "kalman"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError):
+                    TrackMotionTracker(1, "   ", estimator_mode=mode)
+
+                tracker = TrackMotionTracker(1, "vehicle", estimator_mode=mode)
+                for bad_cat in ("   ", "", None, 123):
+                    with self.assertRaises(ValueError):
+                        for _ in range(3):
+                            tracker.observe_category(bad_cat, confirm_frames=3)
+                    self.assertEqual(tracker.category, "vehicle")
+                    self.assertIsNone(tracker._pending_category)
+                    self.assertEqual(tracker._pending_count, 0)
+
+        # kalman 模式下若 _kalman.set_category 抛出异常，self.category 必须保持不变
+        kf_tracker = TrackMotionTracker(2, "vehicle", estimator_mode="kalman")
+        with mock.patch.object(
+            kf_tracker._kalman, "set_category", side_effect=RuntimeError("mock fail")
+        ):
+            kf_tracker.observe_category("pedestrian", confirm_frames=2)
+            with self.assertRaises(RuntimeError):
+                kf_tracker.observe_category("pedestrian", confirm_frames=2)
+        self.assertEqual(kf_tracker.category, "vehicle")
+        self.assertEqual(kf_tracker._kalman.category, "vehicle")
+
+        # 正常确认切换应同步更新 tracker 与卡尔曼先验参数
+        kf_ok = TrackMotionTracker(3, "vehicle", estimator_mode="kalman")
+        kf_ok.observe_category("pedestrian", confirm_frames=2)
+        self.assertEqual(kf_ok.category, "vehicle")
+        kf_ok.observe_category("pedestrian", confirm_frames=2)
+        self.assertEqual(kf_ok.category, "pedestrian")
+        self.assertEqual(kf_ok._kalman.category, "pedestrian")
+        self.assertEqual(kf_ok._kalman.jerk_std_ms3, 1.5)
 
 
 if __name__ == "__main__":
