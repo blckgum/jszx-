@@ -869,6 +869,52 @@
         };
     }
 
+    function computeCvmCircleTtc(veh, vru, horizonS) {
+        var horizon = horizonS || 3.5;
+        var dx = vru.x - veh.x;
+        var dy = vru.y - veh.y;
+        var rvx = (vru.vx || 0) - (veh.vx || 0);
+        var rvy = (vru.vy || 0) - (veh.vy || 0);
+        var currentDist = Math.hypot(dx, dy);
+        var halfL = (veh.lengthM || 4.5) * 0.5;
+        var halfW = (veh.widthM || 1.9) * 0.5;
+        var vehRadius = Math.max(halfW * 0.85, Math.min(2.8, halfL * 0.55));
+        var pedRadius = vru.radiusM || 0.42;
+        var safeSum = vehRadius + pedRadius;
+
+        var vRelSq = rvx * rvx + rvy * rvy;
+        var tCpa = vRelSq > 1e-6 ? clamp(-(dx * rvx + dy * rvy) / vRelSq, 0, horizon) : 0;
+        var cx = dx + rvx * tCpa;
+        var cy = dy + rvy * tCpa;
+        var cpaCenterDist = Math.hypot(cx, cy);
+        var minClearance = Math.max(0, cpaCenterDist - safeSum);
+
+        var ttc = null;
+        if (currentDist <= safeSum) {
+            ttc = 0;
+        } else if (vRelSq > 1e-6) {
+            var b = dx * rvx + dy * rvy;
+            var c = dx * dx + dy * dy - safeSum * safeSum;
+            var disc = b * b - vRelSq * c;
+            if (disc >= 0) {
+                var tEnter = (-b - Math.sqrt(disc)) / vRelSq;
+                if (tEnter >= 0 && tEnter <= horizon) {
+                    ttc = tEnter;
+                }
+            }
+        }
+
+        var tContact = ttc !== null ? ttc : tCpa;
+        var midX = (veh.x + (veh.vx || 0) * tContact + vru.x + (vru.vx || 0) * tContact) * 0.5;
+        var midY = (veh.y + (veh.vy || 0) * tContact + vru.y + (vru.vy || 0) * tContact) * 0.5;
+        return {
+            currentDist: currentDist,
+            minDistanceM: minClearance,
+            ttcSeconds: ttc,
+            conflictGroundXY: [midX, midY]
+        };
+    }
+
     function computeCpaAndTtc(veh, vru, horizonS) {
         var horizon = horizonS || 3.5;
         var dt = 0.05;
@@ -1460,6 +1506,10 @@
 
     CampusRoadTwinCanvas.prototype._seedInitialPetTrail = function () {
         this._petCells = Object.create(null);
+        var useCvm = this._config && this._config.conflictModel === "cvm_circle";
+        if (useCvm) {
+            return;
+        }
         // Seed recent swept-OBB history behind initial keyframe so PET grid is intelligible immediately
         var startT = Math.max(0, this._simTimeS - 2.0);
         var activeCyclistVru = !(this._config && this._config.cyclistVru === false);
@@ -1543,21 +1593,24 @@
         var maxSpeed = 0;
         var minTtc = null;
         var cyclistVruEnabled = !(this._config && this._config.cyclistVru === false);
+        var useCvmCircle = Boolean(this._config && this._config.conflictModel === "cvm_circle");
         var activeVrus = cyclistVruEnabled
             ? simData.vrus
             : simData.vrus.filter(function (item) { return !isCyclistVruKind(item); });
 
-        this._recordPetGrid(simData.vehicles, activeVrus, timeS);
-
-        // Find active PET overlaps per pair
         var pairPet = Object.create(null);
-        var cellKeys = Object.keys(this._petCells);
-        for (var c = 0; c < cellKeys.length; c += 1) {
-            var cell = this._petCells[cellKeys[c]];
-            if (cell.petS !== null && timeS - cell.vruTime <= 1.8) {
-                var pk = cell.vehId + ":" + cell.vruId;
-                if (pairPet[pk] === undefined || cell.petS < pairPet[pk]) {
-                    pairPet[pk] = cell.petS;
+        if (useCvmCircle) {
+            this._petCells = Object.create(null);
+        } else {
+            this._recordPetGrid(simData.vehicles, activeVrus, timeS);
+            var cellKeys = Object.keys(this._petCells);
+            for (var c = 0; c < cellKeys.length; c += 1) {
+                var cell = this._petCells[cellKeys[c]];
+                if (cell.petS !== null && timeS - cell.vruTime <= 1.8) {
+                    var pk = cell.vehId + ":" + cell.vruId;
+                    if (pairPet[pk] === undefined || cell.petS < pairPet[pk]) {
+                        pairPet[pk] = cell.petS;
+                    }
                 }
             }
         }
@@ -1573,9 +1626,11 @@
             var bestConflict = null;
             for (var pi = 0; pi < activeVrus.length; pi += 1) {
                 var vru = activeVrus[pi];
-                var res = computeCpaAndTtc(veh, vru, 3.5);
+                var res = useCvmCircle
+                    ? computeCvmCircleTtc(veh, vru, 3.5)
+                    : computeCpaAndTtc(veh, vru, 3.5);
                 var pk2 = veh.trackId + ":" + vru.trackId;
-                var petS = pairPet[pk2] !== undefined ? pairPet[pk2] : null;
+                var petS = !useCvmCircle && pairPet[pk2] !== undefined ? pairPet[pk2] : null;
                 if (res.currentDist > 16.0 && petS === null) continue;
 
                 var level = 0;
@@ -4793,7 +4848,9 @@
         }
 
         // Top overlay status bar (clean corner pills)
-        var camTitle = w < 410 ? "CAM-01 · 3D 透视仿真" : "CAM-01 · 3D 透视仿真视角 · 标定 6.0m x 15.0m";
+        var camTitle = st.cameraLabel
+            ? (w < 410 && st.cameraShortLabel ? st.cameraShortLabel : st.cameraLabel)
+            : (w < 410 ? "CAM-01 · 3D 透视仿真" : "CAM-01 · 3D 透视仿真视角 · 标定 6.0m x 15.0m");
         drawPill(ctx, 10, 8, camTitle, pal.bgCard, pal.hairline, pal.textSecondary, w);
 
         var maxRisk = st.maxRisk || 0;

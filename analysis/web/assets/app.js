@@ -124,6 +124,7 @@
     pipeline: null,
     roadTwin: null,
     simCamera: null,
+    replayCamera: null,
     speedChart: null,
     calibCanvas: null,
     audioSynth: null
@@ -216,6 +217,7 @@
     dom.mobileDesktopShutdown = $("mobile-desktop-shutdown");
     dom.themeToggleLabel = $("theme-toggle-label");
     dom.topbarThemeLabel = $("topbar-theme-label");
+    dom.mobileThemeBtn = $("mobile-theme-btn");
 
     dom.topbarRiskPill = $("topbar-risk-pill");
     dom.topbarRiskText = $("topbar-risk-text");
@@ -245,6 +247,7 @@
 
     dom.replayVideo = $("replay-video");
     dom.replayFrameImg = $("replay-frame-img");
+    dom.replaySimCanvas = $("replay-sim-canvas");
     dom.replayMediaCaption = $("replay-media-caption");
     dom.replayControls = $("replay-controls");
     dom.btnReplayToggle = $("btn-replay-toggle");
@@ -426,6 +429,12 @@
     if (dom.topbarThemeLabel) {
       dom.topbarThemeLabel.textContent = state.theme === "light" ? "深色" : "浅色";
     }
+    if (dom.mobileThemeBtn) {
+      dom.mobileThemeBtn.textContent = state.theme === "light" ? "切换深色石墨" : "切换浅色纸张";
+    }
+    if (widgets.replayCamera && typeof widgets.replayCamera.refreshTheme === "function") {
+      widgets.replayCamera.refreshTheme();
+    }
     if (widgets.roadTwin && typeof widgets.roadTwin.refreshTheme === "function") {
       widgets.roadTwin.refreshTheme();
     }
@@ -515,7 +524,13 @@
     });
 
     dom.mobileNavItems.forEach(function (btn) {
-      btn.classList.toggle("is-active", btn.dataset.view === viewId);
+      var active = btn.dataset.view === viewId;
+      btn.classList.toggle("is-active", active);
+      if (active) {
+        btn.setAttribute("aria-current", "page");
+      } else {
+        btn.removeAttribute("aria-current");
+      }
     });
 
     Object.keys(dom.views).forEach(function (key) {
@@ -580,6 +595,10 @@
 
     if (typeof CM.SimulatedCameraCanvas === "function" && dom.simCameraCanvas) {
       widgets.simCamera = new CM.SimulatedCameraCanvas(dom.simCameraCanvas);
+    }
+
+    if (typeof CM.SimulatedCameraCanvas === "function" && dom.replaySimCanvas) {
+      widgets.replayCamera = new CM.SimulatedCameraCanvas(dom.replaySimCanvas);
     }
 
     if (typeof CM.CampusRoadTwinCanvas === "function") {
@@ -910,6 +929,7 @@
       dom.viewportModeBadge.textContent = "实时检测";
       dom.sidebarModeText.textContent = "实时作业";
       setSidebarTarget(state.liveJob.jobId || "--");
+      dom.twinModeLabel.textContent = "实时检测追踪";
       dom.btnTwinPause.hidden = true;
       if (widgets.roadTwin) {
         widgets.roadTwin.setMode("replay");
@@ -1214,13 +1234,15 @@
     dom.replayMediaCaption.textContent =
       dataset.runId + " · 帧 #" + idx + " · " + riskText(framePayload.riskLevel) +
       (state.replay.isFixture ? " · 测试固件(非实拍)" : "") +
-      (state.replay.noVideo ? " · 纯轨迹回放（无标注视频）" : "");
+      (state.replay.noVideo ? " · 纯轨迹重构（无标注 MP4）" : "");
 
     if (dom.replayFrameImg && (state.replay.useJpegFallback || !state.replay.playing)) {
       if (state.replay.noVideo) {
         dom.replayFrameImg.hidden = true;
         dom.replayVideo.hidden = true;
+        if (dom.replaySimCanvas) dom.replaySimCanvas.hidden = false;
       } else {
+        if (dom.replaySimCanvas) dom.replaySimCanvas.hidden = true;
         dom.replayFrameImg.hidden = false;
         dom.replayVideo.hidden = true;
         dom.replayFrameImg.src =
@@ -1230,6 +1252,14 @@
 
     if (widgets.roadTwin) {
       widgets.roadTwin.setReplayFrame(framePayload);
+    }
+    if (state.replay.noVideo && widgets.replayCamera && widgets.roadTwin && typeof widgets.roadTwin.getCurrentRenderState === "function") {
+      var camState = Object.assign({}, widgets.roadTwin.getCurrentRenderState(), {
+        cameraLabel: "TRACKS-ONLY · 3D 轨迹重构（无标注 MP4）",
+        cameraShortLabel: "TRACKS-ONLY · 3D 重构"
+      });
+      widgets.replayCamera.refreshTheme();
+      widgets.replayCamera.renderState(camState);
     }
 
     widgets.kpiMaxSpeed.setValue(framePayload.maxSpeedKmh);
@@ -1277,6 +1307,7 @@
     state.replay.useJpegFallback = true;
     dom.replayVideo.hidden = true;
     dom.replayFrameImg.hidden = Boolean(state.replay.noVideo);
+    if (dom.replaySimCanvas) dom.replaySimCanvas.hidden = !state.replay.noVideo;
 
     state.replay.timerId = window.setInterval(function () {
       if (!state.replay.playing || !state.replay.data) return;
@@ -1294,6 +1325,9 @@
     state.replay.useJpegFallback = true;
     state.replay.noVideo = false;
     state.replay.isFixture = false;
+    if (dom.replaySimCanvas) {
+      dom.replaySimCanvas.hidden = true;
+    }
     if (dom.replayFrameImg) {
       dom.replayFrameImg.hidden = false;
       dom.replayFrameImg.onerror = function () {
@@ -1301,9 +1335,20 @@
         state.replay.noVideo = true;
         dom.replayFrameImg.hidden = true;
         dom.replayFrameImg.removeAttribute("src");
+        if (dom.replaySimCanvas) {
+          dom.replaySimCanvas.hidden = false;
+          if (widgets.replayCamera && widgets.roadTwin && typeof widgets.roadTwin.getCurrentRenderState === "function") {
+            var camState = Object.assign({}, widgets.roadTwin.getCurrentRenderState(), {
+              cameraLabel: "TRACKS-ONLY · 3D 轨迹重构（无标注 MP4）",
+              cameraShortLabel: "TRACKS-ONLY · 3D 重构"
+            });
+            widgets.replayCamera.refreshTheme();
+            widgets.replayCamera.renderState(camState);
+          }
+        }
         if (state.replay.data) {
           dom.replayMediaCaption.textContent =
-            runId + " · 无标注视频（纯轨迹回放 · 右侧鸟瞰孪生同步运行）";
+            runId + " · 纯轨迹重构（无标注 MP4）";
         }
       };
     }
@@ -1317,9 +1362,11 @@
       fetchJson("/api/runs/" + encodeURIComponent(runId) + "/speeds?limit=5000")
     ])
       .then(function (results) {
-        var dataset = buildRunDataset(runId, results[0], results[1], results[2], results[3]);
-        var srcVid = String((results[0] && results[0].source_video) || "");
+        var summaryObj = results[0] || {};
+        var dataset = buildRunDataset(runId, summaryObj, results[1], results[2], results[3]);
+        var srcVid = String(summaryObj.source_video || "");
         state.replay.isFixture = srcVid.indexOf("tracking-fixtures") >= 0 || /sample_[ab]\.mp4/i.test(srcVid);
+        state.replay.noVideo = summaryObj.has_video === false;
         state.replay.data = dataset;
         state.replay.framesCount = dataset.totalFrames;
         dom.twinModeLabel.textContent =
@@ -1339,12 +1386,13 @@
       });
   }
 
-  function stopLiveJobPolling() {
+  function stopLiveJobPolling(options) {
     if (state.liveJob.pollTimerId !== null) {
       window.clearInterval(state.liveJob.pollTimerId);
       state.liveJob.pollTimerId = null;
     }
-    if (dom.liveMjpegImg) {
+    if (dom.liveMjpegImg && !(options && options.preserveFrame)) {
+      dom.liveMjpegImg.onerror = null;
       dom.liveMjpegImg.removeAttribute("src");
     }
   }
@@ -1362,10 +1410,29 @@
     state.liveJob.notifiedDone = false;
 
     setMonitorMode("live");
-    dom.liveMjpegImg.src = "/api/jobs/" + encodeURIComponent(job.job_id) + "/mjpeg";
+    if (dom.liveMjpegImg) {
+      dom.liveMjpegImg.hidden = false;
+      dom.liveMjpegImg.onerror = function () {
+        if (state.mode !== "live" || state.liveJob.jobId !== job.job_id) return;
+        dom.liveMjpegImg.hidden = true;
+      };
+      dom.liveMjpegImg.src = "/api/jobs/" + encodeURIComponent(job.job_id) + "/mjpeg";
+    }
     dom.liveMediaCaption.textContent = "实时流 · " + job.job_id;
     dom.liveJobStatusText.textContent = "状态: " + job.status + " · 0 帧";
     dom.btnStopJob.disabled = false;
+
+    if (widgets.roadTwin) {
+      widgets.roadTwin.setReplayFrame({
+        frameIndex: 0,
+        timestampS: 0,
+        vehicles: [],
+        vrus: [],
+        conflicts: [],
+        label: "LIVE · " + job.job_id
+      });
+    }
+    dom.twinCounts.textContent = "车辆 0 · 行人/骑行 0";
 
     widgets.kpiMaxSpeed.setValue(null);
     widgets.kpiMinTtc.setValue(null);
@@ -1407,6 +1474,24 @@
 
         dom.liveJobStatusText.textContent =
           "作业 " + statusObj.job_id + " · " + statusObj.status + " · " + (statusObj.frames_processed || 0) + " 帧";
+
+        if (statusObj.latest_twin && widgets.roadTwin) {
+          widgets.roadTwin.setReplayFrame(statusObj.latest_twin);
+          var lv = statusObj.latest_twin;
+          var vehCnt = Array.isArray(lv.vehicles) ? lv.vehicles.length : 0;
+          var vruCnt = Array.isArray(lv.vrus) ? lv.vrus.length : 0;
+          dom.twinCounts.textContent = "车辆 " + vehCnt + " · 行人/骑行 " + vruCnt;
+          if (typeof lv.maxSpeedKmh === "number" && Number.isFinite(lv.maxSpeedKmh)) {
+            widgets.kpiMaxSpeed.setValue(lv.maxSpeedKmh);
+          }
+          if (typeof lv.minTtcS === "number" && Number.isFinite(lv.minTtcS)) {
+            widgets.kpiMinTtc.setValue(lv.minTtcS);
+          }
+        }
+
+        if (dom.liveMjpegImg && statusObj.has_latest_frame) {
+          dom.liveMjpegImg.hidden = false;
+        }
 
         var receivedAlerts = alertsObj && Array.isArray(alertsObj.alerts) ? alertsObj.alerts : [];
         if (receivedAlerts.length > 0) {
@@ -1469,16 +1554,16 @@
           if (statusObj.summary && typeof statusObj.summary.max_observed_speed_kmh === "number") {
             widgets.kpiMaxSpeed.setValue(statusObj.summary.max_observed_speed_kmh);
           }
+          if (dom.liveMjpegImg && !statusObj.has_latest_frame) {
+            dom.liveMjpegImg.hidden = true;
+          }
           dom.btnStopJob.disabled = true;
           if (statusObj.error) {
             dom.liveMediaCaption.textContent = "作业失败: " + statusObj.error;
           } else {
-            dom.liveMediaCaption.textContent = "作业已结束 (" + statusObj.status + ")";
+            dom.liveMediaCaption.textContent = "作业已结束 (" + statusObj.status + " · " + (statusObj.frames_processed || 0) + " 帧)";
           }
-          if (state.liveJob.pollTimerId !== null) {
-            window.clearInterval(state.liveJob.pollTimerId);
-            state.liveJob.pollTimerId = null;
-          }
+          stopLiveJobPolling({ preserveFrame: true });
           if (!state.liveJob.notifiedDone) {
             state.liveJob.notifiedDone = true;
             if (statusObj.status === "completed") {
@@ -1685,6 +1770,45 @@
     });
   }
 
+  function isPlayableRun(run) {
+    return Boolean(
+      run &&
+      run.status !== "failed" &&
+      run.status !== "invalid" &&
+      Number(run.frames_processed) > 0
+    );
+  }
+
+  function clearHistoryDisplay() {
+    if (dom.histFrames) dom.histFrames.textContent = "-- 帧";
+    if (dom.histFps) dom.histFps.textContent = "-- FPS";
+    if (dom.histMaxSpeed) dom.histMaxSpeed.textContent = "-- km/h";
+    if (dom.histSpeedLimit) dom.histSpeedLimit.textContent = "限速 30.0 km/h";
+    if (dom.histCautionCount) dom.histCautionCount.textContent = "0 次";
+    if (dom.histSpeedingCount) dom.histSpeedingCount.textContent = "超速告警 0 次";
+    if (dom.histCriticalCount) dom.histCriticalCount.textContent = "0 次";
+    if (dom.histElapsed) dom.histElapsed.textContent = "耗时 -- s";
+    if (dom.historySourceLabel) dom.historySourceLabel.textContent = "";
+    if (widgets.speedChart && typeof widgets.speedChart.setData === "function") {
+      widgets.speedChart.setData([], 30);
+    }
+    if (dom.conflictsTbody) {
+      dom.conflictsTbody.textContent = "";
+      dom.conflictsTbody.appendChild(makeEmptyTableRow("暂无历史分析记录"));
+    }
+    if (dom.eventsTbody) {
+      dom.eventsTbody.textContent = "";
+      dom.eventsTbody.appendChild(makeEmptyTableRow("暂无历史分析记录"));
+    }
+    if (dom.speedsTbody) {
+      dom.speedsTbody.textContent = "";
+      dom.speedsTbody.appendChild(makeEmptyTableRow("暂无历史分析记录"));
+    }
+    if (dom.historyTableMeta) {
+      dom.historyTableMeta.textContent = "暂无历史分析记录";
+    }
+  }
+
   function loadRunsList() {
     return fetchJson("/api/runs")
       .then(function (data) {
@@ -1702,15 +1826,20 @@
           setHistoryActionsDisabled(true);
           if (dom.btnReplaySample) dom.btnReplaySample.hidden = true;
           if (dom.historyChartsCard) dom.historyChartsCard.hidden = true;
+          clearHistoryDisplay();
           return;
         }
 
+        var topPlayable = runs.find(isPlayableRun) || null;
         if (dom.btnReplaySample) {
-          var topRun = runs[0];
-          var topSrc = String((topRun && topRun.source_video) || "");
-          var topIsFixture = topSrc.indexOf("tracking-fixtures") >= 0 || /sample_[ab]\.mp4/i.test(topSrc);
-          dom.btnReplaySample.hidden = false;
-          dom.btnReplaySample.textContent = topIsFixture ? "回放测试固件" : "回放最新记录";
+          if (!topPlayable) {
+            dom.btnReplaySample.hidden = true;
+          } else {
+            var topSrc = String(topPlayable.source_video || "");
+            var topIsFixture = topSrc.indexOf("tracking-fixtures") >= 0 || /sample_[ab]\.mp4/i.test(topSrc);
+            dom.btnReplaySample.hidden = false;
+            dom.btnReplaySample.textContent = topIsFixture ? "回放测试固件" : "回放最新记录";
+          }
         }
 
         setHistoryActionsDisabled(false);
@@ -1994,6 +2123,7 @@
       var active = btn.dataset.tableTab === tab;
       btn.classList.toggle("is-active", active);
       btn.setAttribute("aria-selected", active ? "true" : "false");
+      btn.setAttribute("tabindex", active ? "0" : "-1");
     });
 
     if (state.historyData) {
@@ -2191,11 +2321,13 @@
       var isCalib = state.studioTab === "calib";
       dom.studioTabCalib.classList.toggle("is-active", isCalib);
       dom.studioTabCalib.setAttribute("aria-selected", isCalib ? "true" : "false");
+      dom.studioTabCalib.setAttribute("tabindex", isCalib ? "0" : "-1");
     }
     if (dom.studioTabLab) {
       var isLab = state.studioTab === "lab";
       dom.studioTabLab.classList.toggle("is-active", isLab);
       dom.studioTabLab.setAttribute("aria-selected", isLab ? "true" : "false");
+      dom.studioTabLab.setAttribute("tabindex", isLab ? "0" : "-1");
     }
 
     if (state.studioTab === "calib" && widgets.calibCanvas && typeof widgets.calibCanvas.refreshTheme === "function") {
@@ -2968,12 +3100,12 @@
     }
 
     dom.btnReplaySample.addEventListener("click", function () {
-      if (!state.runs.length) {
-        showToast("暂无可回放的历史分析记录，请先导入视频分析");
+      var playable = state.runs.find(isPlayableRun);
+      if (!playable || !playable.run_id) {
+        showToast("暂无可回放的有效分析记录，请先导入视频分析");
         return;
       }
-      var targetId = state.runs[0].run_id || SAMPLE_RUN_FALLBACK;
-      enterReplayMode(targetId, 0);
+      enterReplayMode(playable.run_id, 0);
     });
 
     dom.btnBackSim.addEventListener("click", function () {
@@ -3007,11 +3139,17 @@
       dom.btnStopJob.disabled = true;
       fetchJson("/api/jobs/" + encodeURIComponent(jobId) + "/stop", { method: "POST" })
         .then(function (job) {
-          dom.liveJobStatusText.textContent = "作业 " + job.job_id + " · " + job.status;
-          stopLiveJobPolling();
+          dom.liveJobStatusText.textContent =
+            "作业 " + job.job_id + " · " + job.status + " · " + (job.frames_processed || 0) + " 帧";
+          dom.liveMediaCaption.textContent = "作业已停止 (" + (job.frames_processed || 0) + " 帧)";
+          if (dom.liveMjpegImg && !job.has_latest_frame) {
+            dom.liveMjpegImg.hidden = true;
+          }
+          stopLiveJobPolling({ preserveFrame: true });
           loadRunsList();
         })
         .catch(function (err) {
+          dom.btnStopJob.disabled = false;
           dom.liveMediaCaption.textContent = "停止失败: " + err.message;
         });
     });
@@ -3126,17 +3264,42 @@
       if (dom.chartLightboxDialog.open) dom.chartLightboxDialog.close();
     });
 
-    document.querySelectorAll("[data-table-tab]").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        state.historyTableTab = btn.dataset.tableTab || "conflicts";
-        updateHistoryTableVisibility();
+    function bindTablistKeyboard(selector, onSelectBtn) {
+      var btns = Array.prototype.slice.call(document.querySelectorAll(selector));
+      btns.forEach(function (btn, idx) {
+        btn.addEventListener("click", function () {
+          onSelectBtn(btn);
+        });
+        btn.addEventListener("keydown", function (ev) {
+          var nextIdx = idx;
+          if (ev.key === "ArrowRight") {
+            nextIdx = (idx + 1) % btns.length;
+          } else if (ev.key === "ArrowLeft") {
+            nextIdx = (idx - 1 + btns.length) % btns.length;
+          } else if (ev.key === "Home") {
+            nextIdx = 0;
+          } else if (ev.key === "End") {
+            nextIdx = btns.length - 1;
+          } else {
+            return;
+          }
+          ev.preventDefault();
+          var targetBtn = btns[nextIdx];
+          if (targetBtn) {
+            onSelectBtn(targetBtn);
+            targetBtn.focus();
+          }
+        });
       });
+    }
+
+    bindTablistKeyboard("[data-table-tab]", function (btn) {
+      state.historyTableTab = btn.dataset.tableTab || "conflicts";
+      updateHistoryTableVisibility();
     });
 
-    document.querySelectorAll("[data-studio-tab]").forEach(function (btn) {
-      btn.addEventListener("click", function () {
-        switchStudioTab(btn.dataset.studioTab || "calib");
-      });
+    bindTablistKeyboard("[data-studio-tab]", function (btn) {
+      switchStudioTab(btn.dataset.studioTab || "calib");
     });
 
     if (dom.btnCalibBrowseVideo) {

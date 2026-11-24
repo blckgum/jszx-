@@ -193,6 +193,12 @@ class ConflictPerceptionPipeline:
             raise ValueError("speed_limit_kmh 必须为有限正数")
         if type(iou) not in (int, float) or not math.isfinite(iou) or not (0 < iou <= 1):
             raise ValueError("iou 必须在 (0, 1] 区间")
+        if conf is not None and (
+            type(conf) not in (int, float) or not math.isfinite(conf) or not (0 < conf <= 1)
+        ):
+            raise ValueError("conf 必须在 (0, 1] 区间")
+        if device is not None and (not isinstance(device, str) or not device.strip()):
+            raise ValueError("device 必须为非空字符串或 None")
         if fps is not None and (type(fps) not in (int, float) or not math.isfinite(fps) or fps <= 0):
             raise ValueError("fps 必须是有限正数")
         if type(imgsz) is not int or imgsz <= 0:
@@ -345,6 +351,7 @@ class ConflictPerceptionPipeline:
         self.visualizer = EnhancedConflictVisualizer(
             calibrator=calibrator, speed_limit_kmh=speed_limit_kmh
         )
+        self._latest_frame_snapshot: Optional[dict] = None
 
     def _configuration_snapshot(
         self,
@@ -841,6 +848,84 @@ class ConflictPerceptionPipeline:
             if writer is not None:
                 writer.write(render_frame)
 
+        twin_vehicles: list[dict] = []
+        twin_vrus: list[dict] = []
+        max_risk_lvl = 0
+        min_ttc_val: Optional[float] = None
+        for r in speed_readings:
+            c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
+            r_lvl = int(c.risk_level) if c is not None else (
+                int(RiskLevel.LEVEL_1_SPEEDING) if r.is_speeding else 0
+            )
+            if r_lvl > max_risk_lvl:
+                max_risk_lvl = r_lvl
+            if c is not None and c.ttc_seconds is not None and math.isfinite(c.ttc_seconds):
+                ttc_f = round(float(c.ttc_seconds), 2)
+                if min_ttc_val is None or ttc_f < min_ttc_val:
+                    min_ttc_val = ttc_f
+
+            pol = object_policy(r.object_kind, r.category, self.object_policies)
+            raw_kind = (r.object_kind or r.category or "vehicle").strip().lower()
+            is_vru = r.category in ("pedestrian", "person") or pol.kind in ("pedestrian", "bicycle", "motorcycle")
+            item = {
+                "trackId": int(r.track_id),
+                "kind": raw_kind if raw_kind else ("pedestrian" if is_vru else "car"),
+                "category": raw_kind if raw_kind else r.category,
+                "x": round(float(r.x_m), 3),
+                "y": round(float(r.y_m), 3),
+                "vx": round(float(r.vx_ms), 3) if r.vx_ms is not None and math.isfinite(r.vx_ms) else 0.0,
+                "vy": round(float(r.vy_ms), 3) if r.vy_ms is not None and math.isfinite(r.vy_ms) else 0.0,
+                "headingDeg": round(float(r.heading_deg), 2) if r.heading_deg is not None and math.isfinite(r.heading_deg) else 90.0,
+                "lengthM": round(float(pol.length_m), 2),
+                "widthM": round(float(pol.width_m), 2),
+                "speedKmh": round(float(r.speed_kmh), 1),
+                "riskLevel": r_lvl,
+                "inParkingZone": bool(r.in_parking_zone),
+            }
+            if is_vru:
+                twin_vrus.append(item)
+            else:
+                twin_vehicles.append(item)
+
+        twin_conflicts = []
+        for c in conflicts:
+            c_lvl = int(c.risk_level)
+            if c_lvl > max_risk_lvl:
+                max_risk_lvl = c_lvl
+            c_ttc = round(float(c.ttc_seconds), 2) if c.ttc_seconds is not None and math.isfinite(c.ttc_seconds) else None
+            c_pet = round(float(c.pet_seconds), 2) if getattr(c, "pet_seconds", None) is not None and math.isfinite(c.pet_seconds) else None
+            c_dmin = round(float(c.min_distance_m), 2) if math.isfinite(c.min_distance_m) else None
+            c_xy = None
+            if c.conflict_ground_xy is not None and len(c.conflict_ground_xy) >= 2:
+                gx, gy = float(c.conflict_ground_xy[0]), float(c.conflict_ground_xy[1])
+                if math.isfinite(gx) and math.isfinite(gy):
+                    c_xy = [round(gx, 3), round(gy, 3)]
+            twin_conflicts.append({
+                "vehTrackId": int(c.veh_track_id),
+                "pedTrackId": int(c.ped_track_id) if c.ped_track_id is not None else None,
+                "riskLevel": c_lvl,
+                "ttcSeconds": c_ttc,
+                "petSeconds": c_pet,
+                "minDistanceM": c_dmin,
+                "conflictGroundXY": c_xy,
+            })
+
+        self._latest_frame_snapshot = {
+            "frameIndex": int(frame_idx),
+            "timestampS": round(float(timestamp_s), 3),
+            "maxSpeedKmh": round(float(frame_max_speed), 1),
+            "minTtcS": min_ttc_val,
+            "riskLevel": max_risk_lvl,
+            "parkingZones": [
+                [[round(float(px), 3), round(float(py), 3)] for px, py in zone]
+                for zone in getattr(self.calibrator, "parking_zones", ())
+            ],
+            "vehicles": twin_vehicles,
+            "vrus": twin_vrus,
+            "conflicts": twin_conflicts,
+            "label": f"LIVE · F{frame_idx:04d} · {float(timestamp_s):.1f}s",
+        }
+
         return frame_max_speed, render_frame
 
     def _reconnect_live_capture(
@@ -913,6 +998,7 @@ class ConflictPerceptionPipeline:
         if is_blank_path(output_dir):
             raise ValueError("输出目录不能为空")
 
+        self._latest_frame_snapshot = None
         capture_arg, src_label, is_live_stream = parse_video_source(video_path)
         out_dir = Path(output_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1298,6 +1384,7 @@ class ConflictPerceptionPipeline:
             raise ValueError("离线轨迹复盘仅支持非空本地视频文件同步渲染，不支持摄像头索引或实时推流")
 
         tracks_file = Path(tracks_path).expanduser().resolve()
+        self._latest_frame_snapshot = None
         out_dir = Path(output_dir).expanduser().resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
         init_started_at = time.perf_counter()

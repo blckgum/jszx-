@@ -1068,19 +1068,32 @@ class TestStandaloneDesktopHost(unittest.TestCase):
     def test_frontend_web_contract_and_zero_emoji(self):
         web_dir = REPO_ROOT / "analysis" / "web"
         html = (web_dir / "index.html").read_text(encoding="utf-8")
+        styles = (web_dir / "assets" / "styles.css").read_text(encoding="utf-8")
         app_js = (web_dir / "assets" / "app.js").read_text(encoding="utf-8")
         motion_js = (web_dir / "assets" / "motion.js").read_text(encoding="utf-8")
 
         self.assertIn('id="btn-replay-sample" class="btn btn-ghost" hidden', html)
+        self.assertIn('id="replay-sim-canvas"', html)
+        self.assertIn('aria-controls="conflicts-table-region"', html)
+        self.assertIn('aria-controls="studio-panel-calib"', html)
         self.assertIn("widgets.roadTwin.setConfig", app_js)
         self.assertIn("dom.replayFrameImg.onerror", app_js)
+        self.assertIn("clearHistoryDisplay", app_js)
+        self.assertIn("isPlayableRun", app_js)
+        self.assertIn("bindTablistKeyboard", app_js)
         self.assertIn("CampusRoadTwinCanvas.prototype.setConfig", motion_js)
+        self.assertIn("computeCvmCircleTtc", motion_js)
         self.assertIn("SCENARIO_CYCLE_S", motion_js)
 
         emoji_re = re.compile(
             "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0000FE0F]"
         )
-        for rel, content in (("index.html", html), ("app.js", app_js), ("motion.js", motion_js)):
+        for rel, content in (
+            ("index.html", html),
+            ("styles.css", styles),
+            ("app.js", app_js),
+            ("motion.js", motion_js),
+        ):
             self.assertIsNone(emoji_re.search(content), f"{rel} 发现未清理的 emoji 字符")
 
 

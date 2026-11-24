@@ -535,6 +535,7 @@ class _ServiceJob:
     frames_processed: int = 0
     latest_timestamp_s: Optional[float] = None
     latest_jpeg: Optional[bytes] = None
+    latest_twin: Optional[dict] = None
     frame_seq: int = 0
     alert_seq: int = 0
     alert_queue: deque = field(default_factory=deque)
@@ -683,6 +684,7 @@ class AnalysisService:
                     "max_observed_speed_kmh": summary.get("max_observed_speed_kmh"),
                     "total_alert_events": summary.get("total_alert_events", 0),
                     "total_critical_conflicts": summary.get("total_critical_conflicts", 0),
+                    "has_video": (entry / "annotated_conflict.mp4").is_file(),
                 },
             ))
         items.sort(key=lambda pair: (pair[0], pair[1]["run_id"]), reverse=True)
@@ -697,7 +699,11 @@ class AnalysisService:
         data = load_json_strict(summary_path)
         if not isinstance(data, dict):
             raise SchemaValidationError("summary.json 顶层必须是 JSON 对象")
-        return {"run_id": run_id, **data}
+        return {
+            "run_id": run_id,
+            "has_video": (run_dir / "annotated_conflict.mp4").is_file(),
+            **data,
+        }
 
     def get_run_events(self, run_id: str, *, limit: Optional[int] = None) -> List[dict]:
         """严格读取指定运行目录的 events.jsonl 告警事件序列。"""
@@ -933,6 +939,7 @@ class AnalysisService:
                 "frames_processed": job.frames_processed,
                 "latest_timestamp_s": job.latest_timestamp_s,
                 "has_latest_frame": job.latest_jpeg is not None,
+                "latest_twin": job.latest_twin,
                 "frame_seq": job.frame_seq,
                 "alert_seq": job.alert_seq,
                 "queued_alerts": len(job.alert_queue),
@@ -980,6 +987,12 @@ class AnalysisService:
         _, src_label, _ = parse_video_source(source)
         if max_frames is not None and (type(max_frames) is not int or max_frames < 0):
             raise ValueError("max_frames 必须是 >= 0 的整数")
+        if conf is not None and (
+            type(conf) not in (int, float) or not math.isfinite(conf) or not (0 < conf <= 1)
+        ):
+            raise ValueError("conf 必须在 (0, 1] 区间")
+        if device is not None and (not isinstance(device, str) or not device.strip()):
+            raise ValueError("device 必须为非空字符串或 None")
         if output_dir is not None and (is_blank_path(output_dir) or type(output_dir) is bool):
             raise ValueError("output_dir 不能为空")
 
@@ -1034,10 +1047,13 @@ class AnalysisService:
                 )
                 if ok:
                     jpeg_bytes = encoded.tobytes()
+            twin_snap = getattr(pipeline, "_latest_frame_snapshot", None)
             with job.cond:
                 job.frames_processed = frame_idx + 1
                 if _is_finite_real(timestamp_s):
                     job.latest_timestamp_s = round(float(timestamp_s), 3)
+                if isinstance(twin_snap, dict):
+                    job.latest_twin = twin_snap
                 if jpeg_bytes is not None:
                     job.latest_jpeg = jpeg_bytes
                     job.frame_seq += 1

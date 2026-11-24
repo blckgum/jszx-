@@ -1243,9 +1243,103 @@ class TestPipelineCtrvAnchorAndLiveDropIntegration(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 400)
                 body = json.loads(ctx.exception.read().decode("utf-8"))
                 self.assertIn("unexpected_kwarg", body["error"])
+
+                for bad_payload in (
+                    {"source": "demo.mp4", "demo": True, "conf": -0.2},
+                    {"source": "demo.mp4", "demo": True, "conf": 1.5},
+                    {"source": "demo.mp4", "demo": True, "conf": True},
+                    {"source": "demo.mp4", "demo": True, "device": True},
+                    {"source": "demo.mp4", "demo": True, "device": "   "},
+                ):
+                    bad_req = Request(
+                        f"{base_url}/api/jobs",
+                        data=json.dumps(bad_payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(HTTPError) as bad_ctx:
+                        urlopen(bad_req, timeout=5)
+                    self.assertEqual(bad_ctx.exception.code, 400)
             finally:
                 server.shutdown()
                 server.server_close()
+
+    def test_runs_report_has_video_and_pipeline_exposes_latest_twin_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs_dir = root / "runs"
+            no_vid_dir = runs_dir / "run-tracks-only"
+            no_vid_dir.mkdir(parents=True)
+            (no_vid_dir / "summary.json").write_text(
+                json.dumps({"schema_version": 1, "status": "ok", "frames_processed": 2}),
+                encoding="utf-8",
+            )
+            vid_dir = runs_dir / "run-with-video"
+            vid_dir.mkdir(parents=True)
+            (vid_dir / "summary.json").write_text(
+                json.dumps({"schema_version": 1, "status": "ok", "frames_processed": 2}),
+                encoding="utf-8",
+            )
+            (vid_dir / "annotated_conflict.mp4").write_bytes(b"mp4bytes")
+
+            calib_file = root / "calib.yaml"
+            cal = _sample_calibrator()
+            cal.to_yaml(calib_file)
+            service = AnalysisService(runs_root=runs_dir, default_calib=calib_file)
+            listed = {item["run_id"]: item for item in service.list_runs()}
+            self.assertFalse(listed["run-tracks-only"]["has_video"])
+            self.assertTrue(listed["run-with-video"]["has_video"])
+            self.assertFalse(service.get_run_summary("run-tracks-only")["has_video"])
+            self.assertTrue(service.get_run_summary("run-with-video")["has_video"])
+
+            pipe = ConflictPerceptionPipeline(calibrator=cal)
+            with self.assertRaises(ValueError):
+                ConflictPerceptionPipeline(calibrator=cal, conf=1.5)
+            with self.assertRaises(ValueError):
+                ConflictPerceptionPipeline(calibrator=cal, device=True)
+
+            tracks_file = root / "tracks.jsonl"
+            tracks_file.write_text(
+                "\n".join([
+                    json.dumps({
+                        "schema_version": 1,
+                        "session_id": "sess-twin-1",
+                        "frame_index": 0,
+                        "timestamp_s": 0.0,
+                        "width": 800,
+                        "height": 600,
+                        "tracks": [{
+                            "track_id": 1,
+                            "category": "vehicle",
+                            "class_name": "car",
+                            "bbox_xyxy": [380.0, 260.0, 460.0, 340.0],
+                            "anchor_xy": [420.0, 340.0],
+                        }],
+                    }),
+                    json.dumps({
+                        "schema_version": 1,
+                        "session_id": "sess-twin-1",
+                        "frame_index": 1,
+                        "timestamp_s": 0.1,
+                        "width": 800,
+                        "height": 600,
+                        "tracks": [{
+                            "track_id": 1,
+                            "category": "vehicle",
+                            "class_name": "car",
+                            "bbox_xyxy": [382.0, 270.0, 462.0, 350.0],
+                            "anchor_xy": [422.0, 350.0],
+                        }],
+                    }),
+                ]),
+                encoding="utf-8",
+            )
+            pipe.process_tracks(tracks_file, root / "out_tracks")
+            snap = pipe._latest_frame_snapshot
+            self.assertIsInstance(snap, dict)
+            self.assertEqual(snap["frameIndex"], 1)
+            self.assertEqual(len(snap["vehicles"]), 1)
+            self.assertEqual(snap["vehicles"][0]["trackId"], 1)
 
 
 if __name__ == "__main__":

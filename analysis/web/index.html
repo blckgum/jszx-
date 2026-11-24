@@ -198,6 +198,7 @@
                 <div id="viewport-replay-panel" class="viewport-media-wrap" hidden>
                   <video id="replay-video" class="media-frame" muted playsinline preload="none" hidden></video>
                   <img id="replay-frame-img" class="media-frame" alt="历史分析标注帧">
+                  <canvas id="replay-sim-canvas" class="media-frame" aria-label="纯轨迹三维重构视角画面" hidden></canvas>
                   <div id="replay-media-caption" class="media-caption mono tabular">回放就绪</div>
                 </div>
 
@@ -529,9 +530,9 @@
                 <span id="history-table-meta" class="meta-tag mono tabular">--</span>
               </div>
               <div class="segmented" role="tablist" aria-label="历史明细表切换">
-                <button type="button" id="tab-btn-conflicts" class="seg-btn is-active" role="tab" aria-selected="true" data-table-tab="conflicts">冲突风险明细</button>
-                <button type="button" id="tab-btn-events" class="seg-btn" role="tab" aria-selected="false" data-table-tab="events">聚合告警事件</button>
-                <button type="button" id="tab-btn-speeds" class="seg-btn" role="tab" aria-selected="false" data-table-tab="speeds">目标轨迹测速</button>
+                <button type="button" id="tab-btn-conflicts" class="seg-btn is-active" role="tab" aria-selected="true" aria-controls="conflicts-table-region" tabindex="0" data-table-tab="conflicts">冲突风险明细</button>
+                <button type="button" id="tab-btn-events" class="seg-btn" role="tab" aria-selected="false" aria-controls="events-table-region" tabindex="-1" data-table-tab="events">聚合告警事件</button>
+                <button type="button" id="tab-btn-speeds" class="seg-btn" role="tab" aria-selected="false" aria-controls="speeds-table-region" tabindex="-1" data-table-tab="speeds">目标轨迹测速</button>
               </div>
             </header>
 
@@ -595,8 +596,8 @@
         <section id="view-studio" class="view-section" hidden aria-labelledby="view-title">
           <div class="panel studio-tabs-bar">
             <div class="segmented" role="tablist" aria-label="标定与算法实验功能切换">
-              <button type="button" id="studio-tab-calib" class="seg-btn is-active" role="tab" aria-selected="true" data-studio-tab="calib">可视化道路标定</button>
-              <button type="button" id="studio-tab-lab" class="seg-btn" role="tab" aria-selected="false" data-studio-tab="lab">算法评测与消融</button>
+              <button type="button" id="studio-tab-calib" class="seg-btn is-active" role="tab" aria-selected="true" aria-controls="studio-panel-calib" tabindex="0" data-studio-tab="calib">可视化道路标定</button>
+              <button type="button" id="studio-tab-lab" class="seg-btn" role="tab" aria-selected="false" aria-controls="studio-panel-lab" tabindex="-1" data-studio-tab="lab">算法评测与消融</button>
             </div>
             <span id="studio-status-pill" class="meta-tag mono">单应标定与回归实验工作台</span>
           </div>
