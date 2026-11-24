@@ -169,6 +169,14 @@ def validate_configuration(data):
     _integer(data["stationary_min_frames"], "configuration.stationary_min_frames", minimum=1)
     _integer(data["alert_confirm_frames"], "configuration.alert_confirm_frames", minimum=1)
     _integer(data["alert_cooldown_frames"], "configuration.alert_cooldown_frames", minimum=0)
+    if "speed_model" in data:
+        if not isinstance(data["speed_model"], str) or data["speed_model"] not in {"ema", "kalman"}:
+            raise SchemaValidationError("configuration.speed_model 必须是 ema 或 kalman")
+    if "conflict_model" in data:
+        if not isinstance(data["conflict_model"], str) or data["conflict_model"] not in {"cvm_circle", "obb_ssm"}:
+            raise SchemaValidationError("configuration.conflict_model 必须是 cvm_circle 或 obb_ssm")
+    if "enable_stitching" in data and type(data["enable_stitching"]) is not bool:
+        raise SchemaValidationError("configuration.enable_stitching 必须是布尔值")
 
     reproducibility = _mapping(data["reproducibility"], "configuration.reproducibility")
     _required(reproducibility, ("generated_at", "environment", "git", "artifacts"),
@@ -207,6 +215,8 @@ def validate_summary(data):
         for key in ("total_alert_events", "total_speeding_alerts", "total_caution_events",
                     "total_critical_conflicts"):
             _integer(data[key], f"summary.{key}", minimum=0)
+    if "stitched_track_count" in data:
+        _integer(data["stitched_track_count"], "summary.stitched_track_count", minimum=0)
     return data
 
 
@@ -233,6 +243,14 @@ def validate_conflict_record(data):
         _finite_number(assessment["ttc_seconds"], "conflict.ttc_seconds", minimum=0)
     if not isinstance(assessment["vehicle_kind"], str) or not assessment["vehicle_kind"].strip():
         raise SchemaValidationError("conflict.vehicle_kind 必须是非空字符串")
+    for opt_num in ("mttc_seconds", "drac_ms2", "pet_seconds"):
+        if opt_num in assessment and assessment[opt_num] is not None:
+            _finite_number(assessment[opt_num], f"conflict.{opt_num}", minimum=0)
+    if "collision_prob" in assessment and assessment["collision_prob"] is not None:
+        _finite_number(assessment["collision_prob"], "conflict.collision_prob", minimum=0, maximum=1)
+    if "conflict_model" in assessment:
+        if not isinstance(assessment["conflict_model"], str) or assessment["conflict_model"] not in {"cvm_circle", "obb_ssm"}:
+            raise SchemaValidationError("conflict.conflict_model 必须是 cvm_circle 或 obb_ssm")
     return data
 
 
@@ -378,7 +396,89 @@ def validate_ablation(data):
             _finite_number(item["min_distance_m"], f"ablation.conflict[{idx}].min_distance_m", minimum=0)
         if not isinstance(item["risk_level"], str) or not item["risk_level"].strip():
             raise SchemaValidationError(f"ablation.conflict[{idx}].risk_level 必须是非空字符串")
+    if "algorithm_comparison" in data:
+        _validate_algorithm_comparison(data["algorithm_comparison"])
     return data
+
+
+def _validate_algorithm_comparison(comp):
+    comp = _mapping(comp, "ablation.algorithm_comparison")
+    _required(
+        comp,
+        ("speed_estimation", "conflict_detection", "tracklet_stitching"),
+        "ablation.algorithm_comparison",
+    )
+
+    speed_cmp = _mapping(comp["speed_estimation"], "ablation.algorithm_comparison.speed_estimation")
+    _required(speed_cmp, ("ema", "kalman", "kalman_improves_mae"), "ablation.algorithm_comparison.speed_estimation")
+    for mode in ("ema", "kalman"):
+        entry = _mapping(speed_cmp[mode], f"ablation.algorithm_comparison.speed_estimation.{mode}")
+        _required(
+            entry,
+            ("mae_ms", "rmse_ms", "max_error_ms"),
+            f"ablation.algorithm_comparison.speed_estimation.{mode}",
+        )
+        for metric in ("mae_ms", "rmse_ms", "max_error_ms"):
+            _finite_number(
+                entry[metric],
+                f"ablation.algorithm_comparison.speed_estimation.{mode}.{metric}",
+                minimum=0,
+            )
+        if "mean_lag_s" in entry and entry["mean_lag_s"] is not None:
+            _finite_number(
+                entry["mean_lag_s"],
+                f"ablation.algorithm_comparison.speed_estimation.{mode}.mean_lag_s",
+            )
+    if type(speed_cmp["kalman_improves_mae"]) is not bool:
+        raise SchemaValidationError("ablation.algorithm_comparison.speed_estimation.kalman_improves_mae 必须是布尔值")
+
+    conflict_cmp = comp["conflict_detection"]
+    if not isinstance(conflict_cmp, list) or not conflict_cmp:
+        raise SchemaValidationError("ablation.algorithm_comparison.conflict_detection 必须是非空列表")
+    for idx, row_raw in enumerate(conflict_cmp):
+        prefix = f"ablation.algorithm_comparison.conflict_detection[{idx}]"
+        row = _mapping(row_raw, prefix)
+        _required(row, ("scenario", "cvm_circle", "obb_ssm"), prefix)
+        if not isinstance(row["scenario"], str) or not row["scenario"].strip():
+            raise SchemaValidationError(f"{prefix}.scenario 必须是非空字符串")
+        for model_key in ("cvm_circle", "obb_ssm"):
+            sub = _mapping(row[model_key], f"{prefix}.{model_key}")
+            _required(sub, ("risk_level", "ttc_s"), f"{prefix}.{model_key}")
+            if not isinstance(sub["risk_level"], str) or not sub["risk_level"].strip():
+                raise SchemaValidationError(f"{prefix}.{model_key}.risk_level 必须是非空字符串")
+            if sub["ttc_s"] is not None:
+                _finite_number(sub["ttc_s"], f"{prefix}.{model_key}.ttc_s", minimum=0)
+            for opt_metric in ("mttc_s", "drac_ms2", "pet_s"):
+                if opt_metric in sub and sub[opt_metric] is not None:
+                    _finite_number(sub[opt_metric], f"{prefix}.{model_key}.{opt_metric}", minimum=0)
+            if "collision_prob" in sub and sub["collision_prob"] is not None:
+                _finite_number(
+                    sub["collision_prob"],
+                    f"{prefix}.{model_key}.collision_prob",
+                    minimum=0,
+                    maximum=1,
+                )
+
+    stitch_cmp = _mapping(comp["tracklet_stitching"], "ablation.algorithm_comparison.tracklet_stitching")
+    _required(
+        stitch_cmp,
+        ("unstitched", "stitched", "stitching_preserved_continuity"),
+        "ablation.algorithm_comparison.tracklet_stitching",
+    )
+    for mode in ("unstitched", "stitched"):
+        sub = _mapping(stitch_cmp[mode], f"ablation.algorithm_comparison.tracklet_stitching.{mode}")
+        _required(
+            sub,
+            ("unique_track_ids", "alert_event_count", "speed_mae_ms"),
+            f"ablation.algorithm_comparison.tracklet_stitching.{mode}",
+        )
+        _integer(sub["unique_track_ids"], f"ablation.algorithm_comparison.tracklet_stitching.{mode}.unique_track_ids", minimum=0)
+        _integer(sub["alert_event_count"], f"ablation.algorithm_comparison.tracklet_stitching.{mode}.alert_event_count", minimum=0)
+        _finite_number(sub["speed_mae_ms"], f"ablation.algorithm_comparison.tracklet_stitching.{mode}.speed_mae_ms", minimum=0)
+        if "stitched_count" in sub:
+            _integer(sub["stitched_count"], f"ablation.algorithm_comparison.tracklet_stitching.{mode}.stitched_count", minimum=0)
+    if type(stitch_cmp["stitching_preserved_continuity"]) is not bool:
+        raise SchemaValidationError("ablation.algorithm_comparison.tracklet_stitching.stitching_preserved_continuity 必须是布尔值")
 
 
 def validate_run(run_dir: str | Path) -> dict:

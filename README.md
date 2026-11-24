@@ -2,7 +2,7 @@
 
 面向校园道路固定路侧摄像头，研究车辆与行人的视觉感知、连续跟踪、实际速度估计和冲突风险预警。系统以 YOLOv8 + ByteTrack 提供检测与连续轨迹，`analysis` 模块完成道路标定、物理测速、TTC 冲突研判、事件去抖与四级预警，形成从视频输入到风险提示和事件记录的完整技术链路。
 
-**当前阶段：全链路已实现**（检测 → 跟踪 → 标定测速 → 冲突分析 → 预警）。CPU 环境下 192 项测试全部通过；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
+**当前阶段：全链路已实现**（检测 → 跟踪 → 短时遮挡缝合 → 标定测速 → 冲突分析 → 预警）。仓库共含 233 项单元与集成测试（本机无 `lap` 环境下 186 项非 `lap` 测试全部通过，含 `lap` 的 4 个跟踪集成模块需配合 `lap` 运行）；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
 
 ## 技术链路
 
@@ -10,9 +10,11 @@
 flowchart TD
     A[路侧固定摄像头 / 校园视频] --> B[YOLOv8 车辆行人检测]
     B --> C[ByteTrack 多目标跟踪]
-    C --> D[单应性标定：像素 → 米制坐标]
-    D --> E[滑窗微分 + EMA 物理测速]
-    E --> F[CVM 匀速外推：t_cpa / D_min]
+    C --> D[单应性标定：像素 → 米制坐标与雅可比协方差]
+    D -.-> S[TrackletStitcher 遮挡断轨缝合（可选）]
+    S --> E[物理测速：滑窗+EMA（默认） / 2D CA Kalman]
+    D --> E
+    E --> F[冲突研判：CVM 圆包络（默认） / OBB-SSM+MTTC+DRAC+PET]
     F --> G[四级风险分级 + 事件去抖状态机]
     G --> H[HUD 渲染 + 结构化日志落盘]
     D -.-> I[独立 30 km/h 限速判定]
@@ -26,11 +28,12 @@ flowchart TD
 | 车辆与行人检测 | YOLOv8n、PyTorch、Ultralytics | 已实现基线 |
 | 多目标跟踪 | ByteTrack：Kalman 预测 + 高/低分检测分阶段关联 | 已实现；校园场景待验证 |
 | 图像轨迹与运动记录 | 时间自适应位置/速度 EMA、像素位移、方向、px/s | 已实现；独立配置、有界缓存、漏检分段 |
-| 标定与测速 | 4 点单应性标定、滑窗两端微分、EMA 滤波 | 已实现；精度待实景验证 |
-| 类别策略 | bicycle/motorcycle/car/bus/truck 分型与安全半径策略 | 已实现；参数可在策略模块调整 |
-| 冲突分析与 TTC | CVM 匀速外推、t_cpa/D_min 闭式解、四级风险 | 已实现；阈值待实景调优 |
+| 断轨缝合 | `TrackletStitcher`：阻尼二阶外推、马氏门控与航向一致性 | 已实现；通过 `--enable-stitching` 开启 |
+| 标定与测速 | 4 点/多点 RANSAC 单应性、去畸变、雅可比协方差、EMA 或 2D CA Kalman | 已实现；精度待实景验证 |
+| 类别策略 | bicycle/motorcycle/car/bus/truck 几何尺寸与安全半径策略 | 已实现；参数可在策略模块调整 |
+| 冲突分析与 TTC | CVM 等速圆包络或 OBB 扫掠 TTC + MTTC + DRAC + PET + 碰撞概率 | 已实现；阈值待实景调优 |
 | 告警事件去抖 | N 帧确认 + 等级滞回 + 冷却合并 | 已实现；confirmed/provisional 分流 |
-| 实验评价 | 检测/跟踪/测速/事件级指标 | 框架已备；校园数据与标注待开展 |
+| 实验评价 | 检测/跟踪/测速/事件级指标与算法对比消融 | 框架已备；校园数据与标注待开展 |
 
 测速核心：`v(m/s) = ‖p(t) − p(t−Δt)‖ / Δt`（滑窗两端差分），`v(km/h) = 3.6 × v(m/s)`。超限 35 m、背向远离、持续静止且速度已收敛的目标不参与碰撞研判；超速与轨迹冲突独立判定，未超速也可能触发高级别 TTC 预警。
 
@@ -53,6 +56,8 @@ python -m analysis --source 0 --device cpu --show
 python -m analysis --source path/to/video_dir --device cpu
 # 基于已有 tracks.jsonl 离线复盘测速与 TTC（不重跑检测跟踪）
 python -m analysis --tracks runs/yolo/track/run-*/tracks.jsonl --calib configs/calibration.yaml
+# 启用 2D CA Kalman 测速、OBB+SSM 冲突研判与短时遮挡断轨缝合
+python -m analysis --tracks runs/yolo/track/run-*/tracks.jsonl --calib configs/calibration.yaml --speed-model kalman --conflict-model obb_ssm --enable-stitching
 
 # 无实测标定时的流程演示（内存合成标定，物理量不可信）
 python -m analysis --source path/to/video.mp4 --demo
@@ -66,7 +71,7 @@ python -m analysis.schema --run runs/analysis/run-<timestamp>
 
 本次 CPU 验证环境：Python 3.12、PyTorch 2.11.0+cpu、torchvision 0.26.0、Ultralytics 8.4.182、opencv-python 5.0.0.93、lap 0.5.12。依赖中不存在的 lap 0.10.0 已修正。
 
-`python -m analysis` 主要参数：`--speed-limit`（30 km/h）、`--object-policy`（类别策略 YAML）、`--ema-alpha`（0.35）、`--window`/`--window-s`（测速窗）、`--ttc-critical`/`--ttc-caution`/`--horizon`（1.8/3.5/3.5 s）、`--parked-seconds`（3.0 s 静止确认）、`--alert-confirm`/`--alert-confirm-s`、`--alert-cooldown`/`--alert-cooldown-s`（去抖窗口）、`--reliable-span-s`（0.2 s 可信度跨度）、`--fps`（无源 FPS 时显式指定）、`--max-frames`、`--demo`、`--show`。**帧数/秒数成对参数一律秒级覆盖帧级。** 训练与检测评估入口 `python -m detection train|val` 见[检测模块实施说明](docs/车辆行人检测方案.md)。
+`python -m analysis` 主要参数：`--speed-limit`（30 km/h）、`--object-policy`（类别策略 YAML）、`--speed-model`（`ema` 默认 / `kalman`）、`--conflict-model`（`cvm_circle` 默认 / `obb_ssm`）、`--enable-stitching`（开启遮挡断轨缝合）、`--ema-alpha`（0.35）、`--window`/`--window-s`（测速窗）、`--ttc-critical`/`--ttc-caution`/`--horizon`（1.8/3.5/3.5 s）、`--parked-seconds`（3.0 s 静止确认）、`--alert-confirm`/`--alert-confirm-s`、`--alert-cooldown`/`--alert-cooldown-s`（去抖窗口）、`--reliable-span-s`（0.2 s 可信度跨度）、`--fps`（无源 FPS 时显式指定）、`--max-frames`、`--demo`、`--show`。**帧数/秒数成对参数一律秒级覆盖帧级。** 训练与检测评估入口 `python -m detection train|val` 见[检测模块实施说明](docs/车辆行人检测方案.md)。
 
 ## 输出产物
 
@@ -77,16 +82,16 @@ python -m analysis.schema --run runs/analysis/run-<timestamp>
 | 文件 | 内容 |
 |---|---|
 | `annotated_conflict.mp4` | HUD/徽章/预测轨迹渲染；`[PROVISIONAL]` 瞬时量与 `[EVT#n CONFIRMED]` 已确认事件区分 |
-| `conflicts.jsonl` | 逐帧原始冲突评估（确认后回填 `event_id`） |
+| `conflicts.jsonl` | 逐帧原始冲突评估（确认后回填 `event_id`，含可选 `mttc_seconds`/`drac_ms2`/`pet_seconds`/`collision_prob`/`conflict_model`） |
 | `events.jsonl` | 生命周期告警事件：首末帧/时间戳、峰值等级、最小 TTC、结束原因 |
 | `speeds.csv` | 逐目标位置、速度、风险、事件关联与可靠度标记 |
-| `configuration.json` | 参数快照、Git 状态、Python/依赖版本及权重/配置 SHA256 指纹 |
-| `summary.json` | 事件计数与运行摘要；异常退出同样落盘并带 `status`/`stop_reason`/`error` |
+| `configuration.json` | 参数快照（含 `speed_model`/`conflict_model`/`enable_stitching`）、Git 状态、依赖版本与 SHA256 指纹 |
+| `summary.json` | 事件计数、断轨缝合计数（`stitched_track_count`）与运行摘要；异常退出同样落盘 |
 
 ## 已知边界
 
 - 纯视觉路侧预警，不做底盘控制；本地摄像头 / RTSP 流接入已实现，但实景网络丢包与端到端延迟未经现场压测
-- ByteTrack 换 ID 会把同一物理事件拆成多条记录（日志保留 track_id 供事后归并）
+- 默认关闭 `--enable-stitching` 时，ByteTrack 换 ID 会把同一物理事件拆成多条记录；开启 `--enable-stitching` 可在短时遮挡下缝合恢复同一 `canonical_id`
 - 路侧停车区多边形豁免与真值 MAE/F1 评测工具已实现，具体校园参数阈值待实拍素材验证后定案
 - 夜间/雨天、遮挡鲁棒性与实景精度未经评估
 
@@ -95,9 +100,9 @@ python -m analysis.schema --run runs/analysis/run-<timestamp>
 ```text
 detection/   YOLOv8 检测、训练与评估入口
 tracking/    ByteTrack 会话、轨迹与 px/s 运动记录、平滑、可视化、批处理
-analysis/    标定 · 测速 · 冲突研判 · 事件去抖 · 批量运行 · 真值评测 · 端到端管线
+analysis/    标定 · 卡尔曼/EMA 测速 · CVM/OBB-SSM 冲突研判 · 断轨缝合 · 事件去抖 · 真值评测 · 端到端管线
 configs/     bytetrack.yaml、motion.yaml、object_policy.yaml、calibration.yaml、真值与数据配置模板
-tests/       单元、集成与异常路径测试（192 项）
+tests/       单元、集成与异常路径测试（233 项）
 docs/        课题需求、研究蓝图（含数学推导）与模块解释文档
 ```
 

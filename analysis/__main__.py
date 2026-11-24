@@ -195,6 +195,25 @@ def main(argv: list[str] | None = None):
         help="停车区多边形内豁免冲突的最大车速 (km/h)，默认 5.0",
     )
     parser.add_argument(
+        "--speed-model",
+        type=str,
+        choices=("ema", "kalman"),
+        default="ema",
+        help="物理测速模型：ema (滑窗差分+EMA，默认) 或 kalman (二维匀加速卡尔曼+雅可比协方差)",
+    )
+    parser.add_argument(
+        "--conflict-model",
+        type=str,
+        choices=("cvm_circle", "obb_ssm"),
+        default="cvm_circle",
+        help="冲突研判模型：cvm_circle (等速圆包络，默认) 或 obb_ssm (OBB+MTTC+DRAC+PET)",
+    )
+    parser.add_argument(
+        "--enable-stitching",
+        action="store_true",
+        help="开启短时遮挡断轨缝合 (TrackletStitcher)，跨 ID 切换保留轨迹与事件连续性",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="是否开启本地桌面实时播放窗口",
@@ -357,6 +376,9 @@ def main(argv: list[str] | None = None):
         fps=args.fps,
         object_policy_config=args.object_policy,
         parking_zone_max_speed_kmh=args.parking_speed,
+        speed_model=args.speed_model,
+        conflict_model=args.conflict_model,
+        enable_stitching=args.enable_stitching,
     )
 
     if source_is_dir:

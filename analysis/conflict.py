@@ -2,9 +2,10 @@
 """
 车辆—行人时空轨迹冲突预测与 TTC 决策引擎 (Trajectory Conflict Analysis & TTC Decision Engine)
 =============================================================================
-利用二阶运动学与等速外推模型 (Constant Velocity Model, CVM)，
-在未来短时间视界 (0 ~ 3.5 秒) 内求解最小相对距离到达时刻 (t_cpa) 与极小间距 D_min，
-并与校园 30 km/h 独立限速机制结合，构建严格的分级预警决策体系。
+支持两种冲突研判模型：
+1. cvm_circle（默认基线）：二阶等速圆包络外推，求解 t_cpa 与 D_min；
+2. obb_ssm：车体旋转矩形 (OBB) 扫掠 TTC + MTTC + DRAC + PET + 碰撞概率综合研判，
+   并与校园 30 km/h 独立限速机制结合，构建严格的分级预警决策体系。
 """
 
 from __future__ import annotations
@@ -14,8 +15,17 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
 
-from .speed import SpeedReading
+import numpy as np
+
 from .policy import ObjectPolicy, object_policy
+from .speed import SpeedReading
+from .ssm import (
+    PETTracker,
+    compute_drac,
+    compute_mttc,
+    compute_obb_swept_ttc,
+    estimate_collision_probability,
+)
 
 
 class RiskLevel(IntEnum):
@@ -36,19 +46,24 @@ class ConflictAssessment:
     veh_speed_kmh: float
     ped_speed_ms: float
     current_distance_m: float
-    min_distance_m: float          # 预测未来最小距离 D_min (米)
+    min_distance_m: float          # 预测未来最小距离 D_min 或最小净距 (米)
     ttc_seconds: Optional[float]   # 碰撞时间 TTC (秒)
     conflict_ground_xy: Optional[Tuple[float, float]]  # 预测冲突点地面坐标 (米)
     vehicle_kind: str = "motor_vehicle"
+    mttc_seconds: Optional[float] = None
+    drac_ms2: Optional[float] = None
+    pet_seconds: Optional[float] = None
+    collision_prob: Optional[float] = None
+    conflict_model: str = "cvm_circle"
 
 
 def _is_finite_number(value) -> bool:
     # 显式排除 bool，防止 True/False 作为 int 子类通过参数校验。
-    return (
-        type(value) is not bool
-        and isinstance(value, (int, float))
-        and math.isfinite(value)
-    )
+    if type(value) is bool or isinstance(value, np.bool_):
+        return False
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return math.isfinite(float(value))
+    return False
 
 
 def _conflict_sort_key(c: ConflictAssessment):
@@ -77,7 +92,7 @@ def build_conflict_maps(
 
 
 class ConflictAnalyzer:
-    """车辆—行人时空交互冲突研判与 TTC 决策核心"""
+    """车辆—行人时空交互冲突研判与 TTC/SSM 决策核心"""
 
     def __init__(
         self,
@@ -89,6 +104,11 @@ class ConflictAnalyzer:
         horizon_s: float = 3.5,
         object_policies: dict[str, ObjectPolicy] | None = None,
         parking_zone_max_speed_kmh: float = 5.0,
+        conflict_model: str = "cvm_circle",
+        drac_critical_ms2: float = 3.4,
+        drac_caution_ms2: float = 2.0,
+        pet_critical_s: float = 1.0,
+        pet_caution_s: float = 2.0,
     ):
         if not _is_finite_number(speed_limit_kmh) or speed_limit_kmh <= 0:
             raise ValueError("speed_limit_kmh 必须为有限正数")
@@ -108,6 +128,21 @@ class ConflictAnalyzer:
             raise ValueError("TTC 阈值需满足 0 < ttc_critical <= ttc_caution <= horizon")
         if not _is_finite_number(parking_zone_max_speed_kmh) or parking_zone_max_speed_kmh < 0:
             raise ValueError("parking_zone_max_speed_kmh 必须为有限非负数")
+        if not isinstance(conflict_model, str) or conflict_model not in ("cvm_circle", "obb_ssm"):
+            raise ValueError("conflict_model 必须是 'cvm_circle' 或 'obb_ssm'")
+        if not (
+            _is_finite_number(drac_caution_ms2)
+            and _is_finite_number(drac_critical_ms2)
+            and 0 < drac_caution_ms2 <= drac_critical_ms2
+        ):
+            raise ValueError("DRAC 阈值需满足 0 < drac_caution_ms2 <= drac_critical_ms2")
+        if not (
+            _is_finite_number(pet_critical_s)
+            and _is_finite_number(pet_caution_s)
+            and 0 < pet_critical_s <= pet_caution_s
+        ):
+            raise ValueError("PET 阈值需满足 0 < pet_critical_s <= pet_caution_s")
+
         self.speed_limit_kmh = float(speed_limit_kmh)
         self.safe_radius_veh_m = float(safe_radius_veh_m)
         self.safe_radius_ped_m = float(safe_radius_ped_m)
@@ -117,12 +152,27 @@ class ConflictAnalyzer:
         self.horizon_s = float(horizon_s)
         self.object_policies = object_policies
         self.parking_zone_max_speed_kmh = float(parking_zone_max_speed_kmh)
+        self.conflict_model = conflict_model
+        self.drac_critical_ms2 = float(drac_critical_ms2)
+        self.drac_caution_ms2 = float(drac_caution_ms2)
+        self.pet_critical_s = float(pet_critical_s)
+        self.pet_caution_s = float(pet_caution_s)
+        self.pet_tracker = PETTracker() if self.conflict_model == "obb_ssm" else None
 
-    def evaluate_pair(
+    def _is_vehicle_exempt(self, veh: SpeedReading) -> bool:
+        """判断车辆是否因确认静止或停车区内低速挪动而豁免冲突研判。"""
+        # is_reliable 兜底：--parked-frames 1 或低 FPS 时静止标记可能在
+        # 收敛前置位，未收敛目标一律保守参与研判，不做豁免。
+        if veh.is_stationary and veh.is_reliable:
+            return True
+        if veh.in_parking_zone and veh.is_reliable and veh.speed_kmh <= self.parking_zone_max_speed_kmh:
+            return True
+        return False
+
+    def _evaluate_pair_cvm(
         self, veh: SpeedReading, ped: SpeedReading
     ) -> Optional[ConflictAssessment]:
-        """评估单一机动车与单一横穿行人之间的潜在几何冲突"""
-        # 拒绝任意 NaN/Inf 运动学输入，防止 NaN 在后续比较中悄悄绕过边界判定。
+        """原有等速圆包络外推 (cvm_circle) 冲突研判逻辑，保持完全向后兼容。"""
         if not all(
             _is_finite_number(v)
             for v in (
@@ -136,23 +186,11 @@ class ConflictAnalyzer:
         dy = ped.y_m - veh.y_m
         current_dist = math.hypot(dx, dy)
 
-        # 超过 35 米开外不构成即时校园道路冲突威胁
         if current_dist > 35.0:
             return None
-
-        # 持续静止且速度估计已收敛的车辆（泊车/停靠）不参与碰撞研判：
-        # 行人走近停靠车辆不构成交通冲突，否则 CVM 外推会对路边停靠目标
-        # 持续误报；缓慢蠕行或速度未收敛的车辆不满足该条件，仍正常评估。
-        # is_reliable 兜底：--parked-frames 1 或低 FPS 时静止标记可能在
-        # 收敛前置位，未收敛目标一律保守参与研判，不做豁免
-        if veh.is_stationary and veh.is_reliable:
-            return None
-        # 停靠在路侧停车区多边形内的低速/蠕行车辆豁免碰撞误报；
-        # 若停车区内车辆高速驶出 (> parking_zone_max_speed_kmh)，仍正常触发预警
-        if veh.in_parking_zone and veh.is_reliable and veh.speed_kmh <= self.parking_zone_max_speed_kmh:
+        if self._is_vehicle_exempt(veh):
             return None
 
-        # 按车辆细分子类策略取对应几何包络半径；默认未覆盖策略时沿用分析器自身 safe_radius_veh_m。
         vehicle_policy = object_policy(veh.object_kind, veh.category, self.object_policies)
         veh_radius_m = (
             self.safe_radius_veh_m
@@ -161,39 +199,27 @@ class ConflictAnalyzer:
         )
         critical_dist_m = veh_radius_m + self.safe_radius_ped_m
 
-        # 相对速度矢量：v_rel = v_ped - v_veh
         dvx = ped.vx_ms - veh.vx_ms
         dvy = ped.vy_ms - veh.vy_ms
         rel_speed_sq = dvx * dvx + dvy * dvy
-
-        # 相对运动过微（几乎无相对速度差）
         if rel_speed_sq < 1e-4:
             return None
 
-        # 判定两者是否处于汇聚靠近态：r · v_rel < 0
         dot_product = dx * dvx + dy * dvy
         if dot_product >= 0:
-            # 内积 >= 0 说明两者正在背向运动，距离正在拉大，TTC 视为无穷大安全
             return None
 
-        # 计算最接近点时间 t_cpa (即 TTC)
         t_cpa = -dot_product / rel_speed_sq
-
-        # 只关注未来预测视界内的有效冲突
         if t_cpa <= 0 or t_cpa > self.horizon_s:
             return None
 
-        # 计算在 t_cpa 时刻两者的预测间距 D_min
         rx_cpa = dx + dvx * t_cpa
         ry_cpa = dy + dvy * t_cpa
         min_dist = math.hypot(rx_cpa, ry_cpa)
 
-        # 预测空间交点坐标（基于车辆外推位置）
         conflict_x = veh.x_m + veh.vx_ms * t_cpa
         conflict_y = veh.y_m + veh.vy_ms * t_cpa
 
-        # 分级风险研判：核心包络内按 TTC 划分紧急(L3)/注意(L2)；
-        # 若横向余量在 1.5 倍安全半径内且位于注意时域内，同样提示注意擦碰(L2)。
         if min_dist <= critical_dist_m:
             if t_cpa <= self.ttc_critical_s:
                 level = RiskLevel.LEVEL_3_CRITICAL
@@ -202,7 +228,6 @@ class ConflictAnalyzer:
                 level = RiskLevel.LEVEL_2_CAUTION
                 desc = f"注意减速礼让行人 (TTC={t_cpa:.1f}s, 轨迹汇聚)"
             else:
-                # 位于 (ttc_caution_s, horizon_s] 区间但尚未进入注意预警时域，暂不告警。
                 return None
         elif min_dist <= critical_dist_m * 1.5 and t_cpa <= self.ttc_caution_s:
             level = RiskLevel.LEVEL_2_CAUTION
@@ -222,21 +247,235 @@ class ConflictAnalyzer:
             ttc_seconds=t_cpa,
             conflict_ground_xy=(conflict_x, conflict_y),
             vehicle_kind=vehicle_policy.kind,
+            conflict_model="cvm_circle",
         )
 
+    def _evaluate_pair_obb_ssm(
+        self, veh: SpeedReading, ped: SpeedReading
+    ) -> Optional[ConflictAssessment]:
+        """基于旋转矩形扫掠与多维替代安全指标 (OBB + MTTC + DRAC + 概率) 的冲突评估。"""
+        raw_veh_ax = getattr(veh, "ax_ms2", 0.0)
+        raw_veh_ay = getattr(veh, "ay_ms2", 0.0)
+        raw_ped_ax = getattr(ped, "ax_ms2", 0.0)
+        raw_ped_ay = getattr(ped, "ay_ms2", 0.0)
+        veh_ax = 0.0 if raw_veh_ax is None else raw_veh_ax
+        veh_ay = 0.0 if raw_veh_ay is None else raw_veh_ay
+        ped_ax = 0.0 if raw_ped_ax is None else raw_ped_ax
+        ped_ay = 0.0 if raw_ped_ay is None else raw_ped_ay
+
+        if not all(
+            _is_finite_number(v)
+            for v in (
+                veh.x_m, veh.y_m, veh.vx_ms, veh.vy_ms, veh.speed_kmh, veh.heading_deg,
+                ped.x_m, ped.y_m, ped.vx_ms, ped.vy_ms, ped.speed_ms,
+                veh_ax, veh_ay, ped_ax, ped_ay,
+            )
+        ):
+            return None
+
+        dx = float(ped.x_m) - float(veh.x_m)
+        dy = float(ped.y_m) - float(veh.y_m)
+        current_dist = math.hypot(dx, dy)
+        if current_dist > 35.0:
+            return None
+        if self._is_vehicle_exempt(veh):
+            return None
+
+        vehicle_policy = object_policy(veh.object_kind, veh.category, self.object_policies)
+        ped_policy = object_policy(ped.object_kind, ped.category, self.object_policies)
+        veh_length_m = vehicle_policy.length_m
+        veh_width_m = vehicle_policy.width_m
+        ped_radius_m = (
+            self.safe_radius_ped_m
+            if abs(self.safe_radius_ped_m - 0.8) > 1e-9
+            else 0.5 * max(ped_policy.length_m, ped_policy.width_m)
+        )
+
+        veh_vx, veh_vy = float(veh.vx_ms), float(veh.vy_ms)
+        ped_vx, ped_vy = float(ped.vx_ms), float(ped.vy_ms)
+        veh_speed_vec = math.hypot(veh_vx, veh_vy)
+        heading_rad = (
+            math.radians(float(veh.heading_deg))
+            if veh_speed_vec > 0.2
+            else math.atan2(veh_vy, veh_vx)
+        )
+
+        obb = compute_obb_swept_ttc(
+            veh_xy=(float(veh.x_m), float(veh.y_m)),
+            veh_v=(veh_vx, veh_vy),
+            heading_rad=heading_rad,
+            veh_length_m=veh_length_m,
+            veh_width_m=veh_width_m,
+            ped_xy=(float(ped.x_m), float(ped.y_m)),
+            ped_v=(ped_vx, ped_vy),
+            ped_radius_m=ped_radius_m,
+            horizon_s=self.horizon_s,
+        )
+
+        dvx = ped_vx - veh_vx
+        dvy = ped_vy - veh_vy
+        dax = float(ped_ax) - float(veh_ax)
+        day = float(ped_ay) - float(veh_ay)
+
+        cos_h = math.cos(heading_rad)
+        sin_h = math.sin(heading_rad)
+        hx_unm = 0.5 * veh_length_m + ped_radius_m
+        hy_unm = 0.5 * veh_width_m + ped_radius_m
+
+        if current_dist > 1e-9:
+            ux = dx / current_dist
+            uy = dy / current_dist
+            ulx = cos_h * ux + sin_h * uy
+            uly = -sin_h * ux + cos_h * uy
+            # 沿当前视线方向截取未加裕度 OBB 的支撑半径，兼顾长车身纵向与窄车身横向特性。
+            critical_dist_obb = min(
+                hx_unm / max(abs(ulx), 1e-9),
+                hy_unm / max(abs(uly), 1e-9),
+            )
+            a_c = -(dax * ux + day * uy)
+        else:
+            critical_dist_obb = hy_unm
+            a_c = 0.0
+
+        mttc = compute_mttc(
+            dx, dy, dvx, dvy, dax, day, critical_dist_obb, self.horizon_s
+        )
+        drac = compute_drac(dx, dy, dvx, dvy, critical_dist_obb)
+
+        # 若等速外推未撞击，但存在加速度骤增，核查二阶外推在 mttc 时刻是否侵入扩展 OBB；
+        # 窄路平行会车（横向始终大于 hy 且无指向性加速）会在此处被自然过滤为安全。
+        accel_enters_obb = False
+        if not obb.collides and mttc is not None and (dax * dax + day * day) > 1e-6:
+            alx = cos_h * dax + sin_h * day
+            aly = -sin_h * dax + cos_h * day
+            px_acc = obb.local_pos_xy[0] + obb.local_vel_xy[0] * mttc + 0.5 * alx * (mttc ** 2)
+            py_acc = obb.local_pos_xy[1] + obb.local_vel_xy[1] * mttc + 0.5 * aly * (mttc ** 2)
+            hx_exp, hy_exp = obb.expanded_half_extents_xy
+            if abs(px_acc) <= hx_exp and abs(py_acc) <= hy_exp:
+                accel_enters_obb = True
+
+        if not obb.collides and not accel_enters_obb:
+            return None
+
+        # 安全制动降级：已明显减速且刹停距离足够（mttc=None）同时所需减速度低于注意阈值。
+        is_safe_braking = (
+            mttc is None
+            and a_c < -0.5
+            and drac is not None
+            and drac < self.drac_caution_ms2
+        )
+        if is_safe_braking:
+            if obb.collides and obb.t_enter is not None and obb.t_enter <= self.ttc_critical_s:
+                level = RiskLevel.LEVEL_2_CAUTION
+                t_eff: Optional[float] = obb.t_enter
+                desc = (
+                    f"减速制动礼让中 (MTTC安全, DRAC={drac:.2f}m/s^2, "
+                    f"净距={obb.min_clearance_m:.2f}m)"
+                )
+            else:
+                return None
+        else:
+            if obb.collides:
+                assert obb.t_enter is not None
+                t_eff = mttc if (mttc is not None and mttc < obb.t_enter) else obb.t_enter
+            else:
+                assert mttc is not None
+                t_eff = mttc
+
+            if t_eff <= self.ttc_critical_s:
+                level = RiskLevel.LEVEL_3_CRITICAL
+            elif t_eff <= self.ttc_caution_s:
+                level = RiskLevel.LEVEL_2_CAUTION
+            else:
+                level = RiskLevel.LEVEL_0_SAFE
+
+            if drac is not None:
+                if drac >= self.drac_critical_ms2:
+                    level = RiskLevel.LEVEL_3_CRITICAL
+                elif drac >= self.drac_caution_ms2 and level < RiskLevel.LEVEL_2_CAUTION:
+                    level = RiskLevel.LEVEL_2_CAUTION
+
+            if level == RiskLevel.LEVEL_0_SAFE:
+                return None
+
+            drac_txt = f"{drac:.2f}" if drac is not None else "0.00"
+            if level == RiskLevel.LEVEL_3_CRITICAL:
+                desc = (
+                    f"紧急碰撞危险! (OBB-TTC={t_eff:.2f}s, "
+                    f"DRAC={drac_txt}m/s^2, 净距={obb.min_clearance_m:.2f}m)"
+                )
+            else:
+                desc = (
+                    f"注意减速礼让行人 (OBB-TTC={t_eff:.2f}s, "
+                    f"DRAC={drac_txt}m/s^2, 净距={obb.min_clearance_m:.2f}m)"
+                )
+
+        t_eval = mttc if mttc is not None else (t_eff if t_eff is not None else obb.t_min_clearance)
+        conflict_x = float(veh.x_m) + veh_vx * t_eval + 0.5 * float(veh_ax) * (t_eval ** 2)
+        conflict_y = float(veh.y_m) + veh_vy * t_eval + 0.5 * float(veh_ay) * (t_eval ** 2)
+
+        veh_cov = getattr(veh, "pos_cov_m2", None)
+        ped_cov = getattr(ped, "pos_cov_m2", None)
+        try:
+            prob = estimate_collision_probability(
+                dx, dy, dvx, dvy, t_eval, critical_dist_obb, veh_cov, ped_cov
+            )
+        except ValueError:
+            prob = estimate_collision_probability(
+                dx, dy, dvx, dvy, t_eval, critical_dist_obb, None, None
+            )
+
+        min_dist_out = 0.0 if accel_enters_obb else obb.min_clearance_m
+        return ConflictAssessment(
+            veh_track_id=veh.track_id,
+            ped_track_id=ped.track_id,
+            risk_level=level,
+            risk_desc=desc,
+            veh_speed_kmh=float(veh.speed_kmh),
+            ped_speed_ms=float(ped.speed_ms),
+            current_distance_m=current_dist,
+            min_distance_m=min_dist_out,
+            ttc_seconds=t_eff,
+            conflict_ground_xy=(conflict_x, conflict_y),
+            vehicle_kind=vehicle_policy.kind,
+            mttc_seconds=mttc,
+            drac_ms2=drac,
+            pet_seconds=None,
+            collision_prob=prob,
+            conflict_model="obb_ssm",
+        )
+
+    def evaluate_pair(
+        self, veh: SpeedReading, ped: SpeedReading
+    ) -> Optional[ConflictAssessment]:
+        """评估单一机动车与单一横穿行人之间的潜在几何冲突"""
+        if self.conflict_model == "obb_ssm":
+            return self._evaluate_pair_obb_ssm(veh, ped)
+        return self._evaluate_pair_cvm(veh, ped)
+
     def analyze_frame(
-        self, readings: List[SpeedReading]
+        self,
+        readings: List[SpeedReading],
+        *,
+        timestamp_s: Optional[float] = None,
     ) -> List[ConflictAssessment]:
-        """全场景多目标批量冲突评估"""
+        """全场景多目标批量冲突评估；obb_ssm 模式下传入 timestamp_s 可叠加 PET 近距险情判定。"""
+        if timestamp_s is not None:
+            if not _is_finite_number(timestamp_s) or float(timestamp_s) < 0.0:
+                raise ValueError("timestamp_s 必须为有限非负数")
+
         vehicles = [r for r in readings if r.category == "vehicle"]
         pedestrians = [r for r in readings if r.category in ("pedestrian", "person")]
+        ped_by_id = {p.track_id: p for p in pedestrians}
+
+        pet_map: Dict[Tuple[int, int], float] = {}
+        if self.conflict_model == "obb_ssm" and self.pet_tracker is not None and timestamp_s is not None:
+            pet_map = self.pet_tracker.update(readings, float(timestamp_s))
 
         assessments: List[ConflictAssessment] = []
 
-        # 遍历所有车辆
         for veh in vehicles:
-            # 跳过任意运动学字段非有限的车辆读数：否则 evaluate_pair 拒绝研判后会落入 else
-            # 分支生成含 NaN speed_kmh 的 LEVEL_0_SAFE 记录，不仅失实且会在严格 JSON 落盘时崩溃。
+            # 跳过任意运动学字段非有限的车辆读数，防止 NaN 落入 LEVEL_0_SAFE 并在严格 JSON 落盘崩溃。
             if not all(
                 _is_finite_number(v)
                 for v in (veh.x_m, veh.y_m, veh.vx_ms, veh.vy_ms, veh.speed_kmh)
@@ -245,36 +484,88 @@ class ConflictAnalyzer:
 
             highest_conflict: Optional[ConflictAssessment] = None
 
-            # 评估与视野内所有行人的交互
             for ped in pedestrians:
                 conflict = self.evaluate_pair(veh, ped)
                 if conflict is not None:
                     if (
                         highest_conflict is None
-                        or conflict.risk_level > highest_conflict.risk_level
+                        or _conflict_sort_key(conflict) > _conflict_sort_key(highest_conflict)
+                    ):
+                        highest_conflict = conflict
+
+            # 叠加 PET 网格跨轨迹侵入近险事件（捕捉行人刚撤离后车辆紧随擦过的险情）。
+            if pet_map and not self._is_vehicle_exempt(veh):
+                veh_kind_tmp = object_policy(veh.object_kind, veh.category, self.object_policies).kind
+                for (v_id, p_id), pet_s in pet_map.items():
+                    if v_id != veh.track_id:
+                        continue
+                    if highest_conflict is not None and highest_conflict.ped_track_id == p_id:
+                        highest_conflict.pet_seconds = pet_s
+                        if pet_s <= self.pet_critical_s and highest_conflict.risk_level < RiskLevel.LEVEL_3_CRITICAL:
+                            highest_conflict.risk_level = RiskLevel.LEVEL_3_CRITICAL
+                            highest_conflict.risk_desc = f"紧急近距擦碰险情 (PET={pet_s:.2f}s)"
+                        elif pet_s <= self.pet_caution_s and highest_conflict.risk_level < RiskLevel.LEVEL_2_CAUTION:
+                            highest_conflict.risk_level = RiskLevel.LEVEL_2_CAUTION
+                            highest_conflict.risk_desc = f"注意近距跨迹险情 (PET={pet_s:.2f}s)"
+                        continue
+
+                    if pet_s > self.pet_caution_s:
+                        continue
+
+                    pet_level = (
+                        RiskLevel.LEVEL_3_CRITICAL
+                        if pet_s <= self.pet_critical_s
+                        else RiskLevel.LEVEL_2_CAUTION
+                    )
+                    ped_obj = ped_by_id.get(p_id)
+                    cur_dist = (
+                        math.hypot(ped_obj.x_m - veh.x_m, ped_obj.y_m - veh.y_m)
+                        if ped_obj is not None and _is_finite_number(ped_obj.x_m) and _is_finite_number(ped_obj.y_m)
+                        else 0.0
+                    )
+                    ped_spd = (
+                        float(ped_obj.speed_ms)
+                        if ped_obj is not None and _is_finite_number(ped_obj.speed_ms)
+                        else 0.0
+                    )
+                    pet_desc = (
+                        f"紧急近距擦碰险情 (PET={pet_s:.2f}s)"
+                        if pet_level == RiskLevel.LEVEL_3_CRITICAL
+                        else f"注意近距跨迹险情 (PET={pet_s:.2f}s)"
+                    )
+                    pet_candidate = ConflictAssessment(
+                        veh_track_id=veh.track_id,
+                        ped_track_id=p_id,
+                        risk_level=pet_level,
+                        risk_desc=pet_desc,
+                        veh_speed_kmh=float(veh.speed_kmh),
+                        ped_speed_ms=ped_spd,
+                        current_distance_m=cur_dist,
+                        min_distance_m=0.0,
+                        ttc_seconds=None,
+                        conflict_ground_xy=(float(veh.x_m), float(veh.y_m)),
+                        vehicle_kind=veh_kind_tmp,
+                        pet_seconds=pet_s,
+                        conflict_model=self.conflict_model,
+                    )
+                    if (
+                        highest_conflict is None
+                        or pet_level > highest_conflict.risk_level
                         or (
-                            conflict.risk_level == highest_conflict.risk_level
+                            pet_level == highest_conflict.risk_level
+                            and highest_conflict.ttc_seconds is None
                             and (
-                                conflict.ttc_seconds
-                                if conflict.ttc_seconds is not None
-                                else 999.0
-                            )
-                            < (
-                                highest_conflict.ttc_seconds
-                                if highest_conflict.ttc_seconds is not None
-                                else 999.0
+                                highest_conflict.pet_seconds is None
+                                or pet_s < highest_conflict.pet_seconds
                             )
                         )
                     ):
-                        highest_conflict = conflict
+                        highest_conflict = pet_candidate
 
             veh_kind = object_policy(veh.object_kind, veh.category, self.object_policies).kind
             if highest_conflict is not None:
                 assessments.append(highest_conflict)
             elif veh.category == "vehicle" and _is_finite_number(veh.speed_kmh) and veh.speed_kmh > self.speed_limit_kmh:
-                # 用本分析器自身的限速值重判而非信任 reading.is_speeding：
-                # 独立使用 ConflictAnalyzer 时两侧限速参数可能不一致
-                # 独立超速判定分支：车辆超速 30 km/h，但前方暂无相交行人
                 assessments.append(
                     ConflictAssessment(
                         veh_track_id=veh.track_id,
@@ -288,10 +579,10 @@ class ConflictAnalyzer:
                         ttc_seconds=None,
                         conflict_ground_xy=None,
                         vehicle_kind=veh_kind,
+                        conflict_model=self.conflict_model,
                     )
                 )
             else:
-                # 正常安全通行
                 assessments.append(
                     ConflictAssessment(
                         veh_track_id=veh.track_id,
@@ -305,6 +596,7 @@ class ConflictAnalyzer:
                         ttc_seconds=None,
                         conflict_ground_xy=None,
                         vehicle_kind=veh_kind,
+                        conflict_model=self.conflict_model,
                     )
                 )
 

@@ -42,6 +42,7 @@ from .events import ConflictEventTracker
 from .policy import DEFAULT_OBJECT_POLICY_CONFIG, read_object_policy_config
 from .provenance import collect_provenance
 from .speed import SpeedEstimator, SpeedReading
+from .stitching import TrackletStitcher
 from .visualization import EnhancedConflictVisualizer, trajectory_color
 
 
@@ -169,6 +170,9 @@ class ConflictPerceptionPipeline:
         fps: Optional[float] = None,
         object_policy_config: str | Path = DEFAULT_OBJECT_POLICY_CONFIG,
         parking_zone_max_speed_kmh: float = 5.0,
+        speed_model: str = "ema",
+        conflict_model: str = "cvm_circle",
+        enable_stitching: bool = False,
     ):
         if type(speed_limit_kmh) not in (int, float) or not math.isfinite(speed_limit_kmh) or speed_limit_kmh <= 0:
             raise ValueError("speed_limit_kmh 必须为有限正数")
@@ -234,6 +238,12 @@ class ConflictPerceptionPipeline:
             raise ValueError("跟踪配置路径不能为空")
         if is_blank_path(object_policy_config):
             raise ValueError("对象策略配置路径不能为空")
+        if type(speed_model) is not str or speed_model not in ("ema", "kalman"):
+            raise ValueError("speed_model 必须是 'ema' 或 'kalman'")
+        if type(conflict_model) is not str or conflict_model not in ("cvm_circle", "obb_ssm"):
+            raise ValueError("conflict_model 必须是 'cvm_circle' 或 'obb_ssm'")
+        if type(enable_stitching) is not bool:
+            raise ValueError("enable_stitching 必须是布尔值")
 
         self.calibrator = calibrator
         self.weights = weights
@@ -254,6 +264,9 @@ class ConflictPerceptionPipeline:
         self.object_policy_config = str(Path(object_policy_config).expanduser().resolve())
         self.object_policies = read_object_policy_config(object_policy_config)
         self.parking_zone_max_speed_kmh = float(parking_zone_max_speed_kmh)
+        self.speed_model = speed_model
+        self.conflict_model = conflict_model
+        self.enable_stitching = enable_stitching
         self.window_size = window_size
         self.ema_alpha = ema_alpha
         self.ttc_critical_s = ttc_critical_s
@@ -274,6 +287,7 @@ class ConflictPerceptionPipeline:
             category_confirm_frames=category_confirm_frames,
             reliable_min_span_s=reliable_min_span_s,
             object_policies=self.object_policies,
+            estimator_mode=speed_model,
         )
         self.speed_estimator = SpeedEstimator(**self._estimator_kwargs)
         self.event_tracker = ConflictEventTracker(
@@ -287,6 +301,10 @@ class ConflictPerceptionPipeline:
             horizon_s=horizon_s,
             object_policies=self.object_policies,
             parking_zone_max_speed_kmh=self.parking_zone_max_speed_kmh,
+            conflict_model=self.conflict_model,
+        )
+        self.stitcher: Optional[TrackletStitcher] = (
+            TrackletStitcher() if self.enable_stitching else None
         )
         self.visualizer = EnhancedConflictVisualizer(
             calibrator=calibrator, speed_limit_kmh=speed_limit_kmh
@@ -329,6 +347,9 @@ class ConflictPerceptionPipeline:
             },
             "fps_used": fps,
             "speed_limit_kmh": self.speed_limit_kmh,
+            "speed_model": self.speed_model,
+            "conflict_model": self.conflict_model,
+            "enable_stitching": self.enable_stitching,
             "ema_alpha": self.ema_alpha,
             "window_size_frames": self.speed_estimator.window_size,
             "window_seconds": self.window_seconds,
@@ -381,6 +402,19 @@ class ConflictPerceptionPipeline:
             confirm_frames=confirm_frames,
             cooldown_frames=cooldown_frames,
         )
+
+    def _configure_conflict_and_stitcher(self):
+        """每次处理新视频或新轨迹流前重置冲突分析器与缝合器状态，防止跨运行串状态。"""
+        self.conflict_analyzer = ConflictAnalyzer(
+            speed_limit_kmh=self.speed_limit_kmh,
+            ttc_critical_s=self.ttc_critical_s,
+            ttc_caution_s=self.ttc_caution_s,
+            horizon_s=self.horizon_s,
+            object_policies=self.object_policies,
+            parking_zone_max_speed_kmh=self.parking_zone_max_speed_kmh,
+            conflict_model=self.conflict_model,
+        )
+        self.stitcher = TrackletStitcher() if self.enable_stitching else None
 
     @staticmethod
     def _write_summary_file(out_dir: Path, payload: dict):
@@ -500,8 +534,7 @@ class ConflictPerceptionPipeline:
         writer=None,
     ):
         """执行单帧标定投影、速度估计、冲突预测、去抖落盘与可选视频渲染。"""
-        speed_readings: List[SpeedReading] = []
-        reading_map: Dict[int, SpeedReading] = {}
+        valid_tracks = []
         out_of_zone_ids: set[int] = set()
         frame_max_speed = 0.0
 
@@ -520,26 +553,67 @@ class ConflictPerceptionPipeline:
                 out_of_zone_ids.add(t.track_id)
                 continue
 
-            reading = self.speed_estimator.update(
-                track_id=t.track_id,
-                category=t.category,
-                timestamp_s=timestamp_s,
-                x_m=x_m,
-                y_m=y_m,
-                object_kind=t.class_name,
-            )
-            reading.in_parking_zone = self.calibrator.is_in_parking_zone(x_m, y_m)
-            reading_map[t.track_id] = reading
+            valid_tracks.append((t, u_foot, v_foot, x_m, y_m))
+
+        id_map: Dict[int, int] = {}
+        if self.enable_stitching and self.stitcher is not None:
+            observations = [
+                (t.track_id, t.category, t.class_name, x_m, y_m)
+                for t, _, _, x_m, y_m in valid_tracks
+            ]
+            id_map, _ = self.stitcher.resolve_frame(observations, timestamp_s)
+
+        speed_readings: List[SpeedReading] = []
+        reading_map: Dict[int, SpeedReading] = {}
+        cov_fn = (
+            getattr(self.calibrator, "ground_covariance_from_pixel", None)
+            if self.speed_model == "kalman"
+            else None
+        )
+
+        for t, u_foot, v_foot, x_m, y_m in valid_tracks:
+            eff_id = id_map.get(t.track_id, t.track_id) if self.enable_stitching else t.track_id
+            if self.speed_model == "kalman" and callable(cov_fn):
+                obs_cov_m2 = cov_fn(u_foot, v_foot)
+                reading = self.speed_estimator.update(
+                    track_id=eff_id,
+                    category=t.category,
+                    timestamp_s=timestamp_s,
+                    x_m=x_m,
+                    y_m=y_m,
+                    object_kind=t.class_name,
+                    obs_cov_m2=obs_cov_m2,
+                )
+            else:
+                reading = self.speed_estimator.update(
+                    track_id=eff_id,
+                    category=t.category,
+                    timestamp_s=timestamp_s,
+                    x_m=x_m,
+                    y_m=y_m,
+                    object_kind=t.class_name,
+                )
+            reading.in_parking_zone = self.calibrator.is_in_parking_zone(reading.x_m, reading.y_m)
+            if self.enable_stitching and self.stitcher is not None:
+                self.stitcher.update_kinematics(eff_id, reading, timestamp_s)
+            reading_map[eff_id] = reading
             speed_readings.append(reading)
 
             if reading.speed_kmh > frame_max_speed:
                 frame_max_speed = reading.speed_kmh
 
         # 根据存活池剔除已移出跟踪器或越出标定区的目标，防止速度状态字典长期残留。
-        live_ids = resolve_live_ids(out_of_zone_ids)
+        live_raw_ids = resolve_live_ids(out_of_zone_ids)
+        if self.enable_stitching and self.stitcher is not None:
+            mapped_raw = {self.stitcher.resolve_canonical_id(rid) for rid in live_raw_ids}
+            live_ids = mapped_raw | self.stitcher.retained_canonical_ids(timestamp_s)
+        else:
+            live_ids = live_raw_ids
         self.speed_estimator.prune_stale_tracks(live_ids)
 
-        conflicts = self.conflict_analyzer.analyze_frame(speed_readings)
+        conflicts = self.conflict_analyzer.analyze_frame(
+            speed_readings, timestamp_s=timestamp_s
+        )
         conflict_map, ped_conflict_map = build_conflict_maps(conflicts)
 
         # 事件去抖状态机推进后立刻弹出已冷却归档的事件写入 events.jsonl。
@@ -591,9 +665,10 @@ class ConflictPerceptionPipeline:
             for t in tracks:
                 if t.track_id is None:
                     continue
-                r = reading_map.get(t.track_id)
+                eff_id = id_map.get(t.track_id, t.track_id) if self.enable_stitching else t.track_id
+                r = reading_map.get(eff_id)
                 if r:
-                    c = conflict_map.get(t.track_id) or ped_conflict_map.get(t.track_id)
+                    c = conflict_map.get(eff_id) or ped_conflict_map.get(eff_id)
                     eid = (
                         event_ids.get((c.veh_track_id, c.ped_track_id))
                         if c is not None else None
@@ -703,6 +778,7 @@ class ConflictPerceptionPipeline:
 
             self._configure_speed_estimator(fps)
             self._configure_event_tracker(fps)
+            self._configure_conflict_and_stitcher()
             session = TrackingSession(
                 source=src_label,
                 weights=self.weights,
@@ -902,6 +978,9 @@ class ConflictPerceptionPipeline:
             "total_speeding_alerts": counts["speeding"],
             "total_caution_events": counts["caution"],
             "total_critical_conflicts": counts["critical"],
+            "stitched_track_count": (
+                self.stitcher.stitched_track_count if self.stitcher is not None else 0
+            ),
         }
 
         self._write_summary_file(out_dir, summary)
@@ -1031,6 +1110,7 @@ class ConflictPerceptionPipeline:
 
             self._configure_speed_estimator(fps)
             self._configure_event_tracker(fps)
+            self._configure_conflict_and_stitcher()
             configuration = self._configuration_snapshot(
                 fps, input_mode="tracks_jsonl", source_tracks=str(tracks_file)
             )
@@ -1229,6 +1309,9 @@ class ConflictPerceptionPipeline:
             "total_speeding_alerts": counts["speeding"],
             "total_caution_events": counts["caution"],
             "total_critical_conflicts": counts["critical"],
+            "stitched_track_count": (
+                self.stitcher.stitched_track_count if self.stitcher is not None else 0
+            ),
         }
         self._write_summary_file(out_dir, summary)
         return summary

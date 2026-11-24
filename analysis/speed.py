@@ -12,8 +12,11 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
+import numpy as np
+
+from .kalman import ConstantAccelerationKalman2D
 from .policy import ObjectPolicy, object_policy
 
 
@@ -21,9 +24,16 @@ def _is_finite_number(value) -> bool:
     # Python 中 bool 是 int 子类，需先排除布尔值避免 True/False 当数值通过校验。
     return (
         type(value) is not bool
-        and isinstance(value, (int, float))
-        and math.isfinite(value)
+        and not isinstance(value, np.bool_)
+        and isinstance(value, (int, float, np.integer, np.floating))
+        and math.isfinite(float(value))
     )
+
+
+def _validate_estimator_mode(estimator_mode: str) -> str:
+    if type(estimator_mode) is not str or estimator_mode not in ("ema", "kalman"):
+        raise ValueError("estimator_mode 必须是 'ema' 或 'kalman'")
+    return estimator_mode
 
 
 @dataclass
@@ -43,6 +53,10 @@ class SpeedReading:
     is_stationary: bool = False  # 是否持续静止（泊车/停靠），需连续多帧低速确认
     in_parking_zone: bool = False  # 是否位于标定的路侧停车区多边形内
     object_kind: str = ""      # pedestrian | bicycle | motorcycle | car | bus | truck | motor_vehicle
+    ax_ms2: float = 0.0        # X 轴加速度分量 (米/秒^2)
+    ay_ms2: float = 0.0        # Y 轴加速度分量 (米/秒^2)
+    pos_std_m: Optional[float] = None  # 滤波位置标准差 (米)
+    pos_cov_m2: Optional[Tuple[float, float, float, float]] = None  # 2x2 位置协方差展开 (cxx, cxy, cyx, cyy)
 
     def __post_init__(self):
         if not self.object_kind:
@@ -64,6 +78,7 @@ class TrackMotionTracker:
         reliable_min_span_s: float = 0.2,
         object_kind: str | None = None,
         object_policies: dict[str, ObjectPolicy] | None = None,
+        estimator_mode: str = "ema",
     ):
         if type(window_size) is not int or window_size < 3:
             raise ValueError("window_size 必须是 >= 3 的整数帧数")
@@ -77,6 +92,7 @@ class TrackMotionTracker:
             raise ValueError("stationary_min_frames 必须是 >= 1 的整数帧数")
         if not _is_finite_number(reliable_min_span_s) or reliable_min_span_s < 0:
             raise ValueError("reliable_min_span_s 必须为有限非负数")
+        _validate_estimator_mode(estimator_mode)
 
         self.track_id = track_id
         self.category = category
@@ -87,6 +103,7 @@ class TrackMotionTracker:
         self.stationary_min_frames = stationary_min_frames
         self.reliable_min_span_s = float(reliable_min_span_s)
         self.object_policies = object_policies
+        self.estimator_mode = estimator_mode
         # 类别为车辆时，过滤误传入的 person/pedestrian 标签（含 Mock 占位对象），
         # 避免把车辆的碰撞安全半径错误缩减成行人半径。
         if category in ("pedestrian", "person"):
@@ -109,6 +126,13 @@ class TrackMotionTracker:
         self.smoothed_vy = 0.0
         self.has_valid_velocity = False
 
+        # 卡尔曼滤波器实例（仅 kalman 模式创建）
+        self._kalman: Optional[ConstantAccelerationKalman2D] = (
+            ConstantAccelerationKalman2D(category=category)
+            if estimator_mode == "kalman"
+            else None
+        )
+
         # 最后一个有限观测位置/时间戳与持续静止帧计数
         self._last_valid_xy: Optional[Tuple[float, float]] = None
         self._last_timestamp_s: Optional[float] = None
@@ -130,14 +154,102 @@ class TrackMotionTracker:
         if self._pending_count >= confirm_frames:
             self.category = category
             self._pending_category, self._pending_count = None, 0
+            if self._kalman is not None:
+                self._kalman.set_category(category)
 
-    def update(self, timestamp_s: float, x_m: float, y_m: float) -> SpeedReading:
+    def _kalman_extras(self) -> Tuple[float, float, Optional[float], Optional[Tuple[float, float, float, float]]]:
+        """读取卡尔曼加速度与位置不确定度；未初始化或 EMA 模式返回默认值。"""
+        if self._kalman is None or self._kalman.update_count == 0:
+            return 0.0, 0.0, None, None
+        ax, ay = self._kalman.acceleration_xy
+        cov = self._kalman.pos_cov_2x2
+        pos_cov_tuple = (
+            float(cov[0, 0]),
+            float(cov[0, 1]),
+            float(cov[1, 0]),
+            float(cov[1, 1]),
+        )
+        return ax, ay, self._kalman.pos_std_m, pos_cov_tuple
+
+    def _apply_micro_truncation(self, mag_ms: float) -> Tuple[float, float]:
+        """应用行人与车辆微动速度显示截断，返回 (speed_ms, speed_kmh)。"""
+        speed_ms = mag_ms
+        speed_kmh = speed_ms * 3.6
+        if self.category in ("pedestrian", "person") and speed_kmh < 0.8:
+            return 0.0, 0.0
+        if self.category == "vehicle" and speed_kmh < 1.0:
+            return 0.0, 0.0
+        return speed_ms, speed_kmh
+
+    def _finalize_kinematics_reading(
+        self,
+        x_m: float,
+        y_m: float,
+        vx_ms: float,
+        vy_ms: float,
+        dt_span_s: float,
+        ax_ms2: float = 0.0,
+        ay_ms2: float = 0.0,
+        pos_std_m: Optional[float] = None,
+        pos_cov_m2: Optional[Tuple[float, float, float, float]] = None,
+    ) -> SpeedReading:
+        """统一计算静止滞回、微动截断、航向角、超速与可信度判定。"""
+        # 静止判定必须使用截断前的平滑速度幅值：
+        # 微动截断（<1 km/h 显示为 0）只影响展示标量，
+        # 若用截断后值判定，0.2 m/s 蠕行车辆会被误豁免为"泊车"导致碰撞漏报
+        smoothed_mag = math.hypot(vx_ms, vy_ms)
+        if len(self.history) >= 3:
+            if smoothed_mag < self.stationary_speed_ms:
+                self._stationary_streak += 1
+            else:
+                self._stationary_streak = 0
+        is_stationary = self._stationary_streak >= self.stationary_min_frames
+
+        speed_ms, speed_kmh = self._apply_micro_truncation(smoothed_mag)
+        heading = (math.degrees(math.atan2(vy_ms, vx_ms)) + 360.0) % 360.0
+        is_speeding = (
+            len(self.history) >= 3
+            and (self.category == "vehicle")
+            and (speed_kmh > self.speed_limit_kmh)
+        )
+        min_samples = min(4, self.window_size)
+        is_reliable = (
+            len(self.history) >= min_samples and dt_span_s >= self.reliable_min_span_s
+        )
+        return SpeedReading(
+            track_id=self.track_id,
+            category=self.category,
+            x_m=x_m,
+            y_m=y_m,
+            vx_ms=vx_ms,
+            vy_ms=vy_ms,
+            speed_ms=speed_ms,
+            speed_kmh=speed_kmh,
+            is_speeding=is_speeding,
+            heading_deg=heading,
+            is_reliable=is_reliable,
+            is_stationary=is_stationary,
+            object_kind=self.object_kind,
+            ax_ms2=ax_ms2,
+            ay_ms2=ay_ms2,
+            pos_std_m=pos_std_m,
+            pos_cov_m2=pos_cov_m2,
+        )
+
+    def update(
+        self,
+        timestamp_s: float,
+        x_m: float,
+        y_m: float,
+        obs_cov_m2: Optional[np.ndarray] = None,
+    ) -> SpeedReading:
         """输入当前帧物理坐标与时间戳，更新运动滤波器状态"""
         # 非有限观测（如地平线附近的退化投影点）不进入历史，
-        # 否则 NaN 经差分进入 EMA 后会使平滑速度永久不可恢复；
+        # 否则 NaN 经差分进入 EMA/Kalman 后会使平滑速度永久不可恢复；
         # 读数回填最后有效位置，不把 NaN 暴露给下游渲染/研判
         if not (_is_finite_number(timestamp_s) and _is_finite_number(x_m) and _is_finite_number(y_m)):
             x_out, y_out = self._last_valid_xy if self._last_valid_xy is not None else (0.0, 0.0)
+            ax_out, ay_out, std_out, cov_out = self._kalman_extras()
             return SpeedReading(
                 track_id=self.track_id,
                 category=self.category,
@@ -152,23 +264,58 @@ class TrackMotionTracker:
                 is_reliable=False,
                 is_stationary=self._stationary_streak >= self.stationary_min_frames,
                 object_kind=self.object_kind,
+                ax_ms2=ax_out,
+                ay_ms2=ay_out,
+                pos_std_m=std_out,
+                pos_cov_m2=cov_out,
             )
+
+        ts = float(timestamp_s)
+        xm = float(x_m)
+        ym = float(y_m)
 
         # 时间戳必须严格递增：回退/重复观测会让窗口差分 dt <= 0，
         # 静默写历史会得到失真速度读数，宁可响亮失败
-        if self._last_timestamp_s is not None and timestamp_s <= self._last_timestamp_s:
+        if self._last_timestamp_s is not None and ts <= self._last_timestamp_s:
             raise ValueError("timestamp_s 必须逐帧严格递增")
-        self._last_timestamp_s = timestamp_s
-        self._last_valid_xy = (x_m, y_m)
-        self.history.append((timestamp_s, x_m, y_m))
+
+        if self.estimator_mode == "kalman":
+            assert self._kalman is not None
+            self._last_timestamp_s = ts
+            self.history.append((ts, xm, ym))
+            self._kalman.update(ts, xm, ym, obs_cov_m2=obs_cov_m2)
+
+            kf_x, kf_y = self._kalman.position_xy
+            kf_vx, kf_vy = self._kalman.velocity_xy
+            kf_ax, kf_ay, pos_std, pos_cov_tuple = self._kalman_extras()
+            self._last_valid_xy = (kf_x, kf_y)
+            self.smoothed_vx = kf_vx
+            self.smoothed_vy = kf_vy
+            self.has_valid_velocity = len(self.history) >= 2
+            dt_span = self.history[-1][0] - self.history[0][0]
+            return self._finalize_kinematics_reading(
+                x_m=kf_x,
+                y_m=kf_y,
+                vx_ms=kf_vx,
+                vy_ms=kf_vy,
+                dt_span_s=dt_span,
+                ax_ms2=kf_ax,
+                ay_ms2=kf_ay,
+                pos_std_m=pos_std,
+                pos_cov_m2=pos_cov_tuple,
+            )
+
+        self._last_timestamp_s = ts
+        self._last_valid_xy = (xm, ym)
+        self.history.append((ts, xm, ym))
 
         # 样本少于 3 个点时处于预热状态，速度不作为强判断
         if len(self.history) < 3:
             return SpeedReading(
                 track_id=self.track_id,
                 category=self.category,
-                x_m=x_m,
-                y_m=y_m,
+                x_m=xm,
+                y_m=ym,
                 vx_ms=0.0,
                 vy_ms=0.0,
                 speed_ms=0.0,
@@ -210,53 +357,12 @@ class TrackMotionTracker:
                 self.ema_alpha * raw_vy + (1.0 - self.ema_alpha) * self.smoothed_vy
             )
 
-        # 静止判定必须使用截断前的平滑速度幅值：
-        # 微动截断（<1 km/h 显示为 0）只影响展示标量，
-        # 若用截断后值判定，0.2 m/s 蠕行车辆会被误豁免为"泊车"导致碰撞漏报
-        smoothed_mag = math.hypot(self.smoothed_vx, self.smoothed_vy)
-        if smoothed_mag < self.stationary_speed_ms:
-            self._stationary_streak += 1
-        else:
-            self._stationary_streak = 0
-        is_stationary = self._stationary_streak >= self.stationary_min_frames
-
-        speed_ms = smoothed_mag
-        speed_kmh = speed_ms * 3.6
-
-        # 行人微动阈值截断（静止站立摆动不计为移动速度）
-        if self.category in ("pedestrian", "person") and speed_kmh < 0.8:
-            speed_ms, speed_kmh = 0.0, 0.0
-        elif self.category == "vehicle" and speed_kmh < 1.0:
-            speed_ms, speed_kmh = 0.0, 0.0
-
-        # 方向角计算 (0~360度，以地面 +X 轴为 0 度，朝 +Y 轴正向)
-        heading = (math.degrees(math.atan2(self.smoothed_vy, self.smoothed_vx)) + 360.0) % 360.0
-
-        # 超速研判：车辆且车速超过 30 km/h (可设容差如 1.0 km/h)
-        is_speeding = (self.category == "vehicle") and (speed_kmh > self.speed_limit_kmh)
-
-        # 可信判定需同时满足样本数与时间跨度下限：
-        # 仅按样本数判定会让高 FPS 视频的 4 帧（仅 0.12s）过早收敛、
-        # 低 FPS 的稀疏观测却长期不可信；跨度下限使跨帧率语义一致
-        min_samples = min(4, self.window_size)
-        is_reliable = (
-            len(self.history) >= min_samples and dt >= self.reliable_min_span_s
-        )
-
-        return SpeedReading(
-            track_id=self.track_id,
-            category=self.category,
-            x_m=x_m,
-            y_m=y_m,
+        return self._finalize_kinematics_reading(
+            x_m=xm,
+            y_m=ym,
             vx_ms=self.smoothed_vx,
             vy_ms=self.smoothed_vy,
-            speed_ms=speed_ms,
-            speed_kmh=speed_kmh,
-            is_speeding=is_speeding,
-            heading_deg=heading,
-            is_reliable=is_reliable,
-            is_stationary=is_stationary,
-            object_kind=self.object_kind,
+            dt_span_s=dt,
         )
 
 
@@ -273,6 +379,7 @@ class SpeedEstimator:
         category_confirm_frames: int = 3,
         object_policies: dict[str, ObjectPolicy] | None = None,
         reliable_min_span_s: float = 0.2,
+        estimator_mode: str = "ema",
     ):
         if not _is_finite_number(ema_alpha) or not (0 < ema_alpha <= 1):
             raise ValueError("ema_alpha 必须在 (0, 1] 区间")
@@ -288,6 +395,8 @@ class SpeedEstimator:
             raise ValueError("category_confirm_frames 必须是 >= 1 的整数帧数")
         if not _is_finite_number(reliable_min_span_s) or reliable_min_span_s < 0:
             raise ValueError("reliable_min_span_s 必须为有限非负数")
+        _validate_estimator_mode(estimator_mode)
+
         self.speed_limit_kmh = float(speed_limit_kmh)
         self.window_size = window_size
         self.ema_alpha = float(ema_alpha)
@@ -296,11 +405,18 @@ class SpeedEstimator:
         self.category_confirm_frames = category_confirm_frames
         self.object_policies = object_policies
         self.reliable_min_span_s = float(reliable_min_span_s)
+        self.estimator_mode = estimator_mode
         self.tracks: Dict[int, TrackMotionTracker] = {}
 
     def update(
-        self, track_id: int, category: str, timestamp_s: float, x_m: float, y_m: float,
+        self,
+        track_id: int,
+        category: str,
+        timestamp_s: float,
+        x_m: float,
+        y_m: float,
         object_kind: str | None = None,
+        obs_cov_m2: Optional[np.ndarray] = None,
     ) -> SpeedReading:
         """更新单个目标并输出速度测算"""
         if track_id not in self.tracks:
@@ -315,6 +431,7 @@ class SpeedEstimator:
                 reliable_min_span_s=self.reliable_min_span_s,
                 object_kind=object_kind,
                 object_policies=self.object_policies,
+                estimator_mode=self.estimator_mode,
             )
         else:
             tracker = self.tracks[track_id]
@@ -355,7 +472,28 @@ class SpeedEstimator:
                         tracker.object_kind = object_policy(
                             safe_kind, tracker.category, tracker.object_policies
                         ).kind
+        if obs_cov_m2 is not None:
+            return self.tracks[track_id].update(
+                timestamp_s, x_m, y_m, obs_cov_m2=obs_cov_m2
+            )
         return self.tracks[track_id].update(timestamp_s, x_m, y_m)
+
+    def transfer_track_state(self, old_track_id: int, new_track_id: int) -> bool:
+        """将已有轨迹的滤波状态迁移至 new_track_id 并同步更新 tracker.track_id。"""
+        if type(old_track_id) is not int or type(new_track_id) is not int:
+            raise ValueError("old_track_id 与 new_track_id 必须是整数")
+        if old_track_id < 0 or new_track_id < 0:
+            raise ValueError("track_id 不能为负数")
+        tracker = self.tracks.get(old_track_id)
+        if tracker is None:
+            return False
+        if old_track_id == new_track_id:
+            tracker.track_id = new_track_id
+            return True
+        self.tracks.pop(old_track_id)
+        tracker.track_id = new_track_id
+        self.tracks[new_track_id] = tracker
+        return True
 
     def prune_stale_tracks(self, live_track_ids: set[int]):
         """清理已终结或离场的轨迹实例，防止内存泄漏"""
