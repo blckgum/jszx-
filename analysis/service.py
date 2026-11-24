@@ -13,16 +13,22 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import deque
 import csv
 from dataclasses import dataclass, field
 import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional
@@ -66,7 +72,51 @@ _NON_CALIB_CONFIG_NAMES = {
     "ground_truth.example.yaml",
     "traffic.example.yaml",
 }
+_ALLOWED_RUN_EXPORT_FILES: Dict[str, str] = {
+    "summary.json": "application/json; charset=utf-8",
+    "speeds.csv": "text/csv; charset=utf-8",
+    "conflicts.jsonl": "application/x-ndjson; charset=utf-8",
+    "events.jsonl": "application/x-ndjson; charset=utf-8",
+    "annotated_conflict.mp4": "video/mp4",
+}
+_ALLOWED_DIALOG_KINDS = ("video", "calib", "folder")
+_DIALOG_LOCK = threading.Lock()
 _VIDEO_STREAM_CHUNK_SIZE = 65536
+
+
+class _ServiceForbiddenError(PermissionError):
+    """未开启关闭权限等禁止操作异常（映射 HTTP 403）。"""
+
+
+class _ServiceConflictError(RuntimeError):
+    """运行目录正被活动任务占用导致的冲突异常（映射 HTTP 409）。"""
+
+
+class _DialogUnavailableError(RuntimeError):
+    """当前环境无法打开图形文件对话框（映射 HTTP 501）。"""
+
+
+def _validate_single_segment_filename(filename: Any, *, label: str = "filename") -> str:
+    """校验单层文件名不含目录分隔符、空字符或相对穿越片段。"""
+    if not isinstance(filename, str) or not filename.strip():
+        raise ValueError(f"{label} 不能为空")
+    stripped = filename.strip()
+    decoded = unquote(stripped)
+    twice = unquote(decoded)
+    for candidate in (filename, stripped, decoded, twice):
+        if (
+            not candidate.strip()
+            or candidate in (".", "..")
+            or candidate.startswith(".")
+            or ".." in candidate
+            or "/" in candidate
+            or "\\" in candidate
+            or ":" in candidate
+            or "\x00" in candidate
+            or Path(candidate).name != candidate
+        ):
+            raise ValueError(f"非法的 {label}（禁止目录穿越）: {filename}")
+    return stripped
 
 
 def _decode_and_validate_asset_subpath(raw_subpath: str) -> str:
@@ -482,6 +532,9 @@ class AnalysisService:
         default_calib: str | Path = "configs/calibration.yaml",
         web_root: Optional[str | Path] = None,
         max_alert_queue: int = 200,
+        desktop_mode: bool = False,
+        allow_shutdown: bool = False,
+        shutdown_callback: Optional[Callable[[], None]] = None,
     ):
         if is_blank_path(runs_root) or type(runs_root) is bool or not isinstance(runs_root, (str, os.PathLike)):
             raise ValueError("runs_root 必须是非空目录路径")
@@ -493,6 +546,12 @@ class AnalysisService:
             raise ValueError("web_root 必须是非空目录路径")
         if type(max_alert_queue) is not int or max_alert_queue < 1:
             raise ValueError("max_alert_queue 必须是 >= 1 的整数")
+        if type(desktop_mode) is not bool:
+            raise ValueError("desktop_mode 必须是布尔值")
+        if type(allow_shutdown) is not bool:
+            raise ValueError("allow_shutdown 必须是布尔值")
+        if shutdown_callback is not None and not callable(shutdown_callback):
+            raise ValueError("shutdown_callback 必须可调用")
 
         self.runs_root = Path(runs_root).expanduser().resolve()
         self.default_calib = Path(default_calib).expanduser().resolve()
@@ -500,6 +559,9 @@ class AnalysisService:
             Path(web_root).expanduser().resolve() if web_root is not None else DEFAULT_WEB_ROOT
         )
         self.max_alert_queue = max_alert_queue
+        self.desktop_mode = desktop_mode
+        self.allow_shutdown = allow_shutdown
+        self._shutdown_callback = shutdown_callback
         self._lock = threading.Lock()
         self._jobs: Dict[str, _ServiceJob] = {}
 
@@ -1091,6 +1153,477 @@ class AnalysisService:
             if finished:
                 break
 
+    def _discover_weight_files(self) -> List[dict]:
+        """扫描仓库根目录、weights/ 与 checkpoints/ 下的 .pt 模型权重文件。"""
+        repo_root = Path(__file__).resolve().parents[1]
+        cwd_resolved = Path.cwd().resolve()
+        scan_bases = list(dict.fromkeys((repo_root, cwd_resolved, self.runs_root.parent)))
+        label_roots = tuple(scan_bases)
+        seen: Dict[Path, dict] = {}
+
+        def _register_weight(path_obj: Path) -> None:
+            if not path_obj.is_file() or path_obj.suffix.lower() != ".pt":
+                return
+            resolved = path_obj.resolve()
+            if resolved not in seen:
+                seen[resolved] = {
+                    "label": self._format_preset_label(resolved, roots=label_roots),
+                    "path": str(resolved),
+                }
+
+        for base in scan_bases:
+            if not base.is_dir():
+                continue
+            for entry in sorted(base.glob("*.pt")):
+                if not entry.name.startswith("."):
+                    _register_weight(entry)
+            for sub_name in ("weights", "checkpoints"):
+                sub_dir = base / sub_name
+                if not sub_dir.is_dir():
+                    continue
+                for entry in sorted(sub_dir.rglob("*.pt")):
+                    try:
+                        rel_parts = entry.relative_to(sub_dir).parts
+                    except ValueError:
+                        continue
+                    if any(part.startswith(".") for part in rel_parts):
+                        continue
+                    _register_weight(entry)
+
+        if DEFAULT_WEIGHTS.is_file():
+            _register_weight(DEFAULT_WEIGHTS)
+
+        return sorted(seen.values(), key=lambda item: (item["label"], item["path"]))
+
+    def get_system_info(self) -> dict:
+        """探测运行环境、图形文件对话框能力、CUDA 可用性及本地权重清单。"""
+        can_browse = False
+        try:
+            can_browse = importlib.util.find_spec("tkinter") is not None
+        except Exception:
+            can_browse = False
+
+        cuda_available = False
+        try:
+            if importlib.util.find_spec("torch") is not None:
+                import torch  # 懒加载，严禁在模块顶层导入
+
+                cuda_available = bool(torch.cuda.is_available())
+        except Exception:
+            cuda_available = False
+
+        jobs = self.list_jobs()
+        active_jobs = sum(1 for item in jobs if item["status"] in ("queued", "running"))
+        total_runs = len(self.list_runs())
+
+        return {
+            "python_version": platform.python_version(),
+            "platform": platform.platform(),
+            "desktop_mode": bool(self.desktop_mode),
+            "allow_shutdown": bool(self.allow_shutdown),
+            "can_browse_files": bool(can_browse),
+            "cuda_available": bool(cuda_available),
+            "runs_root": str(self.runs_root),
+            "default_calib": str(self.default_calib),
+            "weights": self._discover_weight_files(),
+            "active_jobs": active_jobs,
+            "total_runs": total_runs,
+        }
+
+    def stop_active_jobs(self, *, wait_timeout_s: float = 2.0) -> List[dict]:
+        """停止全部处于 queued/running 状态的分析任务。"""
+        if not _is_finite_real(wait_timeout_s) or float(wait_timeout_s) < 0.0:
+            raise ValueError("wait_timeout_s 必须为非负有限数")
+        with self._lock:
+            jobs = list(self._jobs.values())
+        active: List[_ServiceJob] = []
+        for job in jobs:
+            with job.cond:
+                if job.status in ("queued", "running"):
+                    job.stop_event.set()
+                    job.cond.notify_all()
+                    active.append(job)
+        deadline = time.monotonic() + float(wait_timeout_s)
+        for job in active:
+            if job.thread is not None and job.thread.is_alive():
+                rem = max(0.0, deadline - time.monotonic())
+                job.thread.join(timeout=rem)
+        return [self._job_to_dict(job) for job in active]
+
+    def request_shutdown(self) -> dict:
+        """授权模式下停止活动任务并异步触发桌面宿主关闭回调。"""
+        if not self.allow_shutdown:
+            raise _ServiceForbiddenError("当前服务未开启关闭权限 (allow_shutdown=False)")
+        self.stop_active_jobs(wait_timeout_s=2.0)
+        cb = self._shutdown_callback
+        if cb is not None:
+            def _run_cb() -> None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+            timer = threading.Timer(0.15, _run_cb)
+            timer.daemon = True
+            timer.start()
+        return {"status": "shutting_down"}
+
+    def browse_file_dialog(self, kind: str) -> dict:
+        """通过懒导入 tkinter 打开系统原生文件/目录选择框（线程锁保护）。"""
+        if not isinstance(kind, str) or kind not in _ALLOWED_DIALOG_KINDS:
+            raise ValueError(f"kind 必须是 {_ALLOWED_DIALOG_KINDS} 之一")
+
+        with _DIALOG_LOCK:
+            try:
+                import tkinter as tk  # 懒加载，兼容无 GUI 的 Ubuntu CI
+                from tkinter import filedialog
+            except Exception as exc:
+                raise _DialogUnavailableError(f"当前环境未安装 tkinter 图形界面支持: {exc}") from exc
+
+            tcl_error_cls = getattr(tk, "TclError", RuntimeError)
+            root = None
+            try:
+                root = tk.Tk()
+                root.withdraw()
+                try:
+                    root.attributes("-topmost", True)
+                except Exception:
+                    pass
+                try:
+                    root.update_idletasks()
+                except Exception:
+                    pass
+
+                if kind == "folder":
+                    init_dir = str(self.runs_root if self.runs_root.is_dir() else Path.cwd())
+                    selected = filedialog.askdirectory(
+                        parent=root,
+                        title="选择目录",
+                        initialdir=init_dir,
+                    )
+                elif kind == "calib":
+                    init_dir = str(
+                        self.default_calib.parent
+                        if self.default_calib.parent.is_dir()
+                        else Path.cwd()
+                    )
+                    selected = filedialog.askopenfilename(
+                        parent=root,
+                        title="选择道路标定 YAML 文件",
+                        initialdir=init_dir,
+                        filetypes=[
+                            ("YAML 标定文件", "*.yaml *.yml"),
+                            ("所有文件", "*.*"),
+                        ],
+                    )
+                else:
+                    init_dir = str(
+                        self.runs_root.parent
+                        if self.runs_root.parent.is_dir()
+                        else Path.cwd()
+                    )
+                    selected = filedialog.askopenfilename(
+                        parent=root,
+                        title="选择视频文件",
+                        initialdir=init_dir,
+                        filetypes=[
+                            ("视频文件", "*.mp4 *.avi *.mov *.mkv *.webm *.m4v"),
+                            ("所有文件", "*.*"),
+                        ],
+                    )
+            except Exception as exc:
+                if (
+                    isinstance(exc, (tcl_error_cls, RuntimeError))
+                    or "tcl" in type(exc).__name__.lower()
+                    or "display" in str(exc).lower()
+                ):
+                    raise _DialogUnavailableError(f"无法初始化系统文件对话框: {exc}") from exc
+                raise
+            finally:
+                if root is not None:
+                    try:
+                        root.destroy()
+                    except Exception:
+                        pass
+
+        clean_path = (
+            str(selected).strip()
+            if isinstance(selected, (str, os.PathLike)) and str(selected).strip()
+            else None
+        )
+        return {
+            "cancelled": clean_path is None,
+            "path": clean_path,
+        }
+
+    def resolve_run_export_file(self, run_id: str, filename: str) -> tuple[Path, str]:
+        """校验导出文件名在白名单内并解析 run_dir 下的导出文件路径与 MIME 类型。"""
+        clean_name = _validate_single_segment_filename(filename, label="导出文件名")
+        media_type = _ALLOWED_RUN_EXPORT_FILES.get(clean_name)
+        if media_type is None:
+            raise ValueError(f"不允许导出的文件名: {filename}")
+        run_dir = self._resolve_run_dir(run_id)
+        target = (run_dir / clean_name).resolve()
+        if target == run_dir or not target.is_relative_to(run_dir):
+            raise ValueError(f"非法的导出文件路径: {filename}")
+        if not target.is_file():
+            raise FileNotFoundError(f"运行目录缺少导出文件 {clean_name}: {run_id}")
+        return target, media_type
+
+    def delete_run(self, run_id: str) -> dict:
+        """安全删除指定历史运行目录；若仍有活动任务占用则返回 409 冲突。"""
+        run_dir = self._resolve_run_dir(run_id)
+        with self._lock:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            with job.cond:
+                is_active = job.status in ("queued", "running")
+                job_out = Path(job.output_dir).resolve()
+            if is_active and (
+                job_out == run_dir
+                or job_out.is_relative_to(run_dir)
+                or run_dir.is_relative_to(job_out)
+            ):
+                raise _ServiceConflictError(
+                    f"运行目录 {run_id} 正被活动任务 {job.job_id} 占用，无法删除"
+                )
+        shutil.rmtree(run_dir)
+        return {"deleted": True, "run_id": run_id}
+
+    def generate_run_charts(self, run_id: str) -> dict:
+        """懒导入 analysis.charts 为指定运行记录生成车速与风险时间轴 PNG 图表。"""
+        run_dir = self._resolve_run_dir(run_id)
+        charts_dir = (run_dir / "charts").resolve()
+        if charts_dir == run_dir or not charts_dir.is_relative_to(run_dir):
+            raise ValueError(f"非法的图表目录路径: {run_id}")
+        from .charts import plot_run_timeline
+
+        rendered_paths = plot_run_timeline(run_dir, charts_dir)
+        charts = []
+        for item in rendered_paths:
+            name = Path(item).name
+            charts.append({
+                "name": name,
+                "url": f"/api/runs/{run_id}/charts/{name}",
+            })
+        return {
+            "run_id": run_id,
+            "charts": charts,
+        }
+
+    def resolve_run_chart_file(self, run_id: str, filename: str) -> Path:
+        """严格校验并返回 run_dir/charts 下单层 .png 图表路径。"""
+        clean_name = _validate_single_segment_filename(filename, label="图表文件名")
+        if Path(clean_name).suffix.lower() != ".png":
+            raise ValueError(f"仅允许访问 .png 图表文件: {filename}")
+        run_dir = self._resolve_run_dir(run_id)
+        charts_root = (run_dir / "charts").resolve()
+        if charts_root == run_dir or not charts_root.is_relative_to(run_dir):
+            raise ValueError(f"非法的图表目录路径: {run_id}")
+        target = (charts_root / clean_name).resolve()
+        if target == charts_root or not target.is_relative_to(charts_root):
+            raise ValueError(f"非法的图表路径（越出 charts 目录）: {filename}")
+        if not target.is_file():
+            raise FileNotFoundError(f"未找到指定图表文件: {clean_name}")
+        return target
+
+    def open_run_folder(self, run_id: str) -> dict:
+        """在桌面文件管理器中打开指定运行目录。"""
+        run_dir = self._resolve_run_dir(run_id)
+        startfile_fn = getattr(os, "startfile", None)
+        if sys.platform.startswith("win") and callable(startfile_fn):
+            startfile_fn(str(run_dir))
+        else:
+            cmd_name = "open" if sys.platform == "darwin" else "xdg-open"
+            opener = shutil.which(cmd_name)
+            if opener:
+                subprocess.Popen(
+                    [opener, str(run_dir)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        return {"opened": True, "path": str(run_dir)}
+
+    def extract_calibration_frame(self, source: Any, frame_index: int = 0) -> dict:
+        """从本地视频文件抽取指定帧并编码为 JPEG Base64 Data URL。"""
+        if type(source) is not str or is_blank_path(source):
+            raise ValueError("source 必须是非空本地视频文件路径")
+        if type(frame_index) is not int or frame_index < 0:
+            raise ValueError("frame_index 必须是非负整数")
+
+        src_path = Path(source).expanduser().resolve()
+        if not src_path.is_file():
+            raise FileNotFoundError(f"未找到视频文件: {src_path}")
+
+        cap = cv2.VideoCapture(str(src_path))
+        try:
+            if not cap.isOpened():
+                raise ValueError(f"无法打开视频文件: {src_path.name}")
+            raw_total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            raw_fps = cap.get(cv2.CAP_PROP_FPS)
+            total_frames = int(raw_total) if _is_finite_real(raw_total) and raw_total > 0 else 0
+            fps = round(float(raw_fps), 3) if _is_finite_real(raw_fps) and raw_fps > 0 else 25.0
+
+            if frame_index > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, float(frame_index))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                if frame_index == 0:
+                    raise ValueError(f"无法从视频文件解码图像帧: {src_path.name}")
+                raise FileNotFoundError(f"未找到指定帧号 {frame_index}（总帧数: {total_frames}）")
+
+            height, width = frame.shape[:2]
+            ok_enc, buf = cv2.imencode(
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88]
+            )
+            if not ok_enc:
+                raise RuntimeError("标定视频帧 JPEG 编码失败")
+            data_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            return {
+                "width": int(width),
+                "height": int(height),
+                "frame_count": int(total_frames),
+                "fps": float(fps),
+                "frame_index": int(frame_index),
+                "image_data_url": f"data:image/jpeg;base64,{data_b64}",
+            }
+        finally:
+            cap.release()
+
+    @staticmethod
+    def _build_calibrator_from_payload(payload: dict, *, synthetic: bool = False) -> RoadCalibrator:
+        """从预览/保存请求体构造并校验 RoadCalibrator（含像素停车区投射）。"""
+        if not isinstance(payload, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        if "image_points" not in payload:
+            raise ValueError("请求体缺少必需字段: image_points")
+
+        image_points = payload["image_points"]
+        ground_points = payload.get("ground_points")
+        parking_zones = payload.get("parking_zones")
+        parking_zones_image = payload.get("parking_zones_image")
+        use_ransac = True if payload.get("use_ransac") is None else payload.get("use_ransac")
+        name = "campus_road" if payload.get("name") is None else payload.get("name")
+        ransac_thresh = (
+            0.5
+            if payload.get("ransac_reproj_threshold_m") is None
+            else payload.get("ransac_reproj_threshold_m")
+        )
+
+        if ground_points is not None:
+            calibrator = RoadCalibrator.from_correspondences(
+                image_points=image_points,
+                ground_points=ground_points,
+                name=name,
+                synthetic=synthetic,
+                parking_zones=parking_zones,
+                use_ransac=use_ransac,
+                ransac_reproj_threshold_m=ransac_thresh,
+            )
+        else:
+            if "width_m" not in payload or "length_m" not in payload:
+                raise ValueError("未提供 ground_points 时必须提供 width_m 与 length_m")
+            calibrator = RoadCalibrator(
+                image_points=image_points,
+                width_m=payload["width_m"],
+                length_m=payload["length_m"],
+                name=name,
+                synthetic=synthetic,
+                parking_zones=parking_zones,
+            )
+
+        if parking_zones_image is not None:
+            if not isinstance(parking_zones_image, (list, tuple)):
+                raise ValueError("parking_zones_image 必须是像素多边形列表")
+            for poly in parking_zones_image:
+                calibrator.add_parking_zone_pixels(poly)
+
+        return calibrator
+
+    def preview_calibration(self, payload: dict) -> dict:
+        """求解并返回道路单应性标定预览结果（重投影 RMSE、内点数与地面坐标）。"""
+        calibrator = self._build_calibrator_from_payload(payload, synthetic=False)
+        result = {
+            "valid": True,
+            "reprojection_rmse_m": round(float(calibrator.reprojection_rmse_m), 6),
+            "inlier_count": int(calibrator.inlier_count),
+            "width_m": round(float(calibrator.width_m), 6),
+            "length_m": round(float(calibrator.length_m), 6),
+            "ground_points": [
+                [round(float(x), 6), round(float(y), 6)]
+                for x, y in calibrator.ground_points
+            ],
+            "parking_zones": [
+                [
+                    [round(float(x), 6), round(float(y), 6)]
+                    for x, y in zone
+                ]
+                for zone in calibrator.parking_zones
+            ],
+        }
+        _reject_non_finite_tree(result, "calibration_preview")
+        return result
+
+    def save_calibration(self, payload: dict) -> dict:
+        """校验标定几何与文件名，并将实测标定 (synthetic=False) 持久化到 default_calib 所在目录。"""
+        if not isinstance(payload, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        raw_filename = payload.get("filename")
+        clean_name = _validate_single_segment_filename(raw_filename, label="filename")
+        suffix = Path(clean_name).suffix.lower()
+        if suffix not in _CALIB_PRESET_EXTS or not Path(clean_name).stem:
+            raise ValueError("标定文件名必须以 .yaml 或 .yml 结尾")
+        if clean_name.lower() in _NON_CALIB_CONFIG_NAMES:
+            raise ValueError(f"禁止覆盖非标定系统配置文件: {clean_name}")
+
+        calib_dir = self.default_calib.parent.resolve()
+        target = (calib_dir / clean_name).resolve()
+        if target == calib_dir or not target.is_relative_to(calib_dir):
+            raise ValueError(f"非法的标定保存路径: {clean_name}")
+
+        calibrator = self._build_calibrator_from_payload(payload, synthetic=False)
+        saved_path = calibrator.to_yaml(target)
+        result = {
+            "saved": True,
+            "path": str(saved_path),
+            "label": saved_path.name,
+            "reprojection_rmse_m": round(float(calibrator.reprojection_rmse_m), 6),
+        }
+        _reject_non_finite_tree(result, "calibration_save")
+        return result
+
+    def run_scenarios_tool(self) -> dict:
+        """懒导入并执行全部 12 项确定性冲突场景回归验证。"""
+        from .scenarios import (
+            run_ctrv_turn_scenarios,
+            run_obb_ssm_scenarios,
+            run_scenarios,
+        )
+
+        results = (
+            run_scenarios()
+            + run_obb_ssm_scenarios()
+            + run_ctrv_turn_scenarios()
+        )
+        total = len(results)
+        passed = sum(1 for item in results if bool(item.get("passed")))
+        payload = {
+            "total": total,
+            "passed": passed,
+            "all_passed": passed == total,
+            "results": results,
+        }
+        _reject_non_finite_tree(payload, "scenarios")
+        return payload
+
+    def run_ablation_tool(self) -> dict:
+        """懒导入并运行全量确定性算法消融实验。"""
+        from .ablation import run_default_ablation
+
+        result = run_default_ablation()
+        _reject_non_finite_tree(result, "ablation")
+        return result
+
 
 _WEB_ASSET_HEADERS: Dict[str, str] = {
     "X-Content-Type-Options": "nosniff",
@@ -1181,6 +1714,30 @@ def create_http_server(
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_file_stream(
+            self,
+            status_code: int,
+            path: Path,
+            content_type: str,
+            *,
+            extra_headers: Optional[Dict[str, str]] = None,
+        ) -> None:
+            total = path.stat().st_size
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(total))
+            if extra_headers:
+                for key, val in extra_headers.items():
+                    self.send_header(key, val)
+            self.end_headers()
+            if total <= 0:
+                return
+            try:
+                for chunk in _iter_file_range(path, 0, total - 1):
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                self.close_connection = True
+
         def _read_json_body(self) -> dict:
             raw_len = self.headers.get("Content-Length")
             if raw_len is None:
@@ -1211,7 +1768,16 @@ def create_http_server(
                 raise ValueError(f"查询参数 {key} 必须是整数") from None
 
         def _handle_error(self, exc: Exception) -> None:
-            if isinstance(exc, (ValueError, json.JSONDecodeError, SchemaValidationError)):
+            if isinstance(exc, _DialogUnavailableError):
+                self._send_json(
+                    HTTPStatus.NOT_IMPLEMENTED,
+                    {"cancelled": True, "error": str(exc)},
+                )
+            elif isinstance(exc, _ServiceForbiddenError) or isinstance(exc, PermissionError):
+                self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+            elif isinstance(exc, _ServiceConflictError):
+                self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+            elif isinstance(exc, (ValueError, json.JSONDecodeError, SchemaValidationError)):
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             elif isinstance(exc, (FileNotFoundError, KeyError)):
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
@@ -1227,6 +1793,16 @@ def create_http_server(
             try:
                 if raw_path in ("/", "/index.html"):
                     asset_path, media_type = service.resolve_web_asset("index.html")
+                    self._send_bytes(
+                        HTTPStatus.OK,
+                        asset_path.read_bytes(),
+                        media_type,
+                        extra_headers=_WEB_ASSET_HEADERS,
+                    )
+                    return
+
+                if raw_path == "/favicon.ico":
+                    asset_path, media_type = service.resolve_web_asset("assets/favicon.ico")
                     self._send_bytes(
                         HTTPStatus.OK,
                         asset_path.read_bytes(),
@@ -1257,6 +1833,10 @@ def create_http_server(
                     })
                     return
 
+                if raw_path == "/api/system/info":
+                    self._send_json(HTTPStatus.OK, service.get_system_info())
+                    return
+
                 if raw_path == "/api/presets":
                     self._send_json(HTTPStatus.OK, service.list_presets())
                     return
@@ -1264,6 +1844,37 @@ def create_http_server(
                 if raw_path == "/api/runs":
                     runs = service.list_runs()
                     self._send_json(HTTPStatus.OK, {"runs": runs, "count": len(runs)})
+                    return
+
+                if len(segments) >= 4 and segments[0] == "api" and segments[1] == "runs" and segments[3] in ("export", "charts"):
+                    run_id = segments[2]
+                    sub = segments[3]
+                    if len(segments) != 5:
+                        raise ValueError("非法的运行资源路径（禁止空路径或多级目录穿越）")
+                    filename = segments[4]
+                    if sub == "export":
+                        export_path, media_type = service.resolve_run_export_file(run_id, filename)
+                        self._send_file_stream(
+                            HTTPStatus.OK,
+                            export_path,
+                            media_type,
+                            extra_headers={
+                                "Content-Disposition": f'attachment; filename="{run_id}_{export_path.name}"',
+                                "X-Content-Type-Options": "nosniff",
+                                "Cache-Control": "no-store",
+                            },
+                        )
+                        return
+                    chart_path = service.resolve_run_chart_file(run_id, filename)
+                    self._send_bytes(
+                        HTTPStatus.OK,
+                        chart_path.read_bytes(),
+                        "image/png",
+                        extra_headers={
+                            "X-Content-Type-Options": "nosniff",
+                            "Cache-Control": "no-cache",
+                        },
+                    )
                     return
 
                 if len(segments) == 4 and segments[0] == "api" and segments[1] == "runs":
@@ -1380,6 +1991,52 @@ def create_http_server(
             raw_path = parsed.path
             segments = [unquote(seg) for seg in raw_path.strip("/").split("/") if seg]
             try:
+                if raw_path == "/api/system/shutdown":
+                    self._send_json(HTTPStatus.OK, service.request_shutdown())
+                    return
+
+                if raw_path == "/api/dialog/browse":
+                    body = self._read_json_body()
+                    self._send_json(HTTPStatus.OK, service.browse_file_dialog(body.get("kind")))
+                    return
+
+                if raw_path == "/api/calibration/frame":
+                    body = self._read_json_body()
+                    frame_idx = 0 if body.get("frame_index") is None else body.get("frame_index")
+                    self._send_json(
+                        HTTPStatus.OK,
+                        service.extract_calibration_frame(body.get("source"), frame_index=frame_idx),
+                    )
+                    return
+
+                if raw_path == "/api/calibration/preview":
+                    body = self._read_json_body()
+                    self._send_json(HTTPStatus.OK, service.preview_calibration(body))
+                    return
+
+                if raw_path == "/api/calibration/save":
+                    body = self._read_json_body()
+                    self._send_json(HTTPStatus.OK, service.save_calibration(body))
+                    return
+
+                if raw_path == "/api/tools/scenarios":
+                    self._send_json(HTTPStatus.OK, service.run_scenarios_tool())
+                    return
+
+                if raw_path == "/api/tools/ablation":
+                    self._send_json(HTTPStatus.OK, service.run_ablation_tool())
+                    return
+
+                if len(segments) == 4 and segments[0] == "api" and segments[1] == "runs":
+                    run_id = segments[2]
+                    sub = segments[3]
+                    if sub == "charts":
+                        self._send_json(HTTPStatus.OK, service.generate_run_charts(run_id))
+                        return
+                    if sub == "open-folder":
+                        self._send_json(HTTPStatus.OK, service.open_run_folder(run_id))
+                        return
+
                 if raw_path == "/api/jobs":
                     body = self._read_json_body()
                     if "source" not in body:
@@ -1427,6 +2084,9 @@ def create_http_server(
             raw_path = parsed.path
             segments = [unquote(seg) for seg in raw_path.strip("/").split("/") if seg]
             try:
+                if len(segments) == 3 and segments[0] == "api" and segments[1] == "runs":
+                    self._send_json(HTTPStatus.OK, service.delete_run(segments[2]))
+                    return
                 if len(segments) == 3 and segments[0] == "api" and segments[1] == "jobs":
                     self._send_json(HTTPStatus.OK, service.stop_job(segments[2]))
                     return
@@ -1460,17 +2120,43 @@ def create_fastapi_app(service: Optional[AnalysisService] = None):
         )
 
     def _raise_http(exc: Exception) -> None:
+        if isinstance(exc, _ServiceForbiddenError) or isinstance(exc, PermissionError):
+            raise HTTPException(status_code=403, detail=str(exc)) from None
+        if isinstance(exc, _ServiceConflictError):
+            raise HTTPException(status_code=409, detail=str(exc)) from None
         if isinstance(exc, (ValueError, json.JSONDecodeError, SchemaValidationError)):
             raise HTTPException(status_code=400, detail=str(exc)) from None
         if isinstance(exc, (FileNotFoundError, KeyError)):
             raise HTTPException(status_code=404, detail=str(exc)) from None
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from None
 
+    async def _read_fastapi_json(request: Request) -> dict:
+        raw = await request.body()
+        if not raw:
+            return {}
+        body = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+        _reject_non_finite_tree(body, "request_body")
+        if not isinstance(body, dict):
+            raise ValueError("请求体必须是 JSON 对象")
+        return body
+
     @app.get("/")
     @app.get("/index.html")
     def web_index():
         try:
             asset_path, media_type = svc.resolve_web_asset("index.html")
+            return Response(
+                content=asset_path.read_bytes(),
+                media_type=media_type,
+                headers=dict(_WEB_ASSET_HEADERS),
+            )
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.get("/favicon.ico")
+    def web_favicon():
+        try:
+            asset_path, media_type = svc.resolve_web_asset("assets/favicon.ico")
             return Response(
                 content=asset_path.read_bytes(),
                 media_type=media_type,
@@ -1503,6 +2189,73 @@ def create_fastapi_app(service: Optional[AnalysisService] = None):
             "active_jobs": active,
         })
 
+    @app.get("/api/system/info")
+    def system_info():
+        try:
+            return _json_response(svc.get_system_info())
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.post("/api/system/shutdown")
+    def system_shutdown():
+        try:
+            return _json_response(svc.request_shutdown())
+        except _ServiceForbiddenError as exc:
+            return _json_response({"error": str(exc)}, status_code=403)
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.post("/api/dialog/browse")
+    async def dialog_browse(request: Request):
+        try:
+            body = await _read_fastapi_json(request)
+            return _json_response(svc.browse_file_dialog(body.get("kind")))
+        except _DialogUnavailableError as exc:
+            return _json_response({"cancelled": True, "error": str(exc)}, status_code=501)
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.post("/api/calibration/frame")
+    async def calibration_frame(request: Request):
+        try:
+            body = await _read_fastapi_json(request)
+            frame_idx = 0 if body.get("frame_index") is None else body.get("frame_index")
+            return _json_response(
+                svc.extract_calibration_frame(body.get("source"), frame_index=frame_idx)
+            )
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.post("/api/calibration/preview")
+    async def calibration_preview(request: Request):
+        try:
+            body = await _read_fastapi_json(request)
+            return _json_response(svc.preview_calibration(body))
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.post("/api/calibration/save")
+    async def calibration_save(request: Request):
+        try:
+            body = await _read_fastapi_json(request)
+            return _json_response(svc.save_calibration(body))
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.post("/api/tools/scenarios")
+    def tools_scenarios():
+        try:
+            return _json_response(svc.run_scenarios_tool())
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.post("/api/tools/ablation")
+    def tools_ablation():
+        try:
+            return _json_response(svc.run_ablation_tool())
+        except Exception as exc:
+            _raise_http(exc)
+
     @app.get("/api/presets")
     def list_presets():
         return _json_response(svc.list_presets())
@@ -1511,6 +2264,65 @@ def create_fastapi_app(service: Optional[AnalysisService] = None):
     def list_runs():
         runs = svc.list_runs()
         return _json_response({"runs": runs, "count": len(runs)})
+
+    @app.delete("/api/runs/{run_id}")
+    def delete_run(run_id: str):
+        try:
+            return _json_response(svc.delete_run(run_id))
+        except _ServiceConflictError as exc:
+            return _json_response({"error": str(exc)}, status_code=409)
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.get("/api/runs/{run_id}/export/{filename:path}")
+    def run_export(run_id: str, filename: str):
+        try:
+            export_path, media_type = svc.resolve_run_export_file(run_id, filename)
+            total = export_path.stat().st_size
+            headers = {
+                "Content-Disposition": f'attachment; filename="{run_id}_{export_path.name}"',
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+                "Content-Length": str(total),
+            }
+            if total == 0:
+                return Response(content=b"", media_type=media_type, headers=headers)
+            return StreamingResponse(
+                _iter_file_range(export_path, 0, total - 1),
+                media_type=media_type,
+                headers=headers,
+            )
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.post("/api/runs/{run_id}/charts")
+    def run_charts_generate(run_id: str):
+        try:
+            return _json_response(svc.generate_run_charts(run_id))
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.get("/api/runs/{run_id}/charts/{filename:path}")
+    def run_chart_file(run_id: str, filename: str):
+        try:
+            chart_path = svc.resolve_run_chart_file(run_id, filename)
+            return Response(
+                content=chart_path.read_bytes(),
+                media_type="image/png",
+                headers={
+                    "X-Content-Type-Options": "nosniff",
+                    "Cache-Control": "no-cache",
+                },
+            )
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.post("/api/runs/{run_id}/open-folder")
+    def run_open_folder(run_id: str):
+        try:
+            return _json_response(svc.open_run_folder(run_id))
+        except Exception as exc:
+            _raise_http(exc)
 
     @app.get("/api/runs/{run_id}/summary")
     def run_summary(run_id: str):

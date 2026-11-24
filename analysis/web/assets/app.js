@@ -16,6 +16,11 @@
       index: 2,
       title: "历史档案与时间轴",
       subtitle: "运行摘要、车速风险曲线与结构化冲突明细检索"
+    },
+    studio: {
+      index: 3,
+      title: "标定与实验中心",
+      subtitle: "可视化道路单应标定 · 禁停区掩膜 · 算法场景回归与消融实验室"
     }
   };
 
@@ -76,8 +81,31 @@
       pollTimerId: null,
       lastMaxSpeed: null,
       lastMinTtc: null,
-      activeAlertsCount: 0
+      activeAlertsCount: 0,
+      notifiedDone: false
     },
+    systemInfo: {
+      desktop_mode: false,
+      allow_shutdown: false,
+      can_browse_files: false,
+      cuda_available: false,
+      weights: []
+    },
+    soundEnabled: false,
+    studioTab: "calib",
+    calibTool: "points",
+    calibState: {
+      imagePoints: [],
+      parkingZonesImage: [],
+      currentParkingDraft: [],
+      imageWidth: 0,
+      imageHeight: 0
+    },
+    calibPreview: null,
+    chartsByRun: {},
+    pendingDeleteRunId: null,
+    scenariosResult: null,
+    ablationResult: null,
     alertLog: [],
     alertLogFilter: "all",
     lastLogSignature: "",
@@ -92,7 +120,9 @@
     kpiFrames: null,
     pipeline: null,
     roadTwin: null,
-    speedChart: null
+    speedChart: null,
+    calibCanvas: null,
+    audioSynth: null
   };
 
   function $(id) {
@@ -167,7 +197,8 @@
     dom.views = {
       monitor: $("view-monitor"),
       alerts: $("view-alerts"),
-      history: $("view-history")
+      history: $("view-history"),
+      studio: $("view-studio")
     };
     dom.viewTitle = $("view-title");
     dom.viewSubtitle = $("view-subtitle");
@@ -176,6 +207,9 @@
     dom.serviceHealthText = $("service-health-text");
     dom.sidebarModeText = $("sidebar-mode-text");
     dom.sidebarTargetText = $("sidebar-target-text");
+    dom.sidebarComputeText = $("sidebar-compute-text");
+    dom.btnDesktopShutdown = $("btn-desktop-shutdown");
+    dom.mobileDesktopShutdown = $("mobile-desktop-shutdown");
     dom.themeToggleLabel = $("theme-toggle-label");
     dom.topbarThemeLabel = $("topbar-theme-label");
 
@@ -254,10 +288,21 @@
     dom.alertLogCount = $("alert-log-count");
     dom.alertLogList = $("alert-log-list");
     dom.btnClearAlertLog = $("btn-clear-alert-log");
+    dom.btnAlertSoundToggle = $("btn-alert-sound-toggle");
+    dom.alertSoundLabel = $("alert-sound-label");
 
     dom.historyRunSelect = $("history-run-select");
     dom.btnRefreshRuns = $("btn-refresh-runs");
     dom.btnHistoryReplay = $("btn-history-replay");
+    dom.btnHistoryCharts = $("btn-history-charts");
+    dom.btnExportCsv = $("btn-export-csv");
+    dom.btnExportConflicts = $("btn-export-conflicts");
+    dom.btnExportSummary = $("btn-export-summary");
+    dom.btnHistoryOpenFolder = $("btn-history-open-folder");
+    dom.btnHistoryDelete = $("btn-history-delete");
+    dom.historyChartsCard = $("history-charts-card");
+    dom.historyChartsMeta = $("history-charts-meta");
+    dom.historyChartsGrid = $("history-charts-grid");
     dom.histFrames = $("hist-frames");
     dom.histFps = $("hist-fps");
     dom.histMaxSpeed = $("hist-max-speed");
@@ -278,12 +323,59 @@
     dom.eventsTbody = $("events-tbody");
     dom.speedsTbody = $("speeds-tbody");
 
+    dom.studioTabCalib = $("studio-tab-calib");
+    dom.studioTabLab = $("studio-tab-lab");
+    dom.studioStatusPill = $("studio-status-pill");
+    dom.studioPanelCalib = $("studio-panel-calib");
+    dom.studioPanelLab = $("studio-panel-lab");
+
+    dom.calibPresetVideos = $("calib-preset-videos");
+    dom.calibSource = $("calib-source");
+    dom.btnCalibBrowseVideo = $("btn-calib-browse-video");
+    dom.calibFrameIndex = $("calib-frame-index");
+    dom.btnCalibExtract = $("btn-calib-extract");
+    dom.calibFrameMeta = $("calib-frame-meta");
+    dom.calibPointCount = $("calib-point-count");
+    dom.btnCalibToolPoints = $("btn-calib-tool-points");
+    dom.btnCalibToolParking = $("btn-calib-tool-parking");
+    dom.btnCalibFinishParking = $("btn-calib-finish-parking");
+    dom.btnCalibUndo = $("btn-calib-undo");
+    dom.btnCalibClear = $("btn-calib-clear");
+    dom.calibEditorCanvas = $("calib-editor-canvas");
+    dom.calibCoordsPill = $("calib-coords-pill");
+    dom.calibForm = $("calib-form");
+    dom.calibWidthM = $("calib-width-m");
+    dom.calibLengthM = $("calib-length-m");
+    dom.calibName = $("calib-name");
+    dom.calibFilename = $("calib-filename");
+    dom.calibUseRansac = $("calib-use-ransac");
+    dom.calibError = $("calib-error");
+    dom.calibValidBadge = $("calib-valid-badge");
+    dom.btnCalibPreview = $("btn-calib-preview");
+    dom.btnCalibSave = $("btn-calib-save");
+    dom.calibRmseVal = $("calib-rmse-val");
+    dom.calibInliersVal = $("calib-inliers-val");
+    dom.calibSavedVal = $("calib-saved-val");
+
+    dom.btnRunScenarios = $("btn-run-scenarios");
+    dom.scenariosStatusBadge = $("scenarios-status-badge");
+    dom.scenariosPassRatio = $("scenarios-pass-ratio");
+    dom.scenariosSummaryText = $("scenarios-summary-text");
+    dom.scenariosTbody = $("scenarios-tbody");
+    dom.btnRunAblation = $("btn-run-ablation");
+    dom.ablationMeta = $("ablation-meta");
+    dom.ablationTurnTbody = $("ablation-turn-tbody");
+    dom.ablationCoreTbody = $("ablation-core-tbody");
+
     dom.jobDialog = $("job-dialog");
     dom.jobForm = $("job-form");
     dom.jobDialogError = $("job-dialog-error");
     dom.presetVideosList = $("preset-videos-list");
     dom.jobSource = $("job-source");
+    dom.btnJobBrowseSource = $("btn-job-browse-source");
     dom.jobCalib = $("job-calib");
+    dom.btnJobBrowseCalib = $("btn-job-browse-calib");
+    dom.jobWeights = $("job-weights");
     dom.jobSpeedLimit = $("job-speed-limit");
     dom.jobSpeedModel = $("job-speed-model");
     dom.jobConflictModel = $("job-conflict-model");
@@ -295,7 +387,20 @@
     dom.jobDropStale = $("job-drop-stale");
     dom.jobDialogSubmit = $("job-dialog-submit");
 
+    dom.confirmDeleteDialog = $("confirm-delete-dialog");
+    dom.deleteDialogRunId = $("delete-dialog-run-id");
+    dom.confirmDeleteError = $("confirm-delete-error");
+    dom.confirmDeleteCancel = $("confirm-delete-cancel");
+    dom.confirmDeleteSubmit = $("confirm-delete-submit");
+
+    dom.chartLightboxDialog = $("chart-lightbox-dialog");
+    dom.lightboxTitle = $("lightbox-title");
+    dom.lightboxSubtitle = $("lightbox-subtitle");
+    dom.lightboxImg = $("lightbox-img");
+    dom.lightboxDownload = $("lightbox-download");
+
     dom.mobileNavDialog = $("mobile-nav-dialog");
+    dom.toastRegion = $("toast-region");
   }
 
   function applyTheme(theme) {
@@ -321,6 +426,9 @@
     }
     if (widgets.speedChart && typeof widgets.speedChart.refreshTheme === "function") {
       widgets.speedChart.refreshTheme();
+    }
+    if (widgets.calibCanvas && typeof widgets.calibCanvas.refreshTheme === "function") {
+      widgets.calibCanvas.refreshTheme();
     }
   }
 
@@ -417,6 +525,12 @@
           widgets.speedChart.refreshTheme();
         });
       }
+    } else if (viewId === "studio") {
+      if (state.studioTab === "calib" && widgets.calibCanvas && typeof widgets.calibCanvas.refreshTheme === "function") {
+        window.requestAnimationFrame(function () {
+          widgets.calibCanvas.refreshTheme();
+        });
+      }
     }
   }
 
@@ -482,6 +596,16 @@
           }
         }
       });
+    }
+
+    if (typeof CM.CalibrationCanvas === "function" && dom.calibEditorCanvas) {
+      widgets.calibCanvas = new CM.CalibrationCanvas(dom.calibEditorCanvas, {
+        onChange: handleCalibCanvasChange
+      });
+    }
+
+    if (typeof CM.AlertAudioSynth === "function") {
+      widgets.audioSynth = new CM.AlertAudioSynth();
     }
   }
 
@@ -593,6 +717,11 @@
     }
 
     appendAlertLogBatch(driverAlerts, pedAlerts, payload.timestampS);
+
+    var peakRisk = Math.max(driverRisk, pedRisk, parseRiskLevel(payload.riskLevel));
+    if (state.soundEnabled && widgets.audioSynth && typeof widgets.audioSynth.triggerRisk === "function") {
+      widgets.audioSynth.triggerRisk(peakRisk);
+    }
   }
 
   function renderQueueChips(container, items) {
@@ -1172,6 +1301,7 @@
     state.liveJob.lastMaxSpeed = null;
     state.liveJob.lastMinTtc = null;
     state.liveJob.activeAlertsCount = 0;
+    state.liveJob.notifiedDone = false;
 
     setMonitorMode("live");
     dom.liveMjpegImg.src = "/api/jobs/" + encodeURIComponent(job.job_id) + "/mjpeg";
@@ -1252,12 +1382,82 @@
             window.clearInterval(state.liveJob.pollTimerId);
             state.liveJob.pollTimerId = null;
           }
+          if (!state.liveJob.notifiedDone) {
+            state.liveJob.notifiedDone = true;
+            if (statusObj.status === "completed") {
+              showToast(
+                "检测任务已完成 (" + (statusObj.frames_processed || 0) + " 帧)",
+                {
+                  label: "查看档案",
+                  onClick: function () {
+                    switchView("history");
+                    loadRunsList();
+                  }
+                }
+              );
+            } else if (statusObj.status === "failed") {
+              showToast("检测任务失败: " + (statusObj.error || "未知错误"));
+            } else {
+              showToast("检测任务已停止");
+            }
+          }
           loadRunsList();
         }
       })
       .catch(function (_err) {
         // Keep polling resiliently unless stopped
       });
+  }
+
+  function showToast(text, action) {
+    if (!dom.toastRegion || !text) return;
+    while (dom.toastRegion.children.length >= 4) {
+      dom.toastRegion.removeChild(dom.toastRegion.firstChild);
+    }
+
+    var item = document.createElement("div");
+    item.className = "toast-item";
+
+    var msg = document.createElement("span");
+    msg.className = "toast-text";
+    msg.textContent = text;
+    item.appendChild(msg);
+
+    var actions = document.createElement("div");
+    actions.className = "toast-actions";
+
+    var removed = false;
+    function dismiss() {
+      if (removed) return;
+      removed = true;
+      if (item.parentNode) {
+        item.parentNode.removeChild(item);
+      }
+    }
+
+    if (action && action.label && typeof action.onClick === "function") {
+      var actBtn = document.createElement("button");
+      actBtn.type = "button";
+      actBtn.className = "toast-action-btn";
+      actBtn.textContent = action.label;
+      actBtn.addEventListener("click", function () {
+        dismiss();
+        action.onClick();
+      });
+      actions.appendChild(actBtn);
+    }
+
+    var closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "toast-close-btn";
+    closeBtn.textContent = "关闭";
+    closeBtn.addEventListener("click", dismiss);
+    actions.appendChild(closeBtn);
+
+    item.appendChild(actions);
+    dom.toastRegion.appendChild(item);
+
+    window.setTimeout(dismiss, 4800);
   }
 
   function loadHealth() {
@@ -1272,6 +1472,122 @@
       });
   }
 
+  function applySystemInfo(info) {
+    var sys = info || {};
+    state.systemInfo = sys;
+
+    if (dom.sidebarComputeText) {
+      dom.sidebarComputeText.textContent = sys.cuda_available ? "CUDA GPU" : "CPU";
+    }
+
+    var showShutdown = Boolean(sys.desktop_mode && sys.allow_shutdown);
+    if (dom.btnDesktopShutdown) dom.btnDesktopShutdown.hidden = !showShutdown;
+    if (dom.mobileDesktopShutdown) dom.mobileDesktopShutdown.hidden = !showShutdown;
+
+    var canBrowse = Boolean(sys.can_browse_files);
+    if (dom.btnCalibBrowseVideo) dom.btnCalibBrowseVideo.hidden = !canBrowse;
+    if (dom.btnJobBrowseSource) dom.btnJobBrowseSource.hidden = !canBrowse;
+    if (dom.btnJobBrowseCalib) dom.btnJobBrowseCalib.hidden = !canBrowse;
+
+    if (dom.jobWeights) {
+      var prev = dom.jobWeights.value;
+      dom.jobWeights.textContent = "";
+      var defOpt = document.createElement("option");
+      defOpt.value = "";
+      defOpt.textContent = "默认权重 (自动选择)";
+      dom.jobWeights.appendChild(defOpt);
+
+      var weights = Array.isArray(sys.weights) ? sys.weights : [];
+      weights.forEach(function (w) {
+        var opt = document.createElement("option");
+        if (typeof w === "string") {
+          opt.value = w;
+          opt.textContent = w;
+        } else if (w && typeof w === "object") {
+          opt.value = w.path || w.label || "";
+          opt.textContent = w.label || w.path || "";
+        }
+        if (opt.value) {
+          dom.jobWeights.appendChild(opt);
+        }
+      });
+      if (prev) {
+        dom.jobWeights.value = prev;
+      }
+    }
+  }
+
+  function loadSystemInfo() {
+    return fetchJson("/api/system/info")
+      .then(function (data) {
+        applySystemInfo(data);
+      })
+      .catch(function () {
+        applySystemInfo({
+          desktop_mode: false,
+          allow_shutdown: false,
+          can_browse_files: false,
+          cuda_available: false,
+          weights: []
+        });
+      });
+  }
+
+  function handleDesktopShutdown() {
+    if (dom.btnDesktopShutdown) dom.btnDesktopShutdown.disabled = true;
+    if (dom.mobileDesktopShutdown) dom.mobileDesktopShutdown.disabled = true;
+
+    fetchJson("/api/system/shutdown", { method: "POST" })
+      .then(function () {
+        if (dom.serviceHealthDot) dom.serviceHealthDot.setAttribute("data-state", "offline");
+        if (dom.serviceHealthText) dom.serviceHealthText.textContent = "服务已停止";
+        showToast("桌面服务正在安全关闭...");
+        window.setTimeout(function () {
+          try {
+            window.close();
+          } catch (_err) {
+            // ignore
+          }
+        }, 240);
+      })
+      .catch(function (err) {
+        if (dom.btnDesktopShutdown) dom.btnDesktopShutdown.disabled = false;
+        if (dom.mobileDesktopShutdown) dom.mobileDesktopShutdown.disabled = false;
+        showToast("关闭桌面程序失败: " + err.message);
+      });
+  }
+
+  function browseNativeFile(kind, onPicked) {
+    return fetchJson("/api/dialog/browse", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ kind: kind })
+    })
+      .then(function (res) {
+        if (res && !res.cancelled && res.path && typeof onPicked === "function") {
+          onPicked(res.path);
+        }
+      })
+      .catch(function (err) {
+        showToast("打开文件选择器失败: " + err.message);
+      });
+  }
+
+  function setHistoryActionsDisabled(disabled) {
+    var flag = Boolean(disabled);
+    [
+      dom.btnHistoryReplay,
+      dom.btnHistoryCharts,
+      dom.btnExportCsv,
+      dom.btnExportConflicts,
+      dom.btnExportSummary,
+      dom.btnHistoryOpenFolder,
+      dom.btnHistoryDelete
+    ].forEach(function (btn) {
+      if (btn) btn.disabled = flag;
+    });
+  }
+
   function loadRunsList() {
     return fetchJson("/api/runs")
       .then(function (data) {
@@ -1284,11 +1600,14 @@
           emptyOpt.value = "";
           emptyOpt.textContent = "暂无历史分析记录";
           dom.historyRunSelect.appendChild(emptyOpt);
-          dom.btnHistoryReplay.disabled = true;
+          state.selectedRunId = null;
+          state.historyData = null;
+          setHistoryActionsDisabled(true);
+          if (dom.historyChartsCard) dom.historyChartsCard.hidden = true;
           return;
         }
 
-        dom.btnHistoryReplay.disabled = false;
+        setHistoryActionsDisabled(false);
         runs.forEach(function (run) {
           var opt = document.createElement("option");
           opt.value = run.run_id;
@@ -1312,6 +1631,7 @@
   function loadHistoryRunDetail(runId) {
     if (!runId) return;
     state.selectedRunId = runId;
+    renderHistoryChartsGallery(runId, state.chartsByRun[runId] || []);
 
     return Promise.all([
       fetchJson("/api/runs/" + encodeURIComponent(runId) + "/summary"),
@@ -1571,6 +1891,651 @@
     }
   }
 
+  function renderHistoryChartsGallery(runId, charts) {
+    if (!dom.historyChartsCard || !dom.historyChartsGrid) return;
+    var list = Array.isArray(charts) ? charts : [];
+    dom.historyChartsGrid.textContent = "";
+    if (!list.length) {
+      dom.historyChartsCard.hidden = true;
+      if (dom.historyChartsMeta) dom.historyChartsMeta.textContent = "0 张图表";
+      return;
+    }
+
+    dom.historyChartsCard.hidden = false;
+    if (dom.historyChartsMeta) dom.historyChartsMeta.textContent = list.length + " 张图表";
+
+    var frag = document.createDocumentFragment();
+    list.forEach(function (chart) {
+      var name = chart.name || "chart.png";
+      var url = chart.url || ("/api/runs/" + encodeURIComponent(runId) + "/charts/" + encodeURIComponent(name));
+
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "chart-thumb-btn";
+      btn.addEventListener("click", function () {
+        openChartLightbox(name, url, runId);
+      });
+
+      var img = document.createElement("img");
+      img.className = "chart-thumb-img";
+      img.src = url;
+      img.alt = name;
+
+      var cap = document.createElement("span");
+      cap.className = "chart-thumb-caption mono";
+      cap.textContent = name;
+
+      btn.appendChild(img);
+      btn.appendChild(cap);
+      frag.appendChild(btn);
+    });
+    dom.historyChartsGrid.appendChild(frag);
+  }
+
+  function openChartLightbox(name, url, runId) {
+    if (!dom.chartLightboxDialog) return;
+    if (dom.lightboxTitle) dom.lightboxTitle.textContent = name || "实验图表预览";
+    if (dom.lightboxSubtitle) dom.lightboxSubtitle.textContent = (runId || "") + " / " + (name || "");
+    if (dom.lightboxImg) {
+      dom.lightboxImg.src = url;
+      dom.lightboxImg.alt = name || "论文图表大图预览";
+    }
+    if (dom.lightboxDownload) {
+      dom.lightboxDownload.href = url;
+      dom.lightboxDownload.setAttribute("download", (runId ? runId + "_" : "") + (name || "chart.png"));
+    }
+    if (!dom.chartLightboxDialog.open) {
+      dom.chartLightboxDialog.showModal();
+    }
+  }
+
+  function generateHistoryCharts() {
+    var runId = state.selectedRunId;
+    if (!runId || !dom.btnHistoryCharts) return;
+
+    dom.btnHistoryCharts.disabled = true;
+    var origLabel = dom.btnHistoryCharts.textContent;
+    dom.btnHistoryCharts.textContent = "生成中...";
+
+    fetchJson("/api/runs/" + encodeURIComponent(runId) + "/charts", { method: "POST" })
+      .then(function (data) {
+        var charts = (data && data.charts) || [];
+        state.chartsByRun[runId] = charts;
+        renderHistoryChartsGallery(runId, charts);
+        showToast("已生成 " + charts.length + " 张论文图表");
+      })
+      .catch(function (err) {
+        showToast("生成图表失败: " + err.message);
+      })
+      .finally(function () {
+        dom.btnHistoryCharts.disabled = !state.selectedRunId;
+        dom.btnHistoryCharts.textContent = origLabel;
+      });
+  }
+
+  function triggerRunExport(filename) {
+    var runId = state.selectedRunId;
+    if (!runId) return;
+    var url = "/api/runs/" + encodeURIComponent(runId) + "/export/" + encodeURIComponent(filename);
+    var link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", runId + "_" + filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  function openRunFolder() {
+    var runId = state.selectedRunId;
+    if (!runId) return;
+    fetchJson("/api/runs/" + encodeURIComponent(runId) + "/open-folder", { method: "POST" })
+      .then(function (res) {
+        showToast("已打开目录: " + ((res && res.path) || runId));
+      })
+      .catch(function (err) {
+        showToast("打开目录失败: " + err.message);
+      });
+  }
+
+  function openDeleteRunDialog() {
+    var runId = state.selectedRunId;
+    if (!runId || !dom.confirmDeleteDialog) return;
+    state.pendingDeleteRunId = runId;
+    if (dom.deleteDialogRunId) dom.deleteDialogRunId.textContent = runId;
+    if (dom.confirmDeleteError) {
+      dom.confirmDeleteError.hidden = true;
+      dom.confirmDeleteError.textContent = "";
+    }
+    if (!dom.confirmDeleteDialog.open) {
+      dom.confirmDeleteDialog.showModal();
+    }
+  }
+
+  function confirmDeleteRun() {
+    var runId = state.pendingDeleteRunId;
+    if (!runId || !dom.confirmDeleteSubmit) return;
+
+    dom.confirmDeleteSubmit.disabled = true;
+    dom.confirmDeleteSubmit.textContent = "删除中...";
+    if (dom.confirmDeleteError) {
+      dom.confirmDeleteError.hidden = true;
+      dom.confirmDeleteError.textContent = "";
+    }
+
+    fetchJson("/api/runs/" + encodeURIComponent(runId), { method: "DELETE" })
+      .then(function () {
+        if (dom.confirmDeleteDialog && dom.confirmDeleteDialog.open) {
+          dom.confirmDeleteDialog.close();
+        }
+        delete state.chartsByRun[runId];
+        if (state.mode === "replay" && state.replay.runId === runId) {
+          setMonitorMode("simulation");
+        }
+        if (state.selectedRunId === runId) {
+          state.selectedRunId = null;
+          state.historyData = null;
+        }
+        if (dom.historyChartsCard) dom.historyChartsCard.hidden = true;
+        showToast("已删除运行记录 " + runId);
+        loadRunsList();
+      })
+      .catch(function (err) {
+        if (dom.confirmDeleteError) {
+          dom.confirmDeleteError.textContent = "删除失败: " + err.message;
+          dom.confirmDeleteError.hidden = false;
+        }
+      })
+      .finally(function () {
+        dom.confirmDeleteSubmit.disabled = false;
+        dom.confirmDeleteSubmit.textContent = "确认删除";
+      });
+  }
+
+  /* ======================================================================
+   * View 4: Studio (Visual Road Calibration + Algorithm Lab)
+   * ====================================================================== */
+  function switchStudioTab(tab) {
+    state.studioTab = tab === "lab" ? "lab" : "calib";
+    if (dom.studioPanelCalib) dom.studioPanelCalib.hidden = state.studioTab !== "calib";
+    if (dom.studioPanelLab) dom.studioPanelLab.hidden = state.studioTab !== "lab";
+
+    if (dom.studioTabCalib) {
+      var isCalib = state.studioTab === "calib";
+      dom.studioTabCalib.classList.toggle("is-active", isCalib);
+      dom.studioTabCalib.setAttribute("aria-selected", isCalib ? "true" : "false");
+    }
+    if (dom.studioTabLab) {
+      var isLab = state.studioTab === "lab";
+      dom.studioTabLab.classList.toggle("is-active", isLab);
+      dom.studioTabLab.setAttribute("aria-selected", isLab ? "true" : "false");
+    }
+
+    if (state.studioTab === "calib" && widgets.calibCanvas && typeof widgets.calibCanvas.refreshTheme === "function") {
+      window.requestAnimationFrame(function () {
+        widgets.calibCanvas.refreshTheme();
+      });
+    }
+  }
+
+  function setCalibTool(tool) {
+    state.calibTool = tool === "parking" ? "parking" : "points";
+    if (dom.btnCalibToolPoints) dom.btnCalibToolPoints.classList.toggle("is-active", state.calibTool === "points");
+    if (dom.btnCalibToolParking) dom.btnCalibToolParking.classList.toggle("is-active", state.calibTool === "parking");
+    if (widgets.calibCanvas && typeof widgets.calibCanvas.setTool === "function") {
+      widgets.calibCanvas.setTool(state.calibTool);
+    }
+  }
+
+  function formatCoordNum(val) {
+    if (typeof val !== "number" || !Number.isFinite(val)) return "0";
+    var rounded = Math.round(val * 10) / 10;
+    return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+  }
+
+  function handleCalibCanvasChange(snap) {
+    if (!snap) return;
+    state.calibState = snap;
+    var pts = Array.isArray(snap.imagePoints) ? snap.imagePoints : [];
+    var zones = Array.isArray(snap.parkingZonesImage) ? snap.parkingZonesImage : [];
+    var draft = Array.isArray(snap.currentParkingDraft) ? snap.currentParkingDraft : [];
+
+    if (dom.calibPointCount) {
+      var draftNote = draft.length > 0 ? (" · 禁停区草稿 " + draft.length + " 点") : "";
+      dom.calibPointCount.textContent =
+        "已选 P" + pts.length + (pts.length >= 4 ? " (满足4+点)" : " · 至少 4 点") +
+        " · 禁停区 " + zones.length + " 处" + draftNote;
+    }
+
+    if (dom.calibCoordsPill) {
+      if (!pts.length && !draft.length) {
+        dom.calibCoordsPill.textContent = "在画布点击标定参考点 P1..PN（支持拖拽微调）";
+      } else {
+        var parts = pts.map(function (pt, i) {
+          return "P" + (i + 1) + "(" + formatCoordNum(pt[0]) + ", " + formatCoordNum(pt[1]) + ")";
+        });
+        if (draft.length > 0) {
+          parts.push("禁停草稿(" + draft.length + "点)");
+        }
+        dom.calibCoordsPill.textContent = parts.join(" · ");
+      }
+    }
+  }
+
+  function showCalibError(message) {
+    if (!dom.calibError) return;
+    if (!message) {
+      dom.calibError.hidden = true;
+      dom.calibError.textContent = "";
+      return;
+    }
+    dom.calibError.textContent = message;
+    dom.calibError.hidden = false;
+  }
+
+  function extractCalibrationFrame() {
+    var source = dom.calibSource ? dom.calibSource.value.trim() : "";
+    if (!source) {
+      showCalibError("请输入或浏览本地视频路径后再提取标定帧");
+      if (dom.calibSource) dom.calibSource.focus();
+      return;
+    }
+    var frameIdx = parseInt(dom.calibFrameIndex ? dom.calibFrameIndex.value : "0", 10);
+    if (!Number.isFinite(frameIdx) || frameIdx < 0) {
+      showCalibError("帧号必须是非负整数");
+      return;
+    }
+
+    showCalibError("");
+    if (dom.btnCalibExtract) {
+      dom.btnCalibExtract.disabled = true;
+      dom.btnCalibExtract.textContent = "提取中...";
+    }
+
+    fetchJson("/api/calibration/frame", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ source: source, frame_index: frameIdx })
+    })
+      .then(function (res) {
+        if (dom.calibFrameMeta) {
+          dom.calibFrameMeta.textContent =
+            (res.width || 0) + "x" + (res.height || 0) +
+            " · 帧 #" + (res.frame_index != null ? res.frame_index : frameIdx) +
+            " / " + (res.frame_count != null ? res.frame_count : "--") +
+            " (" + formatNumber(res.fps, 1, "--") + " FPS)";
+        }
+        if (widgets.calibCanvas && typeof widgets.calibCanvas.loadImage === "function") {
+          widgets.calibCanvas.loadImage(res.image_data_url, res.width, res.height);
+        }
+        showToast("已提取标定帧 #" + (res.frame_index != null ? res.frame_index : frameIdx));
+      })
+      .catch(function (err) {
+        showCalibError("提取视频帧失败: " + err.message);
+      })
+      .finally(function () {
+        if (dom.btnCalibExtract) {
+          dom.btnCalibExtract.disabled = false;
+          dom.btnCalibExtract.textContent = "提取标定帧";
+        }
+      });
+  }
+
+  function buildCalibrationPayload(requireFilename) {
+    var snap = (widgets.calibCanvas && typeof widgets.calibCanvas.getState === "function")
+      ? widgets.calibCanvas.getState()
+      : state.calibState;
+    var pts = (snap && Array.isArray(snap.imagePoints)) ? snap.imagePoints : [];
+    if (pts.length < 4) {
+      throw new Error("请至少在画布上标定 4 个参考点 (当前 " + pts.length + " 个)");
+    }
+
+    var widthM = parseFloat(dom.calibWidthM ? dom.calibWidthM.value : "");
+    var lengthM = parseFloat(dom.calibLengthM ? dom.calibLengthM.value : "");
+    if (!Number.isFinite(widthM) || widthM <= 0 || !Number.isFinite(lengthM) || lengthM <= 0) {
+      throw new Error("标定宽度 width_m 与长度 length_m 必须为正数");
+    }
+
+    var name = dom.calibName ? dom.calibName.value.trim() : "campus_road";
+    if (!name) {
+      throw new Error("场景名称不能为空");
+    }
+
+    var payload = {
+      image_points: pts.map(function (pt) { return [Number(pt[0]), Number(pt[1])]; }),
+      width_m: widthM,
+      length_m: lengthM,
+      name: name,
+      use_ransac: Boolean(dom.calibUseRansac && dom.calibUseRansac.checked),
+      parking_zones_image: (snap && Array.isArray(snap.parkingZonesImage)) ? snap.parkingZonesImage : []
+    };
+
+    if (requireFilename) {
+      var filename = dom.calibFilename ? dom.calibFilename.value.trim() : "";
+      if (!filename || filename.indexOf("/") >= 0 || filename.indexOf("\\") >= 0 || filename.indexOf("..") >= 0) {
+        throw new Error("保存文件名必须为单层合法文件名 (如 campus_calibrated.yaml)");
+      }
+      if (!/\.ya?ml$/i.test(filename)) {
+        filename += ".yaml";
+        if (dom.calibFilename) dom.calibFilename.value = filename;
+      }
+      payload.filename = filename;
+    }
+
+    return payload;
+  }
+
+  function previewCalibration() {
+    var payload;
+    try {
+      payload = buildCalibrationPayload(false);
+    } catch (err) {
+      showCalibError(err.message);
+      return;
+    }
+
+    showCalibError("");
+    if (dom.btnCalibPreview) {
+      dom.btnCalibPreview.disabled = true;
+      dom.btnCalibPreview.textContent = "求解中...";
+    }
+
+    fetchJson("/api/calibration/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify(payload)
+    })
+      .then(function (res) {
+        state.calibPreview = res;
+        if (dom.calibValidBadge) {
+          dom.calibValidBadge.textContent = res.valid ? "单应矩阵有效" : "校验异常";
+          dom.calibValidBadge.className = res.valid ? "status-badge-pass mono" : "status-badge-fail mono";
+        }
+        if (dom.calibRmseVal) {
+          dom.calibRmseVal.textContent = formatNumber(res.reprojection_rmse_m, 4, "--") + " m";
+        }
+        if (dom.calibInliersVal) {
+          var inliers = res.inlier_count != null ? res.inlier_count : payload.image_points.length;
+          var zoneCount = Array.isArray(res.parking_zones) ? res.parking_zones.length : 0;
+          dom.calibInliersVal.textContent = inliers + " / " + payload.image_points.length + " · 禁停区 " + zoneCount;
+        }
+      })
+      .catch(function (err) {
+        if (dom.calibValidBadge) {
+          dom.calibValidBadge.textContent = "校验失败";
+          dom.calibValidBadge.className = "status-badge-fail mono";
+        }
+        showCalibError("单应矩阵校验失败: " + err.message);
+      })
+      .finally(function () {
+        if (dom.btnCalibPreview) {
+          dom.btnCalibPreview.disabled = false;
+          dom.btnCalibPreview.textContent = "校验单应矩阵";
+        }
+      });
+  }
+
+  function saveCalibration() {
+    var payload;
+    try {
+      payload = buildCalibrationPayload(true);
+    } catch (err) {
+      showCalibError(err.message);
+      return;
+    }
+
+    showCalibError("");
+    if (dom.btnCalibSave) {
+      dom.btnCalibSave.disabled = true;
+      dom.btnCalibSave.textContent = "保存中...";
+    }
+
+    fetchJson("/api/calibration/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify(payload)
+    })
+      .then(function (res) {
+        if (dom.calibValidBadge) {
+          dom.calibValidBadge.textContent = "已保存实测标定";
+          dom.calibValidBadge.className = "status-badge-pass mono";
+        }
+        if (dom.calibRmseVal && res.reprojection_rmse_m != null) {
+          dom.calibRmseVal.textContent = formatNumber(res.reprojection_rmse_m, 4, "--") + " m";
+        }
+        if (dom.calibSavedVal) {
+          dom.calibSavedVal.textContent = res.path || res.label || payload.filename;
+        }
+        loadPresets().then(function () {
+          if (res.path && dom.jobCalib) {
+            dom.jobCalib.value = res.path;
+          }
+        });
+        showToast("已保存标定配置: " + (res.label || payload.filename), {
+          label: "新建检测任务",
+          onClick: openJobDialog
+        });
+      })
+      .catch(function (err) {
+        showCalibError("保存标定文件失败: " + err.message);
+      })
+      .finally(function () {
+        if (dom.btnCalibSave) {
+          dom.btnCalibSave.disabled = false;
+          dom.btnCalibSave.textContent = "保存标定文件";
+        }
+      });
+  }
+
+  function runScenariosRegression() {
+    if (!dom.btnRunScenarios) return;
+    dom.btnRunScenarios.disabled = true;
+    dom.btnRunScenarios.textContent = "运行中...";
+    if (dom.scenariosStatusBadge) dom.scenariosStatusBadge.textContent = "执行中";
+
+    fetchJson("/api/tools/scenarios", { method: "POST" })
+      .then(function (res) {
+        state.scenariosResult = res;
+        var total = res && res.total != null ? res.total : 0;
+        var passed = res && res.passed != null ? res.passed : 0;
+        var allPassed = Boolean(res && res.all_passed);
+
+        if (dom.scenariosPassRatio) {
+          dom.scenariosPassRatio.textContent = passed + " / " + total;
+        }
+        if (dom.scenariosStatusBadge) {
+          dom.scenariosStatusBadge.textContent = allPassed ? "全部通过" : "存在失败";
+          dom.scenariosStatusBadge.className = allPassed ? "status-badge-pass mono" : "status-badge-fail mono";
+        }
+        if (dom.scenariosSummaryText) {
+          dom.scenariosSummaryText.textContent = allPassed
+            ? "全部 " + total + " 项确定性冲突场景回归通过"
+            : "共有 " + (total - passed) + " 项场景与期望风险等级不一致";
+        }
+
+        if (dom.scenariosTbody) {
+          dom.scenariosTbody.textContent = "";
+          var rows = (res && Array.isArray(res.results)) ? res.results : [];
+          if (!rows.length) {
+            var emptyTr = document.createElement("tr");
+            emptyTr.className = "empty-row";
+            var eth = makeCell("th", "--", "mono", "row");
+            var etd = makeCell("td", "未返回场景回归明细");
+            etd.colSpan = 4;
+            emptyTr.appendChild(eth);
+            emptyTr.appendChild(etd);
+            dom.scenariosTbody.appendChild(emptyTr);
+          } else {
+            var frag = document.createDocumentFragment();
+            rows.forEach(function (item) {
+              var tr = document.createElement("tr");
+              tr.appendChild(makeCell("th", item.name || "--", "mono", "row"));
+              tr.appendChild(makeCell("td", item.description || "--", "cell-wrap"));
+              tr.appendChild(makeCell("td", (item.expected_levels || []).join(", ") || "--", "mono"));
+              tr.appendChild(makeCell("td", (item.actual_levels || []).join(", ") || "--", "mono"));
+
+              var statusTd = document.createElement("td");
+              var badge = document.createElement("span");
+              badge.className = item.passed ? "status-badge-pass mono" : "status-badge-fail mono";
+              badge.textContent = item.passed ? "PASS" : "FAIL";
+              statusTd.appendChild(badge);
+              tr.appendChild(statusTd);
+              frag.appendChild(tr);
+            });
+            dom.scenariosTbody.appendChild(frag);
+          }
+        }
+        showToast("场景回归完成: " + passed + " / " + total + " 通过");
+      })
+      .catch(function (err) {
+        if (dom.scenariosStatusBadge) {
+          dom.scenariosStatusBadge.textContent = "运行失败";
+          dom.scenariosStatusBadge.className = "status-badge-fail mono";
+        }
+        showToast("场景回归失败: " + err.message);
+      })
+      .finally(function () {
+        dom.btnRunScenarios.disabled = false;
+        dom.btnRunScenarios.textContent = "运行场景回归";
+      });
+  }
+
+  function runAblationExperiment() {
+    if (!dom.btnRunAblation) return;
+    dom.btnRunAblation.disabled = true;
+    dom.btnRunAblation.textContent = "实验运行中...";
+    if (dom.ablationMeta) dom.ablationMeta.textContent = "计算中";
+
+    fetchJson("/api/tools/ablation", { method: "POST" })
+      .then(function (res) {
+        state.ablationResult = res;
+        var turnRows = (res && Array.isArray(res.turn_speed_ablation)) ? res.turn_speed_ablation : [];
+        var cmp = (res && res.algorithm_comparison) || {};
+
+        if (dom.ablationMeta) {
+          dom.ablationMeta.textContent = "已完成 · 弯道 " + turnRows.length + " 组";
+        }
+
+        if (dom.ablationTurnTbody) {
+          dom.ablationTurnTbody.textContent = "";
+          if (!turnRows.length) {
+            dom.ablationTurnTbody.appendChild(makeEmptyTableRow("未返回弯道误差消融数据"));
+          } else {
+            var tFrag = document.createDocumentFragment();
+            turnRows.forEach(function (row) {
+              var tr = document.createElement("tr");
+              tr.appendChild(makeCell("th", String(row.estimator_mode || "--").toUpperCase(), "mono", "row"));
+              tr.appendChild(makeCell("td", formatNumber(row.target_speed_kmh, 1, "--"), "mono tabular"));
+              tr.appendChild(makeCell("td", formatNumber(row.turn_rate_rad_s, 2, "--"), "mono tabular"));
+              tr.appendChild(makeCell("td", formatNumber(row.mean_abs_error_kmh, 3, "--"), "mono tabular"));
+              tr.appendChild(makeCell("td", formatNumber(row.max_abs_error_kmh, 3, "--"), "mono tabular"));
+              tr.appendChild(makeCell("td", formatNumber(row.mean_heading_error_deg, 2, "--"), "mono tabular"));
+              tr.appendChild(makeCell("td", formatNumber(row.max_heading_error_deg, 2, "--"), "mono tabular"));
+              tFrag.appendChild(tr);
+            });
+            dom.ablationTurnTbody.appendChild(tFrag);
+          }
+        }
+
+        if (dom.ablationCoreTbody) {
+          dom.ablationCoreTbody.textContent = "";
+          var coreRows = [];
+
+          if (cmp.speed_estimation) {
+            var spd = cmp.speed_estimation;
+            var ema = spd.ema || {};
+            var kal = spd.kalman || {};
+            coreRows.push({
+              dim: "透视测速滤波",
+              base: "EMA: MAE " + formatNumber(ema.mae_ms, 3, "--") + " m/s",
+              prop: "Kalman: MAE " + formatNumber(kal.mae_ms, 3, "--") + " m/s",
+              delta: "滞后 " + formatNumber(ema.mean_lag_s, 2, "--") + "s -> " + formatNumber(kal.mean_lag_s, 2, "--") + "s",
+              ok: Boolean(spd.kalman_improves_mae),
+              badge: spd.kalman_improves_mae ? "误差降低" : "无提升"
+            });
+          }
+
+          if (Array.isArray(cmp.conflict_detection)) {
+            cmp.conflict_detection.forEach(function (c) {
+              var cvm = c.cvm_circle || {};
+              var obb = c.obb_ssm || {};
+              coreRows.push({
+                dim: "OBB-SSM: " + (c.scenario || "--"),
+                base: "CVM: " + (cvm.risk_level || "--") + " (" + formatNumber(cvm.ttc_s, 2, "--") + "s)",
+                prop: "OBB: " + (obb.risk_level || "--") + " (" + formatNumber(obb.ttc_s, 2, "--") + "s)",
+                delta: "MTTC " + formatNumber(obb.mttc_s, 2, "--") + "s · DRAC " + formatNumber(obb.drac_ms2, 2, "--"),
+                ok: true,
+                badge: "PASS"
+              });
+            });
+          }
+
+          if (cmp.tracklet_stitching) {
+            var st = cmp.tracklet_stitching;
+            var un = st.unstitched || {};
+            var sd = st.stitched || {};
+            coreRows.push({
+              dim: "遮挡断轨缝合",
+              base: "未缝合: " + (un.unique_track_ids != null ? un.unique_track_ids : "--") + " ID / 切换 " + (un.id_switches != null ? un.id_switches : "--"),
+              prop: "缝合: " + (sd.unique_track_ids != null ? sd.unique_track_ids : "--") + " ID / 缝合 " + (sd.stitched_count != null ? sd.stitched_count : "--"),
+              delta: "MAE " + formatNumber(un.speed_mae_ms, 3, "--") + " -> " + formatNumber(sd.speed_mae_ms, 3, "--") + " m/s",
+              ok: Boolean(st.stitching_preserved_continuity),
+              badge: st.stitching_preserved_continuity ? "连续保持" : "未保持"
+            });
+          }
+
+          if (!coreRows.length) {
+            var emptyCore = document.createElement("tr");
+            emptyCore.className = "empty-row";
+            var cth = makeCell("th", "--", "mono", "row");
+            var ctd = makeCell("td", "未返回核心模块对比数据");
+            ctd.colSpan = 4;
+            emptyCore.appendChild(cth);
+            emptyCore.appendChild(ctd);
+            dom.ablationCoreTbody.appendChild(emptyCore);
+          } else {
+            var cFrag = document.createDocumentFragment();
+            coreRows.forEach(function (r) {
+              var tr = document.createElement("tr");
+              tr.appendChild(makeCell("th", r.dim, "mono", "row"));
+              tr.appendChild(makeCell("td", r.base, "mono tabular"));
+              tr.appendChild(makeCell("td", r.prop, "mono tabular"));
+              tr.appendChild(makeCell("td", r.delta, "mono tabular"));
+              var resTd = document.createElement("td");
+              var b = document.createElement("span");
+              b.className = r.ok ? "status-badge-pass mono" : "status-badge-fail mono";
+              b.textContent = r.badge;
+              resTd.appendChild(b);
+              tr.appendChild(resTd);
+              cFrag.appendChild(tr);
+            });
+            dom.ablationCoreTbody.appendChild(cFrag);
+          }
+        }
+        showToast("全量算法消融实验完成");
+      })
+      .catch(function (err) {
+        if (dom.ablationMeta) dom.ablationMeta.textContent = "运行失败";
+        showToast("消融实验失败: " + err.message);
+      })
+      .finally(function () {
+        dom.btnRunAblation.disabled = false;
+        dom.btnRunAblation.textContent = "运行全量消融实验";
+      });
+  }
+
+  function toggleAlertSound() {
+    state.soundEnabled = !state.soundEnabled;
+    if (widgets.audioSynth && typeof widgets.audioSynth.setEnabled === "function") {
+      widgets.audioSynth.setEnabled(state.soundEnabled);
+    }
+    if (dom.alertSoundLabel) {
+      dom.alertSoundLabel.textContent = state.soundEnabled ? "声音提示: 开启" : "声音提示: 关闭";
+    }
+    if (dom.btnAlertSoundToggle) {
+      dom.btnAlertSoundToggle.classList.toggle("btn-sound-active", state.soundEnabled);
+    }
+  }
+
   function openJobDialog() {
     dom.jobDialogError.hidden = true;
     dom.jobDialogError.textContent = "";
@@ -1578,27 +2543,59 @@
       dom.jobDialog.showModal();
     }
     loadPresets();
+    loadSystemInfo();
+  }
+
+  function selectOrAppendCalibOption(path) {
+    if (!dom.jobCalib || !path) return;
+    var found = Array.prototype.some.call(dom.jobCalib.options, function (opt) {
+      return opt.value === path;
+    });
+    if (!found) {
+      var opt = document.createElement("option");
+      opt.value = path;
+      opt.textContent = path;
+      dom.jobCalib.appendChild(opt);
+    }
+    dom.jobCalib.value = path;
+  }
+
+  function renderVideoPresetChips(container, videos, onSelect) {
+    if (!container) return;
+    container.textContent = "";
+    videos.forEach(function (v) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "preset-chip";
+      btn.textContent = v.label || v.path;
+      btn.addEventListener("click", function () {
+        onSelect(v.path);
+      });
+      container.appendChild(btn);
+    });
   }
 
   function loadPresets() {
     return fetchJson("/api/presets")
       .then(function (data) {
         state.presets = data;
-        dom.presetVideosList.textContent = "";
         var videos = (data && data.videos) || [];
-        videos.forEach(function (v) {
-          var btn = document.createElement("button");
-          btn.type = "button";
-          btn.className = "preset-chip";
-          btn.textContent = v.label || v.path;
-          btn.addEventListener("click", function () {
-            dom.jobSource.value = v.path;
-            dom.jobSource.dispatchEvent(new Event("input", { bubbles: true }));
-            dom.jobSource.focus();
-          });
-          dom.presetVideosList.appendChild(btn);
+
+        renderVideoPresetChips(dom.presetVideosList, videos, function (path) {
+          dom.jobSource.value = path;
+          dom.jobSource.dispatchEvent(new Event("input", { bubbles: true }));
+          dom.jobSource.focus();
         });
 
+        renderVideoPresetChips(dom.calibPresetVideos, videos, function (path) {
+          if (dom.calibSource) {
+            dom.calibSource.value = path;
+            dom.calibSource.dispatchEvent(new Event("input", { bubbles: true }));
+            dom.calibSource.focus();
+          }
+        });
+
+        var prevCalib = dom.jobCalib.value;
         dom.jobCalib.textContent = "";
         var calibs = (data && data.calibs) || [];
         calibs.forEach(function (c) {
@@ -1610,8 +2607,14 @@
           }
           dom.jobCalib.appendChild(opt);
         });
+        if (prevCalib) {
+          selectOrAppendCalibOption(prevCalib);
+        }
         if (!dom.jobSource.value && videos.length > 0) {
           dom.jobSource.value = videos[0].path;
+        }
+        if (dom.calibSource && !dom.calibSource.value && videos.length > 0) {
+          dom.calibSource.value = videos[0].path;
         }
       })
       .catch(function () {
@@ -1653,6 +2656,10 @@
 
     if (dom.jobCalib.value) {
       payload.calib_path = dom.jobCalib.value;
+    }
+
+    if (dom.jobWeights && dom.jobWeights.value) {
+      payload.weights = dom.jobWeights.value;
     }
 
     var maxFramesRaw = dom.jobMaxFrames.value.trim();
@@ -1698,6 +2705,42 @@
       });
   }
 
+  function handleGlobalKeydown(ev) {
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    if (document.querySelector("dialog[open]")) return;
+
+    var target = ev.target;
+    var tag = target && target.tagName ? target.tagName.toUpperCase() : "";
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || (target && target.isContentEditable)) {
+      return;
+    }
+
+    if (ev.key === "1") {
+      switchView("monitor");
+    } else if (ev.key === "2") {
+      switchView("alerts");
+    } else if (ev.key === "3") {
+      switchView("history");
+    } else if (ev.key === "4") {
+      switchView("studio");
+    } else if (ev.key === "n" || ev.key === "N") {
+      ev.preventDefault();
+      openJobDialog();
+    } else if (ev.code === "Space" || ev.key === " ") {
+      if (tag === "BUTTON" || tag === "A" || (target && target.getAttribute && target.getAttribute("role") === "button")) {
+        return;
+      }
+      if (state.activeView === "monitor") {
+        ev.preventDefault();
+        if (state.mode === "simulation" && dom.btnTwinPause) {
+          dom.btnTwinPause.click();
+        } else if (state.mode === "replay" && dom.btnReplayToggle) {
+          dom.btnReplayToggle.click();
+        }
+      }
+    }
+  }
+
   function bindEvents() {
     dom.navItems.forEach(function (btn) {
       btn.addEventListener("click", function () {
@@ -1730,6 +2773,16 @@
     $("topbar-theme-btn").addEventListener("click", toggleTheme);
     $("mobile-theme-btn").addEventListener("click", toggleTheme);
 
+    if (dom.btnDesktopShutdown) {
+      dom.btnDesktopShutdown.addEventListener("click", handleDesktopShutdown);
+    }
+    if (dom.mobileDesktopShutdown) {
+      dom.mobileDesktopShutdown.addEventListener("click", function () {
+        if (dom.mobileNavDialog.open) dom.mobileNavDialog.close();
+        handleDesktopShutdown();
+      });
+    }
+
     $("open-job-dialog-btn").addEventListener("click", openJobDialog);
     $("mobile-new-job-btn").addEventListener("click", function () {
       if (dom.mobileNavDialog.open) dom.mobileNavDialog.close();
@@ -1743,6 +2796,22 @@
       if (dom.jobDialog.open) dom.jobDialog.close();
     });
     dom.jobForm.addEventListener("submit", handleJobSubmit);
+
+    if (dom.btnJobBrowseSource) {
+      dom.btnJobBrowseSource.addEventListener("click", function () {
+        browseNativeFile("video", function (path) {
+          dom.jobSource.value = path;
+          dom.jobSource.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+      });
+    }
+    if (dom.btnJobBrowseCalib) {
+      dom.btnJobBrowseCalib.addEventListener("click", function () {
+        browseNativeFile("calib", function (path) {
+          selectOrAppendCalibOption(path);
+        });
+      });
+    }
 
     dom.scenarioSelect.addEventListener("change", function () {
       state.scenario = dom.scenarioSelect.value;
@@ -1837,6 +2906,10 @@
       });
     });
 
+    if (dom.btnAlertSoundToggle) {
+      dom.btnAlertSoundToggle.addEventListener("click", toggleAlertSound);
+    }
+
     document.querySelectorAll("[data-log-filter]").forEach(function (btn) {
       btn.addEventListener("click", function () {
         state.alertLogFilter = btn.dataset.logFilter || "all";
@@ -1868,25 +2941,140 @@
       }
     });
 
+    if (dom.btnHistoryCharts) {
+      dom.btnHistoryCharts.addEventListener("click", generateHistoryCharts);
+    }
+    if (dom.btnExportCsv) {
+      dom.btnExportCsv.addEventListener("click", function () {
+        triggerRunExport("speeds.csv");
+      });
+    }
+    if (dom.btnExportConflicts) {
+      dom.btnExportConflicts.addEventListener("click", function () {
+        triggerRunExport("conflicts.jsonl");
+      });
+    }
+    if (dom.btnExportSummary) {
+      dom.btnExportSummary.addEventListener("click", function () {
+        triggerRunExport("summary.json");
+      });
+    }
+    if (dom.btnHistoryOpenFolder) {
+      dom.btnHistoryOpenFolder.addEventListener("click", openRunFolder);
+    }
+    if (dom.btnHistoryDelete) {
+      dom.btnHistoryDelete.addEventListener("click", openDeleteRunDialog);
+    }
+
+    $("confirm-delete-close").addEventListener("click", function () {
+      if (dom.confirmDeleteDialog.open) dom.confirmDeleteDialog.close();
+    });
+    dom.confirmDeleteCancel.addEventListener("click", function () {
+      if (dom.confirmDeleteDialog.open) dom.confirmDeleteDialog.close();
+    });
+    dom.confirmDeleteSubmit.addEventListener("click", confirmDeleteRun);
+
+    $("lightbox-close").addEventListener("click", function () {
+      if (dom.chartLightboxDialog.open) dom.chartLightboxDialog.close();
+    });
+    $("lightbox-done").addEventListener("click", function () {
+      if (dom.chartLightboxDialog.open) dom.chartLightboxDialog.close();
+    });
+
     document.querySelectorAll("[data-table-tab]").forEach(function (btn) {
       btn.addEventListener("click", function () {
         state.historyTableTab = btn.dataset.tableTab || "conflicts";
         updateHistoryTableVisibility();
       });
     });
+
+    document.querySelectorAll("[data-studio-tab]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        switchStudioTab(btn.dataset.studioTab || "calib");
+      });
+    });
+
+    if (dom.btnCalibBrowseVideo) {
+      dom.btnCalibBrowseVideo.addEventListener("click", function () {
+        browseNativeFile("video", function (path) {
+          dom.calibSource.value = path;
+          dom.calibSource.dispatchEvent(new Event("input", { bubbles: true }));
+        });
+      });
+    }
+    if (dom.btnCalibExtract) {
+      dom.btnCalibExtract.addEventListener("click", extractCalibrationFrame);
+    }
+    if (dom.btnCalibToolPoints) {
+      dom.btnCalibToolPoints.addEventListener("click", function () {
+        setCalibTool("points");
+      });
+    }
+    if (dom.btnCalibToolParking) {
+      dom.btnCalibToolParking.addEventListener("click", function () {
+        setCalibTool("parking");
+      });
+    }
+    if (dom.btnCalibFinishParking) {
+      dom.btnCalibFinishParking.addEventListener("click", function () {
+        if (widgets.calibCanvas && typeof widgets.calibCanvas.finishParkingZone === "function") {
+          var ok = widgets.calibCanvas.finishParkingZone();
+          if (!ok) {
+            showCalibError("请先在“绘制禁停区”模式下至少点击 3 个顶点后再完成闭合");
+          } else {
+            showCalibError("");
+            showToast("已完成当前禁停标定区闭合");
+          }
+        }
+      });
+    }
+    if (dom.btnCalibUndo) {
+      dom.btnCalibUndo.addEventListener("click", function () {
+        if (widgets.calibCanvas && typeof widgets.calibCanvas.undo === "function") {
+          widgets.calibCanvas.undo();
+        }
+      });
+    }
+    if (dom.btnCalibClear) {
+      dom.btnCalibClear.addEventListener("click", function () {
+        if (!widgets.calibCanvas) return;
+        if (state.calibTool === "parking" && typeof widgets.calibCanvas.clearParkingZones === "function") {
+          widgets.calibCanvas.clearParkingZones();
+        } else if (typeof widgets.calibCanvas.clearPoints === "function") {
+          widgets.calibCanvas.clearPoints();
+        }
+      });
+    }
+    if (dom.btnCalibPreview) {
+      dom.btnCalibPreview.addEventListener("click", previewCalibration);
+    }
+    if (dom.btnCalibSave) {
+      dom.btnCalibSave.addEventListener("click", saveCalibration);
+    }
+
+    if (dom.btnRunScenarios) {
+      dom.btnRunScenarios.addEventListener("click", runScenariosRegression);
+    }
+    if (dom.btnRunAblation) {
+      dom.btnRunAblation.addEventListener("click", runAblationExperiment);
+    }
+
+    document.addEventListener("keydown", handleGlobalKeydown);
   }
 
   function init() {
     initDomRefs();
     initTheme();
-    setupDialog(dom.jobDialog);
-    setupDialog(dom.mobileNavDialog);
+    document.querySelectorAll('dialog[closedby="any"]').forEach(setupDialog);
     initWidgets();
     updateAlgorithmBadges();
     bindEvents();
     setMonitorMode("simulation");
+    switchStudioTab("calib");
+    setCalibTool("points");
     dom.pipelineStageDetail.textContent = PIPELINE_STAGE_INFO.detect;
     loadHealth();
+    loadSystemInfo();
     loadRunsList();
     loadPresets();
   }

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <title>CampusMotion | 校园道路冲突感知控制台</title>
+  <link rel="icon" href="/assets/favicon.ico" sizes="any">
   <link rel="stylesheet" href="/assets/styles.css">
   <script src="/assets/motion.js" defer></script>
   <script src="/assets/app.js" defer></script>
@@ -53,6 +54,16 @@
             </svg>
             <span>历史档案与时间轴</span>
           </button>
+          <button type="button" class="nav-item" data-view="studio">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3v3"></path>
+              <path d="M12 18v3"></path>
+              <path d="M3 12h3"></path>
+              <path d="M18 12h3"></path>
+              <circle cx="12" cy="12" r="5"></circle>
+            </svg>
+            <span>标定与实验中心</span>
+          </button>
         </nav>
       </div>
 
@@ -73,6 +84,10 @@
             <span class="service-key">当前记录</span>
             <span id="sidebar-target-text" class="service-val mono tabular">--</span>
           </div>
+          <div class="service-row">
+            <span class="service-key">计算设备</span>
+            <span id="sidebar-compute-text" class="service-val mono">--</span>
+          </div>
         </div>
 
         <button type="button" id="sidebar-theme-btn" class="btn btn-secondary btn-block">
@@ -88,6 +103,14 @@
             <path d="M19.07 4.93l-1.41 1.41"></path>
           </svg>
           <span id="theme-toggle-label">切换浅色纸张</span>
+        </button>
+
+        <button type="button" id="btn-desktop-shutdown" class="btn btn-danger-outline btn-block" hidden>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3v9"></path>
+            <path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path>
+          </svg>
+          <span>退出桌面程序</span>
         </button>
       </div>
     </aside>
@@ -351,6 +374,23 @@
 
         <!-- View 2: 双端预警镜像 -->
         <section id="view-alerts" class="view-section" hidden aria-labelledby="view-title">
+          <div class="panel alerts-toolbar">
+            <div class="card-title-group">
+              <span class="field-label">双端联动状态</span>
+              <span class="meta-tag mono">L1 仅车端 / L2-L3 双端同步</span>
+            </div>
+            <div class="alerts-toolbar-actions">
+              <button type="button" id="btn-alert-sound-toggle" class="btn btn-secondary">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                  <line x1="23" y1="9" x2="17" y2="15"></line>
+                  <line x1="17" y1="9" x2="23" y2="15"></line>
+                </svg>
+                <span id="alert-sound-label">声音提示: 关闭</span>
+              </button>
+            </div>
+          </div>
+
           <div class="dual-terminals-grid">
             <article id="driver-terminal" class="panel terminal-card beam-active" data-risk="0">
               <header class="terminal-head">
@@ -456,7 +496,15 @@
               <select id="history-run-select" class="form-control select-run"></select>
               <button type="button" id="btn-refresh-runs" class="btn btn-secondary">刷新列表</button>
             </div>
-            <button type="button" id="btn-history-replay" class="btn btn-primary">在监测台回放该记录</button>
+            <div class="history-actions">
+              <button type="button" id="btn-history-replay" class="btn btn-primary">在监测台回放该记录</button>
+              <button type="button" id="btn-history-charts" class="btn btn-secondary">生成论文图表</button>
+              <button type="button" id="btn-export-csv" class="btn btn-secondary">导出 CSV</button>
+              <button type="button" id="btn-export-conflicts" class="btn btn-secondary">导出冲突JSONL</button>
+              <button type="button" id="btn-export-summary" class="btn btn-secondary">导出摘要</button>
+              <button type="button" id="btn-history-open-folder" class="btn btn-secondary">打开目录</button>
+              <button type="button" id="btn-history-delete" class="btn btn-danger-outline">删除记录</button>
+            </div>
           </div>
 
           <div class="summary-pills-grid">
@@ -493,6 +541,16 @@
             <div class="timeline-stage">
               <canvas id="speed-timeline-canvas" aria-label="历史运行车速与冲突风险时间轴"></canvas>
             </div>
+          </article>
+
+          <article id="history-charts-card" class="panel charts-gallery-card" hidden>
+            <header class="card-header">
+              <div class="card-title-group">
+                <h2 class="card-title">论文实验分析图表</h2>
+                <span id="history-charts-meta" class="meta-tag mono tabular">0 张图表</span>
+              </div>
+            </header>
+            <div id="history-charts-grid" class="charts-gallery-grid"></div>
           </article>
 
           <article class="panel history-tables-card">
@@ -563,6 +621,236 @@
             </div>
           </article>
         </section>
+
+        <!-- View 4: 标定与实验中心 -->
+        <section id="view-studio" class="view-section" hidden aria-labelledby="view-title">
+          <div class="panel studio-tabs-bar">
+            <div class="segmented" role="tablist" aria-label="标定与算法实验功能切换">
+              <button type="button" id="studio-tab-calib" class="seg-btn is-active" role="tab" aria-selected="true" data-studio-tab="calib">可视化道路标定</button>
+              <button type="button" id="studio-tab-lab" class="seg-btn" role="tab" aria-selected="false" data-studio-tab="lab">算法评测与消融</button>
+            </div>
+            <span id="studio-status-pill" class="meta-tag mono">单应标定与回归实验工作台</span>
+          </div>
+
+          <!-- Panel A: 可视化道路标定 -->
+          <div id="studio-panel-calib" class="studio-panel">
+            <article class="panel studio-source-card">
+              <header class="card-header">
+                <div class="card-title-group">
+                  <h2 class="card-title">标定参考帧提取</h2>
+                  <span id="calib-frame-meta" class="meta-tag mono tabular">尚未加载视频帧</span>
+                </div>
+                <div id="calib-preset-videos" class="preset-chips"></div>
+              </header>
+              <div class="calib-source-row">
+                <div class="calib-source-field">
+                  <label class="sr-only" for="calib-source">标定视频路径</label>
+                  <input id="calib-source" type="text" class="form-control" placeholder="输入本地视频路径，或点击上方预设 / 右侧浏览">
+                  <button type="button" id="btn-calib-browse-video" class="btn btn-secondary" hidden>浏览视频...</button>
+                </div>
+                <div class="calib-frame-controls">
+                  <label class="field-label" for="calib-frame-index">帧号</label>
+                  <input id="calib-frame-index" type="number" class="form-control tabular calib-frame-input" min="0" step="1" value="0">
+                  <button type="button" id="btn-calib-extract" class="btn btn-primary">提取标定帧</button>
+                </div>
+              </div>
+            </article>
+
+            <div class="studio-calib-grid">
+              <article class="panel calib-canvas-card">
+                <header class="card-header">
+                  <div class="card-title-group">
+                    <h2 class="card-title">交互式平面角点与禁停区画布</h2>
+                    <span id="calib-point-count" class="meta-tag mono tabular">已选 P0 · 至少 4 点</span>
+                  </div>
+                </header>
+
+                <div class="calib-toolbar" role="toolbar" aria-label="标定画布工具">
+                  <div class="segmented" role="group" aria-label="交互模式">
+                    <button type="button" id="btn-calib-tool-points" class="seg-btn is-active" data-calib-tool="points">标定参考点(4+)</button>
+                    <button type="button" id="btn-calib-tool-parking" class="seg-btn" data-calib-tool="parking">绘制禁停区</button>
+                  </div>
+                  <div class="calib-tool-actions">
+                    <button type="button" id="btn-calib-finish-parking" class="btn btn-secondary">完成当前禁停区</button>
+                    <button type="button" id="btn-calib-undo" class="btn btn-ghost">撤销一点</button>
+                    <button type="button" id="btn-calib-clear" class="btn btn-ghost">清空当前</button>
+                  </div>
+                </div>
+
+                <div class="calib-stage">
+                  <canvas id="calib-editor-canvas" aria-label="可视化道路单应标定交互画布"></canvas>
+                </div>
+
+                <div class="calib-coords-strip">
+                  <span class="field-label">坐标序列</span>
+                  <div id="calib-coords-pill" class="calib-coords-pill mono tabular">在画布点击标定参考点 P1..PN（支持拖拽微调）</div>
+                </div>
+              </article>
+
+              <article class="panel calib-params-card">
+                <header class="card-header">
+                  <div class="card-title-group">
+                    <h2 class="card-title">地面尺寸与单应矩阵求解</h2>
+                    <span id="calib-valid-badge" class="meta-tag mono">待校验</span>
+                  </div>
+                </header>
+
+                <form id="calib-form" class="calib-form">
+                  <div class="form-grid">
+                    <div class="form-field">
+                      <label class="field-label" for="calib-width-m">标定区域宽度 width_m (m)</label>
+                      <input id="calib-width-m" type="number" class="form-control tabular" min="0.5" max="200" step="0.1" value="6.0" required>
+                    </div>
+                    <div class="form-field">
+                      <label class="field-label" for="calib-length-m">标定区域长度 length_m (m)</label>
+                      <input id="calib-length-m" type="number" class="form-control tabular" min="0.5" max="500" step="0.1" value="15.0" required>
+                    </div>
+                    <div class="form-field">
+                      <label class="field-label" for="calib-name">场景名称 name</label>
+                      <input id="calib-name" type="text" class="form-control" value="campus_road" required>
+                    </div>
+                    <div class="form-field">
+                      <label class="field-label" for="calib-filename">保存文件名 (.yaml)</label>
+                      <input id="calib-filename" type="text" class="form-control mono" value="campus_calibrated.yaml" required>
+                    </div>
+                  </div>
+
+                  <label class="check-row">
+                    <input type="checkbox" id="calib-use-ransac" checked>
+                    <span>启用 RANSAC 鲁棒估计（5+ 参考点时抑制误点）</span>
+                  </label>
+
+                  <div id="calib-error" class="form-error" role="alert" hidden></div>
+
+                  <div class="calib-action-row">
+                    <button type="button" id="btn-calib-preview" class="btn btn-secondary">校验单应矩阵</button>
+                    <button type="button" id="btn-calib-save" class="btn btn-primary">保存标定文件</button>
+                  </div>
+
+                  <dl id="calib-result-box" class="calib-result-grid">
+                    <div class="metric-cell">
+                      <dt>重投影均方根误差 RMSE</dt>
+                      <dd id="calib-rmse-val" class="mono tabular">-- m</dd>
+                    </div>
+                    <div class="metric-cell">
+                      <dt>内点 / 禁停区</dt>
+                      <dd id="calib-inliers-val" class="mono tabular">--</dd>
+                    </div>
+                    <div class="metric-cell calib-result-full">
+                      <dt>最近保存配置路径</dt>
+                      <dd id="calib-saved-val" class="mono">--</dd>
+                    </div>
+                  </dl>
+                </form>
+              </article>
+            </div>
+          </div>
+
+          <!-- Panel B: 算法评测与消融 -->
+          <div id="studio-panel-lab" class="studio-panel" hidden>
+            <article class="panel lab-card">
+              <header class="card-header">
+                <div class="card-title-group">
+                  <h2 class="card-title">确定性冲突场景回归（12 项）</h2>
+                  <span id="scenarios-status-badge" class="meta-tag mono">待运行</span>
+                </div>
+                <button type="button" id="btn-run-scenarios" class="btn btn-primary">运行场景回归</button>
+              </header>
+
+              <div class="lab-kpi-strip">
+                <div class="lab-kpi-item">
+                  <span class="kpi-label">通过 / 总数</span>
+                  <strong id="scenarios-pass-ratio" class="summary-val mono tabular">-- / --</strong>
+                </div>
+                <div class="lab-kpi-item">
+                  <span class="kpi-label">回归说明</span>
+                  <span id="scenarios-summary-text" class="kpi-meta">执行基础冲突、OBB-SSM、MTTC/DRAC 与弯道 CTRV 12 项确定性场景</span>
+                </div>
+              </div>
+
+              <div id="scenarios-table-region" tabindex="0" role="region" aria-labelledby="scenarios-table-heading" class="table-wrapper">
+                <h3 id="scenarios-table-heading" class="sr-only">确定性冲突场景回归明细表</h3>
+                <table class="data-table scenarios-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">场景名称</th>
+                      <th scope="col">场景说明</th>
+                      <th scope="col">期望等级</th>
+                      <th scope="col">实测等级</th>
+                      <th scope="col">状态</th>
+                    </tr>
+                  </thead>
+                  <tbody id="scenarios-tbody">
+                    <tr class="empty-row">
+                      <th scope="row">--</th>
+                      <td colspan="4">点击“运行场景回归”执行 12 项冲突规则验证</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </article>
+
+            <article class="panel lab-card">
+              <header class="card-header">
+                <div class="card-title-group">
+                  <h2 class="card-title">算法消融实验室</h2>
+                  <span id="ablation-meta" class="meta-tag mono">待运行</span>
+                </div>
+                <button type="button" id="btn-run-ablation" class="btn btn-secondary">运行全量消融实验</button>
+              </header>
+
+              <div class="lab-subsection">
+                <h3 class="subpanel-title">弯道 CTRV / Kalman / EMA 误差对比</h3>
+                <div id="ablation-turn-table-region" tabindex="0" role="region" aria-labelledby="ablation-turn-heading" class="table-wrapper">
+                  <h4 id="ablation-turn-heading" class="sr-only">弯道 CTRV 与 Kalman、EMA 误差对比表</h4>
+                  <table class="data-table ablation-turn-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">滤波器模式</th>
+                        <th scope="col">真值速度 (km/h)</th>
+                        <th scope="col">转弯率 (rad/s)</th>
+                        <th scope="col">平均速度误差 (km/h)</th>
+                        <th scope="col">最大速度误差 (km/h)</th>
+                        <th scope="col">平均航向误差 (deg)</th>
+                        <th scope="col">最大航向误差 (deg)</th>
+                      </tr>
+                    </thead>
+                    <tbody id="ablation-turn-tbody">
+                      <tr class="empty-row">
+                        <th scope="row">--</th>
+                        <td colspan="6">点击“运行全量消融实验”对比弯道测速与航向收敛精度</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div class="lab-subsection">
+                <h3 class="subpanel-title">核心模块对比（测速 / OBB冲突 / 缝合）</h3>
+                <div id="ablation-core-table-region" tabindex="0" role="region" aria-labelledby="ablation-core-heading" class="table-wrapper">
+                  <h4 id="ablation-core-heading" class="sr-only">核心算法模块消融对比表</h4>
+                  <table class="data-table ablation-core-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">对比维度</th>
+                        <th scope="col">基准方案</th>
+                        <th scope="col">增强方案</th>
+                        <th scope="col">核心指标变化</th>
+                        <th scope="col">验证结论</th>
+                      </tr>
+                    </thead>
+                    <tbody id="ablation-core-tbody">
+                      <tr class="empty-row">
+                        <th scope="row">--</th>
+                        <td colspan="4">点击“运行全量消融实验”生成透视测速、OBB-SSM 与轨迹缝合对比结果</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </article>
+          </div>
+        </section>
       </main>
     </div>
   </div>
@@ -593,12 +881,25 @@
       <div class="form-grid">
         <div class="form-field form-field-full">
           <label class="field-label" for="job-source">视频输入源 (本地路径 / RTSP / 摄像头索引)</label>
-          <input id="job-source" name="source" type="text" class="form-control" required autofocus placeholder="例如 runs/tracking-fixtures/sample_01/sample_a.mp4 或 0">
+          <div class="input-browse-row">
+            <input id="job-source" name="source" type="text" class="form-control" required autofocus placeholder="例如 runs/tracking-fixtures/sample_01/sample_a.mp4 或 0">
+            <button type="button" id="btn-job-browse-source" class="btn btn-secondary" hidden>浏览...</button>
+          </div>
         </div>
 
         <div class="form-field">
           <label class="field-label" for="job-calib">标定配置文件</label>
-          <select id="job-calib" name="calib_path" class="form-control"></select>
+          <div class="input-browse-row">
+            <select id="job-calib" name="calib_path" class="form-control"></select>
+            <button type="button" id="btn-job-browse-calib" class="btn btn-secondary" hidden>浏览...</button>
+          </div>
+        </div>
+
+        <div class="form-field">
+          <label class="field-label" for="job-weights">检测权重模型 (可选)</label>
+          <select id="job-weights" name="weights" class="form-control">
+            <option value="">默认权重 (自动选择)</option>
+          </select>
         </div>
 
         <div class="form-field">
@@ -662,6 +963,57 @@
     </form>
   </dialog>
 
+  <!-- 删除历史记录确认对话框 -->
+  <dialog id="confirm-delete-dialog" class="modal-dialog modal-compact" closedby="any" aria-labelledby="delete-dialog-title">
+    <header class="dialog-header">
+      <div>
+        <h1 id="delete-dialog-title" class="dialog-title">确认删除分析记录</h1>
+        <p class="dialog-subtitle">此操作将从磁盘永久移除该次运行的产物目录与导出文件</p>
+      </div>
+      <button type="button" id="confirm-delete-close" class="btn btn-icon" aria-label="关闭删除确认弹窗">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18 6L6 18"></path>
+          <path d="M6 6l12 12"></path>
+        </svg>
+      </button>
+    </header>
+    <div class="dialog-body">
+      <p class="delete-confirm-copy">
+        即将永久删除运行记录 <strong id="delete-dialog-run-id" class="mono">--</strong>（含视频、轨迹测速 CSV、冲突 JSONL 及已生成的论文图表），操作不可撤销。
+      </p>
+      <div id="confirm-delete-error" class="form-error" role="alert" hidden></div>
+      <footer class="dialog-footer">
+        <button type="button" id="confirm-delete-cancel" class="btn btn-secondary" autofocus>取消</button>
+        <button type="button" id="confirm-delete-submit" class="btn btn-danger-outline">确认删除</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <!-- 论文图表灯箱预览对话框 -->
+  <dialog id="chart-lightbox-dialog" class="modal-dialog modal-lightbox" closedby="any" aria-labelledby="lightbox-title">
+    <header class="dialog-header">
+      <div>
+        <h1 id="lightbox-title" class="dialog-title">实验图表预览</h1>
+        <p id="lightbox-subtitle" class="dialog-subtitle mono">--</p>
+      </div>
+      <button type="button" id="lightbox-close" class="btn btn-icon" aria-label="关闭图表预览弹窗">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18 6L6 18"></path>
+          <path d="M6 6l12 12"></path>
+        </svg>
+      </button>
+    </header>
+    <div class="dialog-body lightbox-body">
+      <div class="lightbox-stage">
+        <img id="lightbox-img" class="lightbox-img" alt="论文图表大图预览">
+      </div>
+      <footer class="dialog-footer">
+        <a id="lightbox-download" class="btn btn-secondary" download>下载 PNG</a>
+        <button type="button" id="lightbox-done" class="btn btn-primary">关闭</button>
+      </footer>
+    </div>
+  </dialog>
+
   <!-- 移动端导航抽屉对话框 -->
   <dialog id="mobile-nav-dialog" class="drawer-dialog" closedby="any" aria-labelledby="mobile-nav-title">
     <header class="dialog-header">
@@ -677,11 +1029,15 @@
       <button type="button" class="mobile-nav-item" data-view="monitor" autofocus>实时监测台</button>
       <button type="button" class="mobile-nav-item" data-view="alerts">双端预警镜像</button>
       <button type="button" class="mobile-nav-item" data-view="history">历史档案与时间轴</button>
+      <button type="button" class="mobile-nav-item" data-view="studio">标定与实验中心</button>
     </nav>
     <div class="mobile-nav-actions">
       <button type="button" id="mobile-new-job-btn" class="btn btn-primary btn-block">新建实时检测任务</button>
       <button type="button" id="mobile-theme-btn" class="btn btn-secondary btn-block">切换明暗主题</button>
+      <button type="button" id="mobile-desktop-shutdown" class="btn btn-danger-outline btn-block" hidden>退出桌面程序</button>
     </div>
   </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
 </body>
 </html>

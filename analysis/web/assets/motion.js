@@ -4,7 +4,9 @@
  *   RollingCounter,
  *   AnimatedSignalPipeline,
  *   CampusRoadTwinCanvas,
- *   SpeedTimelineChart
+ *   SpeedTimelineChart,
+ *   CalibrationCanvas,
+ *   AlertAudioSynth
  * }
  */
 (function (global) {
@@ -3081,12 +3083,1148 @@
     };
 
     /* ======================================================================
+     * 5. CalibrationCanvas (Interactive Homography & Parking Zone Editor)
+     * ====================================================================== */
+    function roundCoord1(val) {
+        return Math.round(val * 10) / 10;
+    }
+
+    function clonePointPair(pt) {
+        if (!Array.isArray(pt) || pt.length < 2) return null;
+        var u = toNum(pt[0], NaN);
+        var v = toNum(pt[1], NaN);
+        if (!Number.isFinite(u) || !Number.isFinite(v)) return null;
+        return [u, v];
+    }
+
+    function clonePointList(list) {
+        var out = [];
+        if (!Array.isArray(list)) return out;
+        for (var i = 0; i < list.length; i += 1) {
+            var pair = clonePointPair(list[i]);
+            if (pair) out.push(pair);
+        }
+        return out;
+    }
+
+    function clonePolygonList(polys) {
+        var out = [];
+        if (!Array.isArray(polys)) return out;
+        for (var i = 0; i < polys.length; i += 1) {
+            var poly = clonePointList(polys[i]);
+            if (poly.length >= 3) out.push(poly);
+        }
+        return out;
+    }
+
+    function CalibrationCanvas(canvasEl, options) {
+        if (!(this instanceof CalibrationCanvas)) {
+            return new CalibrationCanvas(canvasEl, options);
+        }
+        if (!canvasEl) {
+            throw new Error("CalibrationCanvas requires a valid <canvas> element");
+        }
+        var opts = options || {};
+        this._canvas = canvasEl;
+        this._ctx = canvasEl.getContext("2d");
+        this._onChange = typeof opts.onChange === "function" ? opts.onChange : null;
+
+        this._tool = "points";
+        this._image = null;
+        this._imageReady = false;
+        this._imageWidth = 0;
+        this._imageHeight = 0;
+        this._loadToken = 0;
+
+        this._imagePoints = [];
+        this._parkingZonesImage = [];
+        this._currentParkingDraft = [];
+
+        this._dragState = null;
+        this._hoverVertexIdx = -1;
+        this._hoverPos = null;
+        this._lastEmitTs = 0;
+        this._emitTimer = null;
+        this._destroyed = false;
+
+        this._cssWidth = 0;
+        this._cssHeight = 0;
+        this._dpr = Math.min(global.devicePixelRatio || 1, 2);
+
+        this._probe = createColorProbe();
+        this._palette = readThemePalette(this._probe);
+
+        if (this._canvas.style && !this._canvas.style.touchAction) {
+            this._canvas.style.touchAction = "none";
+        }
+
+        var self = this;
+        this._motionTracker = createReducedMotionTracker(function () {
+            if (!self._destroyed) {
+                self._render();
+            }
+        });
+        this._unobserveTheme = observeThemeChanges(function () {
+            self.refreshTheme();
+        });
+
+        this._onPointerDown = function (ev) {
+            self._handlePointerDown(ev);
+        };
+        this._onPointerMove = function (ev) {
+            self._handlePointerMove(ev);
+        };
+        this._onPointerUp = function (ev) {
+            self._handlePointerUp(ev);
+        };
+        this._onPointerCancel = function (ev) {
+            self._handlePointerUp(ev);
+        };
+        this._onPointerLeave = function () {
+            if (!self._dragState && (self._hoverVertexIdx !== -1 || self._hoverPos !== null)) {
+                self._hoverVertexIdx = -1;
+                self._hoverPos = null;
+                self._updateCursor();
+                self._render();
+            }
+        };
+
+        this._canvas.addEventListener("pointerdown", this._onPointerDown);
+        this._canvas.addEventListener("pointermove", this._onPointerMove);
+        this._canvas.addEventListener("pointerup", this._onPointerUp);
+        this._canvas.addEventListener("pointercancel", this._onPointerCancel);
+        this._canvas.addEventListener("pointerleave", this._onPointerLeave);
+
+        if (typeof ResizeObserver === "function") {
+            this._resizeObserver = new ResizeObserver(function () {
+                self._measure();
+                self._render();
+            });
+            this._resizeObserver.observe(this._canvas);
+        } else {
+            this._resizeObserver = null;
+        }
+
+        this._measure();
+        this._updateCursor();
+        this._render();
+    }
+
+    CalibrationCanvas.prototype._measure = function () {
+        var rect = this._canvas.getBoundingClientRect();
+        var w = Math.max(0, rect.width || this._canvas.clientWidth || 0);
+        var h = Math.max(0, rect.height || this._canvas.clientHeight || 0);
+        this._dpr = Math.min(global.devicePixelRatio || 1, 2);
+        this._cssWidth = w;
+        this._cssHeight = h;
+        if (w >= 2 && h >= 2) {
+            var pw = Math.round(w * this._dpr);
+            var ph = Math.round(h * this._dpr);
+            if (this._canvas.width !== pw || this._canvas.height !== ph) {
+                this._canvas.width = pw;
+                this._canvas.height = ph;
+            }
+        }
+    };
+
+    CalibrationCanvas.prototype._hasFrameDimensions = function () {
+        return this._imageWidth > 0 && this._imageHeight > 0;
+    };
+
+    CalibrationCanvas.prototype._computeFitRect = function () {
+        var w = this._cssWidth > 2
+            ? this._cssWidth
+            : (this._canvas.clientWidth || (this._canvas.width / (this._dpr || 1)) || 640);
+        var h = this._cssHeight > 2
+            ? this._cssHeight
+            : (this._canvas.clientHeight || (this._canvas.height / (this._dpr || 1)) || 360);
+        var pad = clamp(Math.floor(Math.min(w, h) * 0.045), 10, 18);
+        var availW = Math.max(20, w - pad * 2);
+        var availH = Math.max(20, h - pad * 2);
+        var imgW = this._imageWidth > 0 ? this._imageWidth : 1280;
+        var imgH = this._imageHeight > 0 ? this._imageHeight : 720;
+        var scale = Math.min(availW / imgW, availH / imgH);
+        var drawW = imgW * scale;
+        var drawH = imgH * scale;
+        return {
+            x: pad + (availW - drawW) * 0.5,
+            y: pad + (availH - drawH) * 0.5,
+            w: drawW,
+            h: drawH,
+            scale: scale,
+            imgW: imgW,
+            imgH: imgH
+        };
+    };
+
+    CalibrationCanvas.prototype.imageToCanvas = function (u, v) {
+        var imgU = u;
+        var imgV = v;
+        if (Array.isArray(u)) {
+            imgU = u[0];
+            imgV = u[1];
+        } else if (u && typeof u === "object") {
+            imgU = u.u !== undefined ? u.u : u.x;
+            imgV = u.v !== undefined ? u.v : u.y;
+        }
+        var fit = this._computeFitRect();
+        return {
+            x: fit.x + toNum(imgU, 0) * fit.scale,
+            y: fit.y + toNum(imgV, 0) * fit.scale
+        };
+    };
+
+    CalibrationCanvas.prototype.canvasToImage = function (cx, cy) {
+        var px = cx;
+        var py = cy;
+        if (Array.isArray(cx)) {
+            px = cx[0];
+            py = cx[1];
+        } else if (cx && typeof cx === "object") {
+            px = cx.x;
+            py = cx.y;
+        }
+        var fit = this._computeFitRect();
+        var rawU = (toNum(px, fit.x) - fit.x) / Math.max(1e-6, fit.scale);
+        var rawV = (toNum(py, fit.y) - fit.y) / Math.max(1e-6, fit.scale);
+        return {
+            u: clamp(roundCoord1(rawU), 0, fit.imgW),
+            v: clamp(roundCoord1(rawV), 0, fit.imgH)
+        };
+    };
+
+    CalibrationCanvas.prototype._pointerToCanvas = function (ev) {
+        var rect = this._canvas.getBoundingClientRect();
+        var x = ev.clientX - (rect.left || 0);
+        var y = ev.clientY - (rect.top || 0);
+        if (rect.width > 1 && this._cssWidth > 1 && Math.abs(rect.width - this._cssWidth) > 1) {
+            x = x * (this._cssWidth / rect.width);
+        }
+        if (rect.height > 1 && this._cssHeight > 1 && Math.abs(rect.height - this._cssHeight) > 1) {
+            y = y * (this._cssHeight / rect.height);
+        }
+        return { x: x, y: y };
+    };
+
+    CalibrationCanvas.prototype._activeVertexList = function () {
+        return this._tool === "parking" ? this._currentParkingDraft : this._imagePoints;
+    };
+
+    CalibrationCanvas.prototype._findNearestVertex = function (cx, cy, list, maxDistPx) {
+        var threshold = maxDistPx !== undefined ? maxDistPx : 14;
+        var bestIdx = -1;
+        var bestDist = Infinity;
+        for (var i = 0; i < list.length; i += 1) {
+            var pt = this.imageToCanvas(list[i][0], list[i][1]);
+            var d = Math.hypot(pt.x - cx, pt.y - cy);
+            if (d <= threshold && d < bestDist) {
+                bestDist = d;
+                bestIdx = i;
+            }
+        }
+        return bestIdx;
+    };
+
+    CalibrationCanvas.prototype._updateCursor = function () {
+        if (!this._canvas || !this._canvas.style) return;
+        if (!this._hasFrameDimensions()) {
+            this._canvas.style.cursor = "default";
+        } else if (this._dragState) {
+            this._canvas.style.cursor = "grabbing";
+        } else if (this._hoverVertexIdx >= 0) {
+            this._canvas.style.cursor = "grab";
+        } else {
+            this._canvas.style.cursor = "crosshair";
+        }
+    };
+
+    CalibrationCanvas.prototype._emitChange = function (immediate) {
+        if (this._destroyed || !this._onChange) return;
+        var now = typeof performance !== "undefined" ? performance.now() : Date.now();
+        if (immediate) {
+            if (this._emitTimer !== null && typeof global.clearTimeout === "function") {
+                global.clearTimeout(this._emitTimer);
+                this._emitTimer = null;
+            }
+            this._lastEmitTs = now;
+            this._onChange(this.getState());
+            return;
+        }
+        var elapsed = now - this._lastEmitTs;
+        if (elapsed >= 48) {
+            if (this._emitTimer !== null && typeof global.clearTimeout === "function") {
+                global.clearTimeout(this._emitTimer);
+                this._emitTimer = null;
+            }
+            this._lastEmitTs = now;
+            this._onChange(this.getState());
+        } else if (this._emitTimer === null && typeof global.setTimeout === "function") {
+            var self = this;
+            var wait = Math.max(10, 48 - elapsed);
+            this._emitTimer = global.setTimeout(function () {
+                self._emitTimer = null;
+                if (self._destroyed || !self._onChange) return;
+                self._lastEmitTs = typeof performance !== "undefined" ? performance.now() : Date.now();
+                self._onChange(self.getState());
+            }, wait);
+        }
+    };
+
+    CalibrationCanvas.prototype._handlePointerDown = function (ev) {
+        if (this._destroyed) return;
+        if (ev.button !== undefined && ev.button !== 0) return;
+        if (!this._hasFrameDimensions()) return;
+
+        var pos = this._pointerToCanvas(ev);
+        this._hoverPos = pos;
+        var list = this._activeVertexList();
+        var hitIdx = this._findNearestVertex(pos.x, pos.y, list, 14);
+
+        if (hitIdx >= 0) {
+            this._dragState = {
+                target: this._tool,
+                index: hitIdx,
+                pointerId: ev.pointerId,
+                moved: false
+            };
+            this._hoverVertexIdx = hitIdx;
+            if (ev.pointerId !== undefined && typeof this._canvas.setPointerCapture === "function") {
+                try {
+                    this._canvas.setPointerCapture(ev.pointerId);
+                } catch (_err) {
+                    // Ignore synthetic pointer capture errors
+                }
+            }
+            this._updateCursor();
+            this._render();
+            return;
+        }
+
+        var fit = this._computeFitRect();
+        var margin = 12;
+        if (pos.x < fit.x - margin || pos.x > fit.x + fit.w + margin ||
+            pos.y < fit.y - margin || pos.y > fit.y + fit.h + margin) {
+            return;
+        }
+
+        var imgPt = this.canvasToImage(pos.x, pos.y);
+        list.push([imgPt.u, imgPt.v]);
+        this._hoverVertexIdx = list.length - 1;
+        this._updateCursor();
+        this._render();
+        this._emitChange(true);
+    };
+
+    CalibrationCanvas.prototype._handlePointerMove = function (ev) {
+        if (this._destroyed) return;
+        if (!this._hasFrameDimensions()) return;
+
+        var pos = this._pointerToCanvas(ev);
+        this._hoverPos = pos;
+
+        if (this._dragState) {
+            if (ev.pointerId !== undefined &&
+                this._dragState.pointerId !== undefined &&
+                ev.pointerId !== this._dragState.pointerId) {
+                return;
+            }
+            var list = this._dragState.target === "parking"
+                ? this._currentParkingDraft
+                : this._imagePoints;
+            var idx = this._dragState.index;
+            if (idx >= 0 && idx < list.length) {
+                var imgPt = this.canvasToImage(pos.x, pos.y);
+                var prev = list[idx];
+                if (prev[0] !== imgPt.u || prev[1] !== imgPt.v) {
+                    list[idx] = [imgPt.u, imgPt.v];
+                    this._dragState.moved = true;
+                    this._render();
+                    this._emitChange(false);
+                }
+            }
+            return;
+        }
+
+        var activeList = this._activeVertexList();
+        var hitIdx = this._findNearestVertex(pos.x, pos.y, activeList, 14);
+        var changed = hitIdx !== this._hoverVertexIdx;
+        this._hoverVertexIdx = hitIdx;
+        this._updateCursor();
+        if (changed || activeList.length > 0) {
+            this._render();
+        }
+    };
+
+    CalibrationCanvas.prototype._handlePointerUp = function (ev) {
+        if (this._destroyed || !this._dragState) return;
+        if (ev.pointerId !== undefined &&
+            this._dragState.pointerId !== undefined &&
+            ev.pointerId !== this._dragState.pointerId) {
+            return;
+        }
+
+        var wasMoved = this._dragState.moved;
+        var ptrId = this._dragState.pointerId;
+        this._dragState = null;
+
+        if (ptrId !== undefined &&
+            typeof this._canvas.hasPointerCapture === "function" &&
+            typeof this._canvas.releasePointerCapture === "function") {
+            try {
+                if (this._canvas.hasPointerCapture(ptrId)) {
+                    this._canvas.releasePointerCapture(ptrId);
+                }
+            } catch (_err) {
+                // Ignore synthetic pointer release errors
+            }
+        }
+
+        this._updateCursor();
+        this._render();
+        if (wasMoved || this._emitTimer !== null) {
+            this._emitChange(true);
+        }
+    };
+
+    CalibrationCanvas.prototype._drawCenteredBadge = function (ctx, cx, cy, text, bg, border, fg, canvasW, canvasH) {
+        ctx.save();
+        ctx.font = "500 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+        var padX = 6;
+        var h = 18;
+        var boxW = ctx.measureText(text).width + padX * 2;
+        var x = clamp(cx - boxW * 0.5, 6, Math.max(6, canvasW - boxW - 6));
+        var y = clamp(cy - h * 0.5, 6, Math.max(6, canvasH - h - 6));
+        drawRoundedRectPath(ctx, x, y, boxW, h, 4);
+        ctx.fillStyle = withAlpha(bg, 0.92);
+        ctx.fill();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = border;
+        ctx.stroke();
+        ctx.fillStyle = fg;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.fillText(text, x + padX, y + h * 0.5 + 0.5);
+        ctx.restore();
+    };
+
+    CalibrationCanvas.prototype._render = function () {
+        if (!this._ctx || this._cssWidth < 2 || this._cssHeight < 2) return;
+        var ctx = this._ctx;
+        var pal = this._palette;
+        var w = this._cssWidth;
+        var h = this._cssHeight;
+
+        ctx.save();
+        ctx.scale(this._dpr, this._dpr);
+        ctx.clearRect(0, 0, w, h);
+
+        // Backdrop & subtle engineering dot pattern
+        ctx.fillStyle = pal.roadShoulder;
+        ctx.fillRect(0, 0, w, h);
+
+        ctx.fillStyle = withAlpha(pal.textMuted, pal.isLight ? 0.14 : 0.12);
+        var dotStep = 24;
+        for (var dx = 12; dx < w; dx += dotStep) {
+            for (var dy = 12; dy < h; dy += dotStep) {
+                ctx.fillRect(dx, dy, 1, 1);
+            }
+        }
+
+        var fit = this._computeFitRect();
+
+        if (this._imageReady && this._image) {
+            ctx.drawImage(this._image, fit.x, fit.y, fit.w, fit.h);
+            ctx.strokeStyle = pal.hairline;
+            ctx.lineWidth = 1;
+            ctx.strokeRect(fit.x, fit.y, fit.w, fit.h);
+        } else {
+            // Crisp instrumented guide grid when no frame image is rendered
+            ctx.fillStyle = pal.bgCard;
+            ctx.fillRect(fit.x, fit.y, fit.w, fit.h);
+            ctx.strokeStyle = pal.hairline;
+            ctx.lineWidth = 1;
+            ctx.strokeRect(fit.x, fit.y, fit.w, fit.h);
+
+            var cols = 12;
+            var rows = 8;
+            ctx.strokeStyle = pal.gridLine;
+            ctx.lineWidth = 1;
+            for (var ci = 1; ci < cols; ci += 1) {
+                var gx = fit.x + (fit.w * ci) / cols;
+                ctx.beginPath();
+                ctx.moveTo(gx, fit.y);
+                ctx.lineTo(gx, fit.y + fit.h);
+                ctx.stroke();
+            }
+            for (var ri = 1; ri < rows; ri += 1) {
+                var gy = fit.y + (fit.h * ri) / rows;
+                ctx.beginPath();
+                ctx.moveTo(fit.x, gy);
+                ctx.lineTo(fit.x + fit.w, gy);
+                ctx.stroke();
+            }
+
+            // Center crosshair & corner calibration ticks
+            var midX = fit.x + fit.w * 0.5;
+            var midY = fit.y + fit.h * 0.5;
+            ctx.strokeStyle = withAlpha(pal.roadMark, 0.85);
+            ctx.beginPath();
+            ctx.moveTo(midX - 24, midY);
+            ctx.lineTo(midX + 24, midY);
+            ctx.moveTo(midX, midY - 24);
+            ctx.lineTo(midX, midY + 24);
+            ctx.stroke();
+
+            ctx.strokeStyle = withAlpha(pal.accent, 0.40);
+            ctx.beginPath();
+            ctx.arc(midX, midY, 16, 0, Math.PI * 2);
+            ctx.stroke();
+
+            var arm = 14;
+            ctx.strokeStyle = withAlpha(pal.accent, 0.65);
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            // Top-left
+            ctx.moveTo(fit.x, fit.y + arm);
+            ctx.lineTo(fit.x, fit.y);
+            ctx.lineTo(fit.x + arm, fit.y);
+            // Top-right
+            ctx.moveTo(fit.x + fit.w - arm, fit.y);
+            ctx.lineTo(fit.x + fit.w, fit.y);
+            ctx.lineTo(fit.x + fit.w, fit.y + arm);
+            // Bottom-left
+            ctx.moveTo(fit.x, fit.y + fit.h - arm);
+            ctx.lineTo(fit.x, fit.y + fit.h);
+            ctx.lineTo(fit.x + arm, fit.y + fit.h);
+            // Bottom-right
+            ctx.moveTo(fit.x + fit.w - arm, fit.y + fit.h);
+            ctx.lineTo(fit.x + fit.w, fit.y + fit.h);
+            ctx.lineTo(fit.x + fit.w, fit.y + fit.h - arm);
+            ctx.stroke();
+
+            if (!this._hasFrameDimensions()) {
+                ctx.fillStyle = pal.textSecondary;
+                ctx.font = "500 13px system-ui, -apple-system, sans-serif";
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText("等待加载视频标定帧", midX, midY - 12);
+
+                ctx.fillStyle = pal.textMuted;
+                ctx.font = "400 11px system-ui, -apple-system, sans-serif";
+                ctx.fillText("选择视频源并提取标定帧后，可点击设置 P1..PN 参考点与禁停区", midX, midY + 12);
+            }
+
+            ctx.fillStyle = pal.textMuted;
+            ctx.font = "500 10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+            ctx.textAlign = "right";
+            ctx.textBaseline = "bottom";
+            var specTag = this._hasFrameDimensions()
+                ? (this._imageWidth + "x" + this._imageHeight + " px")
+                : "CALIBRATION GRID · 16:9";
+            ctx.fillText(specTag, fit.x + fit.w - 10, fit.y + fit.h - 8);
+        }
+
+        // 1. Committed roadside parking exclusion zones
+        for (var zi = 0; zi < this._parkingZonesImage.length; zi += 1) {
+            var poly = this._parkingZonesImage[zi];
+            if (!Array.isArray(poly) || poly.length < 3) continue;
+            var sumX = 0;
+            var sumY = 0;
+            var zPts = [];
+            for (var zp = 0; zp < poly.length; zp += 1) {
+                var cPt = this.imageToCanvas(poly[zp][0], poly[zp][1]);
+                zPts.push(cPt);
+                sumX += cPt.x;
+                sumY += cPt.y;
+            }
+            ctx.save();
+            ctx.beginPath();
+            for (var k = 0; k < zPts.length; k += 1) {
+                if (k === 0) ctx.moveTo(zPts[k].x, zPts[k].y);
+                else ctx.lineTo(zPts[k].x, zPts[k].y);
+            }
+            ctx.closePath();
+            ctx.fillStyle = withAlpha(pal.parkingZone, 0.18);
+            ctx.fill();
+            ctx.setLineDash([6, 4]);
+            ctx.strokeStyle = withAlpha(pal.parkingZone, 0.92);
+            ctx.lineWidth = 1.8;
+            ctx.stroke();
+            ctx.restore();
+
+            for (var zv = 0; zv < zPts.length; zv += 1) {
+                ctx.fillStyle = pal.bgCard;
+                ctx.strokeStyle = pal.parkingZone;
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                ctx.arc(zPts[zv].x, zPts[zv].y, 3.2, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+            }
+
+            var zoneLabel = this._parkingZonesImage.length > 1
+                ? ("禁停标定区 #" + (zi + 1))
+                : "禁停标定区";
+            this._drawCenteredBadge(
+                ctx,
+                sumX / zPts.length,
+                sumY / zPts.length,
+                zoneLabel,
+                pal.bgCard,
+                withAlpha(pal.parkingZone, 0.78),
+                pal.parkingZone,
+                w,
+                h
+            );
+        }
+
+        // 2. Active roadside parking exclusion draft polygon
+        if (this._currentParkingDraft.length > 0) {
+            var dPts = [];
+            var dSumX = 0;
+            var dSumY = 0;
+            for (var di = 0; di < this._currentParkingDraft.length; di += 1) {
+                var dPt = this.imageToCanvas(this._currentParkingDraft[di][0], this._currentParkingDraft[di][1]);
+                dPts.push(dPt);
+                dSumX += dPt.x;
+                dSumY += dPt.y;
+            }
+
+            if (dPts.length >= 3) {
+                ctx.save();
+                ctx.beginPath();
+                for (var df = 0; df < dPts.length; df += 1) {
+                    if (df === 0) ctx.moveTo(dPts[df].x, dPts[df].y);
+                    else ctx.lineTo(dPts[df].x, dPts[df].y);
+                }
+                ctx.closePath();
+                ctx.fillStyle = withAlpha(pal.accent, 0.14);
+                ctx.fill();
+                ctx.setLineDash([3, 4]);
+                ctx.strokeStyle = withAlpha(pal.accent, 0.55);
+                ctx.lineWidth = 1.3;
+                ctx.beginPath();
+                ctx.moveTo(dPts[dPts.length - 1].x, dPts[dPts.length - 1].y);
+                ctx.lineTo(dPts[0].x, dPts[0].y);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            if (dPts.length >= 2) {
+                ctx.save();
+                ctx.setLineDash([6, 4]);
+                ctx.strokeStyle = pal.accent;
+                ctx.lineWidth = 2.0;
+                ctx.beginPath();
+                for (var dl = 0; dl < dPts.length; dl += 1) {
+                    if (dl === 0) ctx.moveTo(dPts[dl].x, dPts[dl].y);
+                    else ctx.lineTo(dPts[dl].x, dPts[dl].y);
+                }
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            if (this._tool === "parking" && this._hoverPos && !this._dragState && this._hoverVertexIdx === -1) {
+                var lastDraftPt = dPts[dPts.length - 1];
+                ctx.save();
+                ctx.setLineDash([3, 4]);
+                ctx.strokeStyle = withAlpha(pal.accent, 0.45);
+                ctx.lineWidth = 1.2;
+                ctx.beginPath();
+                ctx.moveTo(lastDraftPt.x, lastDraftPt.y);
+                ctx.lineTo(this._hoverPos.x, this._hoverPos.y);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            for (var dv = 0; dv < dPts.length; dv += 1) {
+                var draftActive = this._tool === "parking" &&
+                    ((this._dragState && this._dragState.target === "parking" && this._dragState.index === dv) ||
+                     this._hoverVertexIdx === dv);
+                ctx.fillStyle = pal.bgCard;
+                ctx.strokeStyle = pal.accent;
+                ctx.lineWidth = draftActive ? 2.4 : 1.8;
+                ctx.beginPath();
+                ctx.arc(dPts[dv].x, dPts[dv].y, draftActive ? 6.5 : 4.5, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+            }
+
+            var draftLabelX = dPts.length >= 3 ? (dSumX / dPts.length) : dPts[0].x;
+            var draftLabelY = dPts.length >= 3 ? (dSumY / dPts.length) : (dPts[0].y - 18);
+            this._drawCenteredBadge(
+                ctx,
+                draftLabelX,
+                draftLabelY,
+                "禁停标定区",
+                pal.bgCard,
+                pal.accent,
+                pal.accent,
+                w,
+                h
+            );
+        }
+
+        // 3. Ground-correspondence calibration polygon & P1..PN vertices
+        if (this._imagePoints.length > 0) {
+            var cPts = [];
+            for (var pi = 0; pi < this._imagePoints.length; pi += 1) {
+                cPts.push(this.imageToCanvas(this._imagePoints[pi][0], this._imagePoints[pi][1]));
+            }
+
+            if (cPts.length >= 3) {
+                ctx.save();
+                ctx.beginPath();
+                for (var pf = 0; pf < cPts.length; pf += 1) {
+                    if (pf === 0) ctx.moveTo(cPts[pf].x, cPts[pf].y);
+                    else ctx.lineTo(cPts[pf].x, cPts[pf].y);
+                }
+                ctx.closePath();
+                ctx.fillStyle = withAlpha(pal.accent, 0.13);
+                ctx.fill();
+                ctx.setLineDash([6, 4]);
+                ctx.strokeStyle = withAlpha(pal.accent, 0.90);
+                ctx.lineWidth = 1.6;
+                ctx.stroke();
+
+                if (cPts.length === 4) {
+                    ctx.setLineDash([3, 4]);
+                    ctx.strokeStyle = withAlpha(pal.accent, 0.30);
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(cPts[0].x, cPts[0].y);
+                    ctx.lineTo(cPts[2].x, cPts[2].y);
+                    ctx.moveTo(cPts[1].x, cPts[1].y);
+                    ctx.lineTo(cPts[3].x, cPts[3].y);
+                    ctx.stroke();
+                }
+                ctx.restore();
+            } else if (cPts.length === 2) {
+                ctx.save();
+                ctx.setLineDash([6, 4]);
+                ctx.strokeStyle = withAlpha(pal.accent, 0.90);
+                ctx.lineWidth = 1.6;
+                ctx.beginPath();
+                ctx.moveTo(cPts[0].x, cPts[0].y);
+                ctx.lineTo(cPts[1].x, cPts[1].y);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            if (this._tool === "points" && this._hoverPos && !this._dragState && this._hoverVertexIdx === -1) {
+                var lastPt = cPts[cPts.length - 1];
+                ctx.save();
+                ctx.setLineDash([3, 4]);
+                ctx.strokeStyle = withAlpha(pal.accent, 0.42);
+                ctx.lineWidth = 1.2;
+                ctx.beginPath();
+                ctx.moveTo(lastPt.x, lastPt.y);
+                ctx.lineTo(this._hoverPos.x, this._hoverPos.y);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            for (var vi = 0; vi < cPts.length; vi += 1) {
+                var pt = cPts[vi];
+                var isActive = this._tool === "points" &&
+                    ((this._dragState && this._dragState.target === "points" && this._dragState.index === vi) ||
+                     this._hoverVertexIdx === vi);
+
+                if (isActive) {
+                    ctx.fillStyle = withAlpha(pal.accent, 0.22);
+                    ctx.beginPath();
+                    ctx.arc(pt.x, pt.y, 11, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                ctx.fillStyle = pal.bgCard;
+                ctx.strokeStyle = pal.accent;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.arc(pt.x, pt.y, isActive ? 7 : 5.5, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+
+                ctx.fillStyle = pal.accent;
+                ctx.beginPath();
+                ctx.arc(pt.x, pt.y, 2.2, 0, Math.PI * 2);
+                ctx.fill();
+
+                var badgeTxt = "P" + (vi + 1);
+                ctx.save();
+                ctx.font = "600 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+                var bPadX = 5;
+                var bH = 17;
+                var bW = ctx.measureText(badgeTxt).width + bPadX * 2;
+                var bx = pt.x + 9;
+                if (bx + bW > w - 6) bx = pt.x - bW - 9;
+                bx = clamp(bx, 6, Math.max(6, w - bW - 6));
+                var by = pt.y - bH - 6;
+                if (by < 6) by = pt.y + 8;
+                by = clamp(by, 6, Math.max(6, h - bH - 6));
+
+                drawRoundedRectPath(ctx, bx, by, bW, bH, 4);
+                ctx.fillStyle = withAlpha(pal.bgCard, 0.94);
+                ctx.fill();
+                ctx.lineWidth = 1;
+                ctx.strokeStyle = isActive ? pal.accent : withAlpha(pal.accent, 0.72);
+                ctx.stroke();
+
+                ctx.fillStyle = pal.textPrimary;
+                ctx.textAlign = "left";
+                ctx.textBaseline = "middle";
+                ctx.fillText(badgeTxt, bx + bPadX, by + bH * 0.5 + 0.5);
+                ctx.restore();
+            }
+        }
+
+        // Top-left compact HUD status pill when frame is loaded
+        if (this._hasFrameDimensions() && w >= 220) {
+            var hudText = this._tool === "parking"
+                ? ("禁停区绘制 · 草稿 " + this._currentParkingDraft.length + " 点")
+                : ("参考点标定 · 已选 " + this._imagePoints.length + " 点");
+            hudText += " · " + this._imageWidth + "x" + this._imageHeight;
+            drawPill(ctx, 10, 8, hudText, pal.bgCard, pal.hairline, pal.textSecondary, w);
+        }
+
+        ctx.restore();
+    };
+
+    CalibrationCanvas.prototype.loadImage = function (dataUrl, imgWidth, imgHeight) {
+        if (this._destroyed) return;
+        this._loadToken += 1;
+        var token = this._loadToken;
+        var reqW = toNum(imgWidth, 0);
+        var reqH = toNum(imgHeight, 0);
+
+        this._dragState = null;
+        this._hoverVertexIdx = -1;
+
+        if (!dataUrl || typeof dataUrl !== "string") {
+            this._image = null;
+            this._imageReady = false;
+            this._imageWidth = reqW > 0 ? reqW : 0;
+            this._imageHeight = reqH > 0 ? reqH : 0;
+            this._measure();
+            this._updateCursor();
+            this._render();
+            return;
+        }
+
+        this._image = null;
+        this._imageReady = false;
+        this._imageWidth = reqW > 0 ? reqW : 0;
+        this._imageHeight = reqH > 0 ? reqH : 0;
+        this._measure();
+        this._updateCursor();
+        this._render();
+
+        if (typeof global.Image !== "function") {
+            return;
+        }
+
+        var self = this;
+        var img = new global.Image();
+        img.onload = function () {
+            if (self._destroyed || token !== self._loadToken) return;
+            var natW = toNum(img.naturalWidth || img.width, 0);
+            var natH = toNum(img.naturalHeight || img.height, 0);
+            if (self._imageWidth <= 0 && natW > 0) self._imageWidth = natW;
+            if (self._imageHeight <= 0 && natH > 0) self._imageHeight = natH;
+            if (self._imageWidth <= 0) self._imageWidth = 1280;
+            if (self._imageHeight <= 0) self._imageHeight = 720;
+            self._image = img;
+            self._imageReady = true;
+            self._measure();
+            self._updateCursor();
+            self._render();
+        };
+        img.onerror = function () {
+            if (self._destroyed || token !== self._loadToken) return;
+            self._image = null;
+            self._imageReady = false;
+            self._render();
+        };
+        img.src = dataUrl;
+    };
+
+    CalibrationCanvas.prototype.setTool = function (tool) {
+        if (this._destroyed) return;
+        this._tool = tool === "parking" ? "parking" : "points";
+        this._dragState = null;
+        this._hoverVertexIdx = -1;
+        this._updateCursor();
+        this._render();
+    };
+
+    CalibrationCanvas.prototype.undo = function () {
+        if (this._destroyed) return false;
+        var list = this._activeVertexList();
+        if (list.length === 0) return false;
+        list.pop();
+        this._dragState = null;
+        this._hoverVertexIdx = -1;
+        this._updateCursor();
+        this._render();
+        this._emitChange(true);
+        return true;
+    };
+
+    CalibrationCanvas.prototype.finishParkingZone = function () {
+        if (this._destroyed) return false;
+        if (this._currentParkingDraft.length < 3) {
+            return false;
+        }
+        this._parkingZonesImage.push(clonePointList(this._currentParkingDraft));
+        this._currentParkingDraft = [];
+        this._dragState = null;
+        this._hoverVertexIdx = -1;
+        this._updateCursor();
+        this._render();
+        this._emitChange(true);
+        return true;
+    };
+
+    CalibrationCanvas.prototype.clearPoints = function () {
+        if (this._destroyed) return;
+        this._imagePoints = [];
+        this._dragState = null;
+        this._hoverVertexIdx = -1;
+        this._updateCursor();
+        this._render();
+        this._emitChange(true);
+    };
+
+    CalibrationCanvas.prototype.clearParkingZones = function () {
+        if (this._destroyed) return;
+        this._parkingZonesImage = [];
+        this._currentParkingDraft = [];
+        this._dragState = null;
+        this._hoverVertexIdx = -1;
+        this._updateCursor();
+        this._render();
+        this._emitChange(true);
+    };
+
+    CalibrationCanvas.prototype.getState = function () {
+        return {
+            imagePoints: clonePointList(this._imagePoints),
+            parkingZonesImage: clonePolygonList(this._parkingZonesImage),
+            currentParkingDraft: clonePointList(this._currentParkingDraft),
+            imageWidth: this._imageWidth,
+            imageHeight: this._imageHeight
+        };
+    };
+
+    CalibrationCanvas.prototype.setState = function (nextState) {
+        if (this._destroyed || !nextState || typeof nextState !== "object") return;
+        if (nextState.imagePoints !== undefined) {
+            this._imagePoints = clonePointList(nextState.imagePoints);
+        }
+        if (nextState.parkingZonesImage !== undefined) {
+            this._parkingZonesImage = clonePolygonList(nextState.parkingZonesImage);
+        }
+        if (nextState.currentParkingDraft !== undefined) {
+            this._currentParkingDraft = clonePointList(nextState.currentParkingDraft);
+        }
+        if (isFiniteNum(nextState.imageWidth) && nextState.imageWidth > 0) {
+            this._imageWidth = nextState.imageWidth;
+        }
+        if (isFiniteNum(nextState.imageHeight) && nextState.imageHeight > 0) {
+            this._imageHeight = nextState.imageHeight;
+        }
+        this._dragState = null;
+        this._hoverVertexIdx = -1;
+        this._measure();
+        this._updateCursor();
+        this._render();
+    };
+
+    CalibrationCanvas.prototype.refreshTheme = function () {
+        if (this._destroyed) return;
+        this._palette = readThemePalette(this._probe);
+        this._measure();
+        this._render();
+    };
+
+    CalibrationCanvas.prototype.destroy = function () {
+        if (this._destroyed) return;
+        this._destroyed = true;
+        this._loadToken += 1;
+        this._image = null;
+        if (this._emitTimer !== null && typeof global.clearTimeout === "function") {
+            global.clearTimeout(this._emitTimer);
+            this._emitTimer = null;
+        }
+        this._canvas.removeEventListener("pointerdown", this._onPointerDown);
+        this._canvas.removeEventListener("pointermove", this._onPointerMove);
+        this._canvas.removeEventListener("pointerup", this._onPointerUp);
+        this._canvas.removeEventListener("pointercancel", this._onPointerCancel);
+        this._canvas.removeEventListener("pointerleave", this._onPointerLeave);
+        if (this._resizeObserver) {
+            this._resizeObserver.disconnect();
+            this._resizeObserver = null;
+        }
+        this._unobserveTheme();
+        this._motionTracker.destroy();
+        if (this._probe && this._probe.parentNode) {
+            this._probe.parentNode.removeChild(this._probe);
+        }
+    };
+
+    /* ======================================================================
+     * 6. AlertAudioSynth (Zero-Asset Web Audio L3 Instrumentation Chime)
+     * ====================================================================== */
+    function AlertAudioSynth() {
+        if (!(this instanceof AlertAudioSynth)) {
+            return new AlertAudioSynth();
+        }
+        this._enabled = false;
+        this._ctx = null;
+        this._lastChimeMs = -Infinity;
+        this._lastRiskLevel = 0;
+        this._destroyed = false;
+    }
+
+    AlertAudioSynth.prototype._ensureAudioContext = function () {
+        if (this._destroyed) return null;
+        if (!this._ctx) {
+            var AudioCtx = global.AudioContext || global.webkitAudioContext;
+            if (typeof AudioCtx !== "function") {
+                return null;
+            }
+            try {
+                this._ctx = new AudioCtx();
+            } catch (_err) {
+                this._ctx = null;
+                return null;
+            }
+        }
+        if (this._ctx && this._ctx.state === "suspended" && typeof this._ctx.resume === "function") {
+            try {
+                var p = this._ctx.resume();
+                if (p && typeof p.catch === "function") {
+                    p.catch(function () {});
+                }
+            } catch (_err2) {
+                // Ignore resume failure
+            }
+        }
+        return this._ctx;
+    };
+
+    AlertAudioSynth.prototype.setEnabled = function (enabled) {
+        if (this._destroyed) return false;
+        var next = Boolean(enabled);
+        this._enabled = next;
+        if (next) {
+            this._ensureAudioContext();
+        } else {
+            this._lastRiskLevel = 0;
+        }
+        return this._enabled;
+    };
+
+    AlertAudioSynth.prototype.isEnabled = function () {
+        return this._enabled;
+    };
+
+    AlertAudioSynth.prototype._playDualToneChime = function (ctx) {
+        if (!ctx || ctx.state === "closed" ||
+            typeof ctx.createOscillator !== "function" ||
+            typeof ctx.createGain !== "function") {
+            return false;
+        }
+        try {
+            var t0 = typeof ctx.currentTime === "number" ? ctx.currentTime : 0;
+            var notes = [
+                { freq: 784.0, delay: 0.0, dur: 0.20, peak: 0.05 },
+                { freq: 1046.5, delay: 0.095, dur: 0.26, peak: 0.055 }
+            ];
+            for (var i = 0; i < notes.length; i += 1) {
+                var spec = notes[i];
+                var osc = ctx.createOscillator();
+                var gain = ctx.createGain();
+                var startAt = t0 + spec.delay;
+                var stopAt = startAt + spec.dur;
+
+                osc.type = "sine";
+                osc.frequency.setValueAtTime(spec.freq, startAt);
+
+                gain.gain.setValueAtTime(0.0001, startAt);
+                gain.gain.linearRampToValueAtTime(spec.peak, startAt + 0.014);
+                gain.gain.exponentialRampToValueAtTime(0.0001, stopAt);
+
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.start(startAt);
+                osc.stop(stopAt + 0.01);
+            }
+            return true;
+        } catch (_err) {
+            return false;
+        }
+    };
+
+    AlertAudioSynth.prototype.triggerRisk = function (riskLevel) {
+        if (this._destroyed) return false;
+        if (!this._enabled) {
+            this._lastRiskLevel = 0;
+            return false;
+        }
+
+        var lvl = parseRiskLevel(riskLevel);
+        var prevLvl = this._lastRiskLevel;
+        this._lastRiskLevel = lvl;
+
+        if (lvl < 3 || prevLvl >= 3) {
+            return false;
+        }
+
+        var nowMs = Date.now();
+        if (nowMs < this._lastChimeMs) {
+            this._lastChimeMs = nowMs - 2500;
+        }
+        if (nowMs - this._lastChimeMs < 2500) {
+            return false;
+        }
+
+        var ctx = this._ensureAudioContext();
+        if (!ctx) return false;
+
+        if (this._playDualToneChime(ctx)) {
+            this._lastChimeMs = nowMs;
+            return true;
+        }
+        return false;
+    };
+
+    AlertAudioSynth.prototype.destroy = function () {
+        if (this._destroyed) return;
+        this._destroyed = true;
+        this._enabled = false;
+        if (this._ctx && typeof this._ctx.close === "function" && this._ctx.state !== "closed") {
+            try {
+                var p = this._ctx.close();
+                if (p && typeof p.catch === "function") {
+                    p.catch(function () {});
+                }
+            } catch (_err) {
+                // Ignore close failure
+            }
+        }
+        this._ctx = null;
+    };
+
+    /* ======================================================================
      * Public global export
      * ====================================================================== */
     global.CampusMotion = {
         RollingCounter: RollingCounter,
         AnimatedSignalPipeline: AnimatedSignalPipeline,
         CampusRoadTwinCanvas: CampusRoadTwinCanvas,
-        SpeedTimelineChart: SpeedTimelineChart
+        SpeedTimelineChart: SpeedTimelineChart,
+        CalibrationCanvas: CalibrationCanvas,
+        AlertAudioSynth: AlertAudioSynth
     };
 })(typeof window !== "undefined" ? window : globalThis);
