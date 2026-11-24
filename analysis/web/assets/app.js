@@ -72,6 +72,7 @@
       playing: false,
       timerId: null,
       useJpegFallback: false,
+      isFixture: false,
       data: null
     },
     liveJob: {
@@ -120,6 +121,7 @@
     kpiFrames: null,
     pipeline: null,
     roadTwin: null,
+    simCamera: null,
     speedChart: null,
     calibCanvas: null,
     audioSynth: null
@@ -233,9 +235,10 @@
     dom.viewportSimPanel = $("viewport-sim-panel");
     dom.viewportReplayPanel = $("viewport-replay-panel");
     dom.viewportLivePanel = $("viewport-live-panel");
-    dom.simSceneName = $("sim-scene-name");
-    dom.simObjectsSummary = $("sim-objects-summary");
-    dom.simRiskSummary = $("sim-risk-summary");
+    dom.simCameraCanvas = $("sim-camera-canvas");
+    dom.simControls = $("sim-controls");
+    dom.simSceneTelemetry = $("sim-scene-telemetry");
+    dom.btnImportVideo = $("btn-import-video");
     dom.btnReplaySample = $("btn-replay-sample");
 
     dom.replayVideo = $("replay-video");
@@ -424,6 +427,9 @@
     if (widgets.roadTwin && typeof widgets.roadTwin.refreshTheme === "function") {
       widgets.roadTwin.refreshTheme();
     }
+    if (widgets.simCamera && typeof widgets.simCamera.refreshTheme === "function") {
+      widgets.simCamera.refreshTheme();
+    }
     if (widgets.speedChart && typeof widgets.speedChart.refreshTheme === "function") {
       widgets.speedChart.refreshTheme();
     }
@@ -570,10 +576,22 @@
       widgets.pipeline.setConfig(state.pipelineConfig);
     }
 
+    if (typeof CM.SimulatedCameraCanvas === "function" && dom.simCameraCanvas) {
+      widgets.simCamera = new CM.SimulatedCameraCanvas(dom.simCameraCanvas);
+    }
+
     if (typeof CM.CampusRoadTwinCanvas === "function") {
       widgets.roadTwin = new CM.CampusRoadTwinCanvas(dom.roadTwinCanvas, {
-        onTelemetry: handleTwinTelemetry
+        onTelemetry: handleTwinTelemetry,
+        onRenderState: function (renderState) {
+          if (state.mode === "simulation" && widgets.simCamera) {
+            widgets.simCamera.renderState(renderState);
+          }
+        }
       });
+      if (widgets.simCamera && typeof widgets.roadTwin.getCurrentRenderState === "function") {
+        widgets.simCamera.renderState(widgets.roadTwin.getCurrentRenderState());
+      }
     }
 
     if (typeof CM.SpeedTimelineChart === "function") {
@@ -640,10 +658,13 @@
       widgets.pipeline.setRiskLevel(risk);
     }
 
-    dom.simSceneName.textContent = SCENARIO_LABELS[state.scenario] || state.scenario;
-    dom.simObjectsSummary.textContent =
-      (snap.vehicleCount || 0) + " 车辆 / " + (snap.vruCount || 0) + " 行人与骑行者";
-    dom.simRiskSummary.textContent = riskText(risk) + (typeof snap.minTtcS === "number" ? (" · TTC " + snap.minTtcS.toFixed(2) + "s") : "");
+    if (dom.simSceneTelemetry) {
+      var ttcNote = typeof snap.minTtcS === "number" ? (" · TTC " + snap.minTtcS.toFixed(2) + "s") : "";
+      dom.simSceneTelemetry.textContent =
+        (SCENARIO_LABELS[state.scenario] || state.scenario) + " · " +
+        (snap.vehicleCount || 0) + " 车辆 · " + (snap.vruCount || 0) + " VRU · " +
+        riskText(risk) + ttcNote;
+    }
     dom.twinCounts.textContent = "车辆 " + (snap.vehicleCount || 0) + " · 行人/骑行 " + (snap.vruCount || 0);
 
     updateDualEndMirrors({
@@ -849,6 +870,7 @@
     dom.viewportSimPanel.hidden = mode !== "simulation";
     dom.viewportReplayPanel.hidden = mode !== "replay";
     dom.viewportLivePanel.hidden = mode !== "live";
+    if (dom.simControls) dom.simControls.hidden = mode !== "simulation";
     dom.replayControls.hidden = mode !== "replay";
     dom.liveControls.hidden = mode !== "live";
     dom.scenarioSelect.hidden = mode !== "simulation";
@@ -863,6 +885,9 @@
         widgets.roadTwin.setMode("simulation");
         widgets.roadTwin.setScenario(state.scenario);
         widgets.roadTwin.setPaused(state.paused);
+        if (widgets.simCamera && typeof widgets.roadTwin.getCurrentRenderState === "function") {
+          widgets.simCamera.renderState(widgets.roadTwin.getCurrentRenderState());
+        }
       }
       if (widgets.pipeline) {
         widgets.pipeline.setPaused(state.paused);
@@ -1175,7 +1200,8 @@
     dom.replayFrameLabel.textContent =
       idx + " / " + maxIdx + " (" + formatNumber(framePayload.timestampS, 1, "0.0") + "s)";
     dom.replayMediaCaption.textContent =
-      dataset.runId + " · 帧 #" + idx + " · " + riskText(framePayload.riskLevel);
+      dataset.runId + " · 帧 #" + idx + " · " + riskText(framePayload.riskLevel) +
+      (state.replay.isFixture ? " · 测试固件(非实拍)" : "");
 
     if (dom.replayFrameImg && (state.replay.useJpegFallback || !state.replay.playing)) {
       dom.replayFrameImg.hidden = false;
@@ -1248,8 +1274,9 @@
     setMonitorMode("replay");
     state.replay.runId = runId;
     state.replay.useJpegFallback = true;
+    state.replay.isFixture = false;
     setSidebarTarget(runId);
-    dom.replayMediaCaption.textContent = "正在加载历史样本 " + runId;
+    dom.replayMediaCaption.textContent = "正在加载历史记录 " + runId;
 
     return Promise.all([
       fetchJson("/api/runs/" + encodeURIComponent(runId) + "/summary"),
@@ -1259,17 +1286,15 @@
     ])
       .then(function (results) {
         var dataset = buildRunDataset(runId, results[0], results[1], results[2], results[3]);
+        var srcVid = String((results[0] && results[0].source_video) || "");
+        state.replay.isFixture = srcVid.indexOf("tracking-fixtures") >= 0 || /sample_[ab]\.mp4/i.test(srcVid);
         state.replay.data = dataset;
         state.replay.framesCount = dataset.totalFrames;
         dom.twinModeLabel.textContent =
           "x[" + dataset.bounds.xMin + "," + dataset.bounds.xMax + "] y[" + dataset.bounds.yMin + "," + dataset.bounds.yMax + "]";
 
-        // Probe MP4 codec support; fallback immediately to JPEG frame endpoint if unsupported.
         if (dom.replayVideo) {
-          dom.replayVideo.src = "/api/runs/" + encodeURIComponent(runId) + "/video";
-          dom.replayVideo.onerror = function () {
-            state.replay.useJpegFallback = true;
-          };
+          dom.replayVideo.hidden = true;
         }
 
         renderReplayFrame(typeof initialFrame === "number" ? initialFrame : 0);
@@ -1603,8 +1628,17 @@
           state.selectedRunId = null;
           state.historyData = null;
           setHistoryActionsDisabled(true);
+          if (dom.btnReplaySample) dom.btnReplaySample.hidden = true;
           if (dom.historyChartsCard) dom.historyChartsCard.hidden = true;
           return;
+        }
+
+        if (dom.btnReplaySample) {
+          var topRun = runs[0];
+          var topSrc = String((topRun && topRun.source_video) || "");
+          var topIsFixture = topSrc.indexOf("tracking-fixtures") >= 0 || /sample_[ab]\.mp4/i.test(topSrc);
+          dom.btnReplaySample.hidden = false;
+          dom.btnReplaySample.textContent = topIsFixture ? "回放测试固件" : "回放最新记录";
         }
 
         setHistoryActionsDisabled(false);
@@ -2831,6 +2865,10 @@
         widgets.pipeline.setPaused(state.paused);
       }
     });
+
+    if (dom.btnImportVideo) {
+      dom.btnImportVideo.addEventListener("click", openJobDialog);
+    }
 
     dom.btnReplaySample.addEventListener("click", function () {
       var targetId = (state.runs.length && state.runs[0].run_id) || SAMPLE_RUN_FALLBACK;

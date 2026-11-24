@@ -1311,6 +1311,7 @@
         this._canvas = canvasEl;
         this._ctx = canvasEl.getContext("2d");
         this._onTelemetry = typeof opts.onTelemetry === "function" ? opts.onTelemetry : null;
+        this._onRenderState = typeof opts.onRenderState === "function" ? opts.onRenderState : null;
         this._speedLimitKmh = toNum(opts.speedLimitKmh, 30.0);
 
         this._mode = "simulation";
@@ -2334,6 +2335,13 @@
         }
 
         ctx.restore();
+        if (this._onRenderState) {
+            this._onRenderState(this._currentRenderState);
+        }
+    };
+
+    CampusRoadTwinCanvas.prototype.getCurrentRenderState = function () {
+        return this._currentRenderState;
     };
 
     function padId(n) {
@@ -4217,6 +4225,552 @@
     };
 
     /* ======================================================================
+     * 7. SimulatedCameraCanvas (Synchronized 3D Oblique Perspective Feed)
+     * ====================================================================== */
+    function SimulatedCameraCanvas(canvasEl, options) {
+        if (!(this instanceof SimulatedCameraCanvas)) {
+            return new SimulatedCameraCanvas(canvasEl, options);
+        }
+        if (!canvasEl) {
+            throw new Error("SimulatedCameraCanvas requires a valid <canvas> element");
+        }
+        var opts = options || {};
+        this._canvas = canvasEl;
+        this._ctx = canvasEl.getContext("2d");
+        this._destroyed = false;
+        this._cssWidth = 0;
+        this._cssHeight = 0;
+        this._dpr = Math.min(global.devicePixelRatio || 1, 2);
+        this._lastState = opts.initialState || null;
+
+        this._probe = createColorProbe();
+        this._palette = readThemePalette(this._probe);
+
+        var self = this;
+        this._unobserveTheme = observeThemeChanges(function () {
+            self.refreshTheme();
+        });
+        if (typeof ResizeObserver === "function") {
+            this._resizeObserver = new ResizeObserver(function () {
+                self._measure();
+                self._render();
+            });
+            this._resizeObserver.observe(this._canvas);
+        } else {
+            this._resizeObserver = null;
+        }
+        this._measure();
+        this._render();
+    }
+
+    SimulatedCameraCanvas.prototype._measure = function () {
+        var rect = this._canvas.getBoundingClientRect();
+        var cssW = Math.max(0, Math.round(rect.width || this._canvas.clientWidth || 0));
+        var cssH = Math.max(0, Math.round(rect.height || this._canvas.clientHeight || 0));
+        if (cssW < 2 || cssH < 2) {
+            cssW = 540;
+            cssH = 340;
+        }
+        this._dpr = Math.min(global.devicePixelRatio || 1, 2);
+        var pxW = Math.round(cssW * this._dpr);
+        var pxH = Math.round(cssH * this._dpr);
+        if (this._canvas.width !== pxW || this._canvas.height !== pxH) {
+            this._canvas.width = pxW;
+            this._canvas.height = pxH;
+        }
+        this._cssWidth = cssW;
+        this._cssHeight = cssH;
+    };
+
+    SimulatedCameraCanvas.prototype.renderState = function (state) {
+        if (this._destroyed) return;
+        this._lastState = state || null;
+        this._render();
+    };
+
+    SimulatedCameraCanvas.prototype.refreshTheme = function () {
+        if (this._destroyed) return;
+        this._palette = readThemePalette(this._probe);
+        this._measure();
+        this._render();
+    };
+
+    SimulatedCameraCanvas.prototype._project3D = function (wx, wy, wz, cam) {
+        var dx = wx - cam.x;
+        var dy = wy - cam.y;
+        var dz = wz - cam.z;
+        var zCam = dy * cam.fwdY + dz * cam.fwdZ;
+        if (zCam <= 0.45) return null;
+        var xCam = dx;
+        var yCam = dy * cam.upY + dz * cam.upZ;
+        return {
+            x: cam.cx + (xCam / zCam) * cam.focal,
+            y: cam.cy - (yCam / zCam) * cam.focal,
+            zCam: zCam
+        };
+    };
+
+    SimulatedCameraCanvas.prototype._render = function () {
+        if (!this._ctx || this._cssWidth < 2 || this._cssHeight < 2) return;
+        var ctx = this._ctx;
+        var pal = this._palette;
+        var w = this._cssWidth;
+        var h = this._cssHeight;
+        var st = this._lastState || {
+            bounds: { xMin: -3.2, xMax: 3.2, yMin: 0.0, yMax: 15.0 },
+            parkingZones: [],
+            vehicles: [],
+            vrus: [],
+            conflicts: [],
+            maxRisk: 0,
+            label: "SIM"
+        };
+        var b = st.bounds || { xMin: -3.2, xMax: 3.2, yMin: 0.0, yMax: 15.0 };
+
+        // Oblique roadside CCTV camera calibrated looking along +Y across crosswalk
+        var tgtY = 0.5 * (b.yMin + b.yMax);
+        var camY = b.yMin - 6.2;
+        var camZ = 5.1;
+        var dY = tgtY - camY;
+        var dZ = -camZ;
+        var len = Math.hypot(dY, dZ) || 1;
+        var fwdY = dY / len;
+        var fwdZ = dZ / len;
+        var cam = {
+            x: 0.5 * (b.xMin + b.xMax),
+            y: camY,
+            z: camZ,
+            fwdY: fwdY,
+            fwdZ: fwdZ,
+            upY: -fwdZ,
+            upZ: fwdY,
+            cx: w * 0.5,
+            cy: h * 0.49,
+            focal: Math.min(w * 0.86, h * 1.48)
+        };
+
+        var self = this;
+        function p3(wx, wy, wz) {
+            return self._project3D(wx, wy, wz || 0, cam);
+        }
+
+        function fillPolyPts(worldPts, fillColor, strokeColor, lineWidth, dashed) {
+            var pts = [];
+            for (var i = 0; i < worldPts.length; i += 1) {
+                var pt = p3(worldPts[i][0], worldPts[i][1], worldPts[i][2] || 0);
+                if (!pt) return;
+                pts.push(pt);
+            }
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (var j = 1; j < pts.length; j += 1) {
+                ctx.lineTo(pts[j].x, pts[j].y);
+            }
+            ctx.closePath();
+            if (fillColor) {
+                ctx.fillStyle = fillColor;
+                ctx.fill();
+            }
+            if (strokeColor) {
+                if (dashed) ctx.setLineDash([5, 4]);
+                ctx.strokeStyle = strokeColor;
+                ctx.lineWidth = lineWidth || 1;
+                ctx.stroke();
+            }
+            ctx.restore();
+        }
+
+        ctx.save();
+        ctx.scale(this._dpr, this._dpr);
+        ctx.clearRect(0, 0, w, h);
+
+        // Background sky / campus horizon band + distant ground apron
+        ctx.fillStyle = pal.isLight ? "#dde1e8" : "#101012";
+        ctx.fillRect(0, 0, w, h);
+
+        var horizonPt = p3(cam.x, b.yMax + 80, 0);
+        var horizonY = horizonPt ? clamp(horizonPt.y, 18, h * 0.32) : h * 0.22;
+        ctx.fillStyle = pal.roadShoulder;
+        ctx.fillRect(0, horizonY, w, h - horizonY);
+
+        // Crisp campus horizon curb + distant light pole silhouettes
+        ctx.strokeStyle = pal.hairline;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, horizonY);
+        ctx.lineTo(w, horizonY);
+        ctx.stroke();
+
+        var poleXs = [b.xMin - 0.6, b.xMax + 0.6];
+        var poleYs = [5.5, 11.8];
+        for (var pxi = 0; pxi < poleXs.length; pxi += 1) {
+            for (var pyi = 0; pyi < poleYs.length; pyi += 1) {
+                var pb = p3(poleXs[pxi], poleYs[pyi], 0);
+                var ptTop = p3(poleXs[pxi], poleYs[pyi], 4.0);
+                var ptArm = p3(poleXs[pxi] * 0.78, poleYs[pyi], 3.9);
+                if (pb && ptTop && ptArm) {
+                    ctx.strokeStyle = withAlpha(pal.textMuted, 0.34);
+                    ctx.lineWidth = 1.6;
+                    ctx.beginPath();
+                    ctx.moveTo(pb.x, pb.y);
+                    ctx.lineTo(ptTop.x, ptTop.y);
+                    ctx.lineTo(ptArm.x, ptArm.y);
+                    ctx.stroke();
+                }
+            }
+        }
+
+        // Far-extending asphalt carriageway & sidewalks
+        var farY = b.yMax + 10.0;
+        var nearY = Math.max(camY + 1.2, b.yMin - 1.5);
+        fillPolyPts(
+            [[b.xMin - 1.8, nearY], [b.xMax + 1.8, nearY], [b.xMax + 1.8, farY], [b.xMin - 1.8, farY]],
+            withAlpha(pal.bgRaised, pal.isLight ? 0.85 : 0.7),
+            null,
+            0,
+            false
+        );
+        fillPolyPts(
+            [[b.xMin, nearY], [b.xMax, nearY], [b.xMax, farY], [b.xMin, farY]],
+            pal.roadSurface,
+            pal.roadCurb,
+            1.4,
+            false
+        );
+
+        // Perspective dashed center divider
+        var cxMid = 0.5 * (b.xMin + b.xMax);
+        ctx.save();
+        ctx.strokeStyle = pal.roadMark;
+        ctx.lineWidth = 1.4;
+        for (var ly = nearY + 0.4; ly < farY - 0.8; ly += 1.8) {
+            var d0 = p3(cxMid, ly, 0);
+            var d1 = p3(cxMid, Math.min(farY, ly + 0.9), 0);
+            if (d0 && d1) {
+                ctx.beginPath();
+                ctx.moveTo(d0.x, d0.y);
+                ctx.lineTo(d1.x, d1.y);
+                ctx.stroke();
+            }
+        }
+        ctx.restore();
+
+        // Crosswalk perspective zebra stripes (y = 7.25 .. 8.45)
+        if (7.8 >= b.yMin + 0.4 && 7.8 <= b.yMax - 0.4) {
+            var cwTint = withAlpha(pal.textPrimary, pal.isLight ? 0.16 : 0.12);
+            for (var zx = b.xMin + 0.4; zx < b.xMax - 0.35; zx += 0.72) {
+                fillPolyPts(
+                    [[zx, 7.25], [Math.min(zx + 0.38, b.xMax - 0.3), 7.25], [Math.min(zx + 0.38, b.xMax - 0.3), 8.45], [zx, 8.45]],
+                    cwTint,
+                    null,
+                    0,
+                    false
+                );
+            }
+        }
+
+        // Calibrated 4-point homography ROI trapezoid overlay
+        var roiPadX = 0.32;
+        var roiY0 = b.yMin + 0.8;
+        var roiY1 = b.yMax - 0.8;
+        var roiWorld = [
+            [b.xMin + roiPadX, roiY1, 0],
+            [b.xMax - roiPadX, roiY1, 0],
+            [b.xMax - roiPadX, roiY0, 0],
+            [b.xMin + roiPadX, roiY0, 0]
+        ];
+        fillPolyPts(roiWorld, withAlpha(pal.accent, 0.045), withAlpha(pal.accent, 0.46), 1.2, false);
+        for (var rci = 0; rci < roiWorld.length; rci += 1) {
+            var rpt = p3(roiWorld[rci][0], roiWorld[rci][1], 0);
+            if (rpt) {
+                ctx.fillStyle = pal.accent;
+                ctx.beginPath();
+                ctx.arc(rpt.x, rpt.y, 2.5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
+        // Roadside parking exclusion zone projected onto pavement
+        var zones = st.parkingZones || [];
+        for (var zi = 0; zi < zones.length; zi += 1) {
+            var poly = zones[zi];
+            if (!Array.isArray(poly) || poly.length < 3) continue;
+            var worldPoly = poly.map(function (pt) { return [pt[0], pt[1], 0]; });
+            fillPolyPts(worldPoly, withAlpha(pal.parkingZone, 0.10), withAlpha(pal.parkingZone, 0.72), 1.3, true);
+        }
+
+        // Future CTRV trajectory arcs projected onto pavement
+        var vehicles = Array.isArray(st.vehicles) ? st.vehicles : [];
+        for (var vi = 0; vi < vehicles.length; vi += 1) {
+            var veh = vehicles[vi];
+            var spdMs = Math.hypot(veh.vx || 0, veh.vy || 0);
+            if (spdMs < 0.35 || veh.inParkingZone) continue;
+            var arcPts = predictCtrvArc(veh, 2.5, 16);
+            var arcColor = veh.riskLevel >= 1 ? riskColor(pal, veh.riskLevel) : pal.safe;
+            ctx.save();
+            ctx.setLineDash([5, 4]);
+            ctx.strokeStyle = withAlpha(arcColor, 0.86);
+            ctx.lineWidth = 1.7;
+            ctx.beginPath();
+            var startedArc = false;
+            for (var ai = 0; ai < arcPts.length; ai += 1) {
+                var aProj = p3(arcPts[ai].x, arcPts[ai].y, 0.02);
+                if (!aProj) continue;
+                if (!startedArc) {
+                    ctx.moveTo(aProj.x, aProj.y);
+                    startedArc = true;
+                } else {
+                    ctx.lineTo(aProj.x, aProj.y);
+                }
+            }
+            if (startedArc) ctx.stroke();
+            ctx.restore();
+        }
+
+        // Projected TTC convergence link & ground ring
+        var vrus = Array.isArray(st.vrus) ? st.vrus : [];
+        var conflicts = Array.isArray(st.conflicts) ? st.conflicts : [];
+        for (var ci = 0; ci < conflicts.length; ci += 1) {
+            var cf = conflicts[ci];
+            if ((cf.riskLevel || 0) < 2) continue;
+            var cfColor = riskColor(pal, cf.riskLevel);
+            var vObj = findById(vehicles, cf.vehTrackId);
+            var uObj = findById(vrus, cf.pedTrackId);
+            if (vObj && uObj) {
+                var vp = p3(vObj.x, vObj.y, 0.05);
+                var up = p3(uObj.x, uObj.y, 0.05);
+                if (vp && up) {
+                    ctx.save();
+                    ctx.setLineDash([4, 3]);
+                    ctx.strokeStyle = withAlpha(cfColor, 0.85);
+                    ctx.lineWidth = 1.4;
+                    ctx.beginPath();
+                    ctx.moveTo(vp.x, vp.y);
+                    ctx.lineTo(up.x, up.y);
+                    ctx.stroke();
+                    ctx.restore();
+                }
+            }
+            var cxy = cf.conflictGroundXY;
+            if ((!Array.isArray(cxy) || cxy.length < 2) && vObj && uObj) {
+                cxy = [(vObj.x + uObj.x) * 0.5, (vObj.y + uObj.y) * 0.5];
+            }
+            if (Array.isArray(cxy) && cxy.length >= 2) {
+                var ringPts = [];
+                for (var ang = 0; ang < 16; ang += 1) {
+                    var theta = (ang / 16) * Math.PI * 2;
+                    var rp = p3(cxy[0] + Math.cos(theta) * 0.65, cxy[1] + Math.sin(theta) * 0.65, 0.03);
+                    if (rp) ringPts.push(rp);
+                }
+                if (ringPts.length >= 6) {
+                    ctx.strokeStyle = cfColor;
+                    ctx.lineWidth = 1.5;
+                    ctx.beginPath();
+                    ctx.moveTo(ringPts[0].x, ringPts[0].y);
+                    for (var ri = 1; ri < ringPts.length; ri += 1) {
+                        ctx.lineTo(ringPts[ri].x, ringPts[ri].y);
+                    }
+                    ctx.closePath();
+                    ctx.stroke();
+                }
+            }
+        }
+
+        // Depth-sort actors far-to-near and project 3D boxes + 2D YOLO detection overlays
+        var renderActors = [];
+        for (var vIdx = 0; vIdx < vehicles.length; vIdx += 1) {
+            renderActors.push({ kind: "veh", item: vehicles[vIdx], yDepth: vehicles[vIdx].y || 0 });
+        }
+        for (var uIdx = 0; uIdx < vrus.length; uIdx += 1) {
+            renderActors.push({ kind: "vru", item: vrus[uIdx], yDepth: vrus[uIdx].y || 0 });
+        }
+        renderActors.sort(function (a, bObj) { return bObj.yDepth - a.yDepth; });
+
+        var placedLabels = [];
+        var safeRect = { minX: 6, minY: 30, maxX: w - 6, maxY: h - 6 };
+
+        for (var ai2 = 0; ai2 < renderActors.length; ai2 += 1) {
+            var entry = renderActors[ai2];
+            if (entry.kind === "veh") {
+                var v = entry.item;
+                var vColor = v.inParkingZone
+                    ? pal.textMuted
+                    : (v.riskLevel >= 1 ? riskColor(pal, v.riskLevel) : pal.safe);
+                var hl = (v.lengthM || 4.5) * 0.5;
+                var hw = (v.widthM || 1.9) * 0.5;
+                var vh = v.kind === "bus" ? 2.85 : (v.kind === "truck" ? 2.55 : 1.48);
+                var hRad = v.headingRad !== undefined ? v.headingRad : Math.PI * 0.5;
+                var cosH = Math.cos(hRad);
+                var sinH = Math.sin(hRad);
+                var cornersWorld = [
+                    [v.x + hl * cosH - hw * sinH, v.y + hl * sinH + hw * cosH],
+                    [v.x + hl * cosH + hw * sinH, v.y + hl * sinH - hw * cosH],
+                    [v.x - hl * cosH + hw * sinH, v.y - hl * sinH - hw * cosH],
+                    [v.x - hl * cosH - hw * sinH, v.y - hl * sinH + hw * cosH]
+                ];
+                var basePx = [];
+                var topPx = [];
+                var allValid = true;
+                for (var ci2 = 0; ci2 < 4; ci2 += 1) {
+                    var bp = p3(cornersWorld[ci2][0], cornersWorld[ci2][1], 0);
+                    var tp = p3(cornersWorld[ci2][0], cornersWorld[ci2][1], vh);
+                    if (!bp || !tp) {
+                        allValid = false;
+                        break;
+                    }
+                    basePx.push(bp);
+                    topPx.push(tp);
+                }
+                if (!allValid) continue;
+
+                // Subtle 3D wireframe cabin shell + roof tint
+                ctx.save();
+                ctx.fillStyle = withAlpha(vColor, v.inParkingZone ? 0.12 : 0.16);
+                ctx.strokeStyle = withAlpha(vColor, 0.72);
+                ctx.lineWidth = 1.1;
+                ctx.beginPath();
+                ctx.moveTo(topPx[0].x, topPx[0].y);
+                for (var ti2 = 1; ti2 < 4; ti2 += 1) ctx.lineTo(topPx[ti2].x, topPx[ti2].y);
+                ctx.closePath();
+                ctx.fill();
+                ctx.stroke();
+
+                for (var ei = 0; ei < 4; ei += 1) {
+                    ctx.beginPath();
+                    ctx.moveTo(basePx[ei].x, basePx[ei].y);
+                    ctx.lineTo(topPx[ei].x, topPx[ei].y);
+                    ctx.stroke();
+                }
+                ctx.restore();
+
+                // Compute 2D YOLO detection bbox around projected 3D box
+                var allBoxPts = basePx.concat(topPx);
+                var minBx = Infinity;
+                var minBy = Infinity;
+                var maxBx = -Infinity;
+                var maxBy = -Infinity;
+                for (var bi = 0; bi < allBoxPts.length; bi += 1) {
+                    if (allBoxPts[bi].x < minBx) minBx = allBoxPts[bi].x;
+                    if (allBoxPts[bi].y < minBy) minBy = allBoxPts[bi].y;
+                    if (allBoxPts[bi].x > maxBx) maxBx = allBoxPts[bi].x;
+                    if (allBoxPts[bi].y > maxBy) maxBy = allBoxPts[bi].y;
+                }
+                ctx.strokeStyle = vColor;
+                ctx.lineWidth = v.riskLevel >= 2 ? 2.0 : 1.5;
+                ctx.strokeRect(minBx, minBy, maxBx - minBx, maxBy - minBy);
+
+                // Ground anchor dot
+                var anchorPt = p3(v.x, v.y, 0);
+                if (anchorPt) {
+                    ctx.fillStyle = pal.accent;
+                    ctx.beginPath();
+                    ctx.arc(anchorPt.x, anchorPt.y, 3, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                var spdTxt = isFiniteNum(v.speedKmh) ? v.speedKmh.toFixed(1) + " km/h" : "0.0 km/h";
+                var statusSuffix = v.riskLevel >= 3 ? " [ALERT]" : (v.riskLevel === 2 ? " [CAUTION]" : (v.riskLevel === 1 ? " [SPEEDING]" : ""));
+                var vLabel = "V-" + padId(v.trackId) + " | " + spdTxt + statusSuffix;
+                var vBg = v.riskLevel >= 3 ? pal.critical : pal.bgCard;
+                var vFg = v.riskLevel >= 3 ? "#ffffff" : pal.textPrimary;
+                placePill(
+                    ctx,
+                    { cx: (minBx + maxBx) * 0.5, cy: minBy - 10, rx: 0, ry: 2 },
+                    vLabel,
+                    vBg,
+                    vColor,
+                    vFg,
+                    safeRect,
+                    placedLabels,
+                    []
+                );
+            } else {
+                var u = entry.item;
+                var isBike = u.kind === "bicycle" || u.category === "bicycle" || u.kind === "motorcycle";
+                var uColor = u.riskLevel >= 2 ? riskColor(pal, u.riskLevel) : (isBike ? pal.accent : pal.safe);
+                var uw = isBike ? 0.55 : 0.36;
+                var uh = isBike ? 1.42 : 1.72;
+                var uBaseL = p3(u.x - uw, u.y, 0);
+                var uBaseR = p3(u.x + uw, u.y, 0);
+                var uTopL = p3(u.x - uw, u.y, uh);
+                var uTopR = p3(u.x + uw, u.y, uh);
+                var uAnchor = p3(u.x, u.y, 0);
+                if (!uBaseL || !uBaseR || !uTopL || !uTopR) continue;
+
+                var bx1 = Math.min(uBaseL.x, uTopL.x);
+                var bx2 = Math.max(uBaseR.x, uTopR.x);
+                var by1 = Math.min(uTopL.y, uTopR.y);
+                var by2 = Math.max(uBaseL.y, uBaseR.y);
+                var bw = Math.max(14, bx2 - bx1);
+                var bh = Math.max(24, by2 - by1);
+
+                ctx.fillStyle = withAlpha(uColor, 0.14);
+                ctx.fillRect(bx1, by1, bw, bh);
+                ctx.strokeStyle = uColor;
+                ctx.lineWidth = u.riskLevel >= 2 ? 1.8 : 1.4;
+                ctx.strokeRect(bx1, by1, bw, bh);
+
+                if (uAnchor) {
+                    ctx.fillStyle = pal.accent;
+                    ctx.beginPath();
+                    ctx.arc(uAnchor.x, uAnchor.y, 2.5, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                var uTag = (isBike ? "B-" : "P-") + padId(u.trackId);
+                if (isBike && Math.hypot(u.vx || 0, u.vy || 0) > 0.2) {
+                    uTag += " " + (Math.hypot(u.vx || 0, u.vy || 0) * 3.6).toFixed(1) + "km/h";
+                }
+                placePill(
+                    ctx,
+                    { cx: bx1 + bw * 0.5, cy: by1 - 10, rx: 0, ry: 2 },
+                    uTag,
+                    u.riskLevel >= 3 ? pal.critical : pal.bgCard,
+                    uColor,
+                    u.riskLevel >= 3 ? "#ffffff" : pal.textPrimary,
+                    safeRect,
+                    placedLabels,
+                    []
+                );
+            }
+        }
+
+        // Top overlay status bar (clean corner pills)
+        var camTitle = w < 410 ? "CAM-01 · 3D 透视仿真" : "CAM-01 · 3D 透视仿真视角 · 标定 6.0m x 15.0m";
+        drawPill(ctx, 10, 8, camTitle, pal.bgCard, pal.hairline, pal.textSecondary, w);
+
+        var maxRisk = st.maxRisk || 0;
+        var riskTxt = maxRisk === 3 ? "L3 CRITICAL" : (maxRisk === 2 ? "L2 CAUTION" : (maxRisk === 1 ? "L1 SPEEDING" : "L0 SAFE"));
+        var riskCol = riskColor(pal, maxRisk);
+        drawPill(
+            ctx,
+            Math.max(10, w - 104),
+            8,
+            riskTxt,
+            maxRisk === 3 ? pal.critical : pal.bgCard,
+            riskCol,
+            maxRisk === 3 ? "#ffffff" : riskCol,
+            w
+        );
+
+        ctx.restore();
+    };
+
+    SimulatedCameraCanvas.prototype.destroy = function () {
+        if (this._destroyed) return;
+        this._destroyed = true;
+        if (this._resizeObserver) {
+            this._resizeObserver.disconnect();
+            this._resizeObserver = null;
+        }
+        this._unobserveTheme();
+        if (this._probe && this._probe.parentNode) {
+            this._probe.parentNode.removeChild(this._probe);
+        }
+    };
+
+    /* ======================================================================
      * Public global export
      * ====================================================================== */
     global.CampusMotion = {
@@ -4225,6 +4779,7 @@
         CampusRoadTwinCanvas: CampusRoadTwinCanvas,
         SpeedTimelineChart: SpeedTimelineChart,
         CalibrationCanvas: CalibrationCanvas,
-        AlertAudioSynth: AlertAudioSynth
+        AlertAudioSynth: AlertAudioSynth,
+        SimulatedCameraCanvas: SimulatedCameraCanvas
     };
 })(typeof window !== "undefined" ? window : globalThis);

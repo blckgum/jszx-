@@ -565,6 +565,67 @@ class TestPipelineObbAndRtspReconnect(unittest.TestCase):
             self.assertTrue(any("[VRU]" in txt for txt in rendered_texts))
             self.assertTrue(any("DRAC:" in txt for txt in rendered_texts))
 
+    def test_speed_badge_critical_contrast_edge_clamp_and_collision_avoidance(self):
+        frame = np.zeros((320, 480, 3), dtype=np.uint8)
+        r1 = SpeedReading(
+            track_id=1, category="vehicle", x_m=3.0, y_m=6.0,
+            vx_ms=0.0, vy_ms=4.0, speed_ms=4.0, speed_kmh=14.4,
+            is_speeding=False, heading_deg=90.0, is_reliable=True,
+        )
+        r2 = SpeedReading(
+            track_id=2, category="pedestrian", x_m=3.1, y_m=6.2,
+            vx_ms=0.5, vy_ms=0.0, speed_ms=0.5, speed_kmh=1.8,
+            is_speeding=False, heading_deg=0.0, is_reliable=True,
+        )
+        c_crit = ConflictAssessment(
+            veh_track_id=1, ped_track_id=2, risk_level=RiskLevel.LEVEL_3_CRITICAL,
+            risk_desc="crit", veh_speed_kmh=14.4, ped_speed_ms=0.5,
+            current_distance_m=1.2, min_distance_m=0.2, ttc_seconds=1.1,
+            conflict_ground_xy=(3.0, 6.2),
+        )
+        calls = []
+        orig_put = cv2.putText
+        orig_rect = cv2.rectangle
+
+        def _spy_put(img, text, org, font, scale, color, *args, **kwargs):
+            calls.append((text, org, scale, color))
+            return orig_put(img, text, org, font, scale, color, *args, **kwargs)
+
+        rects = []
+
+        def _spy_rect(img, pt1, pt2, color, thickness=1, *args, **kwargs):
+            if thickness == -1:
+                rects.append((pt1[0], pt1[1], pt2[0], pt2[1]))
+            return orig_rect(img, pt1, pt2, color, thickness, *args, **kwargs)
+
+        t1 = SimpleNamespace(track_id=1, bbox_xyxy=(410, 120, 475, 220))
+        t2 = SimpleNamespace(track_id=2, bbox_xyxy=(415, 120, 460, 210))
+        viz = EnhancedConflictVisualizer(_sample_calibrator(), speed_limit_kmh=30.0)
+        with (
+            mock.patch("analysis.visualization.cv2.putText", side_effect=_spy_put),
+            mock.patch("analysis.visualization.cv2.rectangle", side_effect=_spy_rect),
+        ):
+            viz.draw_frame(frame, [t1, t2], [r1, r2], [c_crit])
+
+        # L3 badge text uses high-contrast white (255, 255, 255) and stays inside narrow frame width
+        badge_calls = [c for c in calls if c[0].startswith("ID:")]
+        self.assertEqual(len(badge_calls), 2)
+        self.assertEqual(badge_calls[0][3], (255, 255, 255))
+        badge_rects = [r for r in rects if r[0] >= 2]
+        self.assertEqual(len(badge_rects), 2)
+        for rx1, ry1, rx2, ry2 in badge_rects:
+            self.assertGreaterEqual(rx1, 2)
+            self.assertLessEqual(rx2, 478)
+        # Adjacent badges must not overlap vertically
+        a, b = badge_rects
+        overlap = not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
+        self.assertFalse(overlap)
+
+        # Narrow frame HUD banner scales font down so long text fits inside frame width
+        hud_calls = [c for c in calls if "CRITICAL CONFLICT ALERT" in c[0]]
+        self.assertEqual(len(hud_calls), 1)
+        self.assertLess(hud_calls[0][2], 0.65)
+
 
 if __name__ == "__main__":
     unittest.main()

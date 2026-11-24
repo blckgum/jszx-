@@ -99,6 +99,7 @@ class EnhancedConflictVisualizer:
     def __init__(self, calibrator: RoadCalibrator, speed_limit_kmh: float = 30.0):
         self.calibrator = calibrator
         self.speed_limit_kmh = speed_limit_kmh
+        self._frame_badge_rects: Optional[List[Tuple[int, int, int, int]]] = None
 
         # 调色板定义 (BGR 格式)
         self.COLOR_SAFE = (50, 205, 50)       # 绿色 (正常)
@@ -284,8 +285,10 @@ class EnhancedConflictVisualizer:
         reading: SpeedReading,
         conflict: Optional[ConflictAssessment] = None,
         event_id: Optional[int] = None,
+        *,
+        occupied_rects: Optional[List[Tuple[int, int, int, int]]] = None,
     ):
-        """在目标检测框上方绘制测速与状态徽章"""
+        """在目标检测框上方绘制测速与状态徽章（自动防越界裁剪与同帧避让重叠）。"""
         x1, y1, x2, y2 = map(int, box_xyxy)
 
         vru_kind = _conflict_target_vru_kind(conflict)
@@ -293,17 +296,21 @@ class EnhancedConflictVisualizer:
         mark = "!" if event_id is not None else "?"
         if conflict and conflict.risk_level == RiskLevel.LEVEL_3_CRITICAL:
             color = self.COLOR_CRITICAL
+            text_color = (255, 255, 255)
             label = f"ID:{reading.track_id} {reading.category.upper()} | {reading.speed_kmh:.1f} km/h [COLLISION ALERT{mark}]"
         elif conflict and conflict.risk_level == RiskLevel.LEVEL_2_CAUTION:
             color = self.COLOR_CAUTION
+            text_color = (15, 15, 16)
             label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h [CAUTION{mark}]"
         elif reading.is_speeding or (
             conflict is not None and conflict.risk_level == RiskLevel.LEVEL_1_SPEEDING
         ):
             color = self.COLOR_SPEEDING
+            text_color = (15, 15, 16)
             label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h [SPEEDING{mark}]"
         else:
             color = self.COLOR_SAFE
+            text_color = (15, 15, 16)
             label = f"ID:{reading.track_id} | {reading.speed_kmh:.1f} km/h"
 
         # 涉及非行人弱势交通参与者（如骑行者）时标注 [VRU]。
@@ -316,17 +323,46 @@ class EnhancedConflictVisualizer:
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        # 绘制文本背景
+        # 绘制文本背景（约束在画幅内部并避让同帧已放置徽章）
+        fh, fw = frame.shape[:2]
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        ty = max(y1 - 6, th + 4)
-        cv2.rectangle(frame, (x1, ty - th - 4), (x1 + tw + 6, ty + 2), color, -1)
+        box_w = tw + 6
+        box_h = th + 6
+        bx1 = max(2, min(x1, max(2, fw - box_w - 2)))
+        by2 = max(box_h + 2, min(y1 - 4, max(box_h + 2, fh - 2)))
+
+        active_rects = occupied_rects if occupied_rects is not None else self._frame_badge_rects
+        if active_rects is not None:
+            step_y = box_h + 4
+            candidates_y = [by2]
+            for mul in range(1, 6):
+                candidates_y.append(by2 - mul * step_y)
+                candidates_y.append(by2 + mul * step_y)
+            for cand_by2 in candidates_y:
+                if cand_by2 - box_h < 2 or cand_by2 > fh - 2:
+                    continue
+                cand_rect = (bx1, cand_by2 - box_h, bx1 + box_w, cand_by2)
+                if not any(
+                    not (
+                        cand_rect[2] <= ox1
+                        or cand_rect[0] >= ox2
+                        or cand_rect[3] <= oy1
+                        or cand_rect[1] >= oy2
+                    )
+                    for ox1, oy1, ox2, oy2 in active_rects
+                ):
+                    by2 = cand_by2
+                    break
+            active_rects.append((bx1, by2 - box_h, bx1 + box_w, by2))
+
+        cv2.rectangle(frame, (bx1, by2 - box_h), (bx1 + box_w, by2), color, -1)
         cv2.putText(
             frame,
             label,
-            (x1 + 3, ty - 2),
+            (bx1 + 3, by2 - 4),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
-            (0, 0, 0),
+            text_color,
             1,
             cv2.LINE_AA,
         )
@@ -406,15 +442,26 @@ class EnhancedConflictVisualizer:
 
         cv2.rectangle(overlay, (0, 0), (w, min(h, banner_h)), bg_color, -1)
         cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+        max_text_w = max(80, w - 32)
+        font_scale = 0.65
+        while font_scale > 0.36:
+            thickness = 2 if font_scale >= 0.52 else 1
+            (tw_banner, _), _ = cv2.getTextSize(
+                banner_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+            )
+            if tw_banner <= max_text_w:
+                break
+            font_scale = round(font_scale - 0.04, 2)
+        thickness = 2 if font_scale >= 0.52 else 1
         main_y = 30 if ssm_summary else 32
         cv2.putText(
             frame,
             banner_text,
             (16, main_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
+            font_scale,
             (255, 255, 255),
-            2,
+            thickness,
             cv2.LINE_AA,
         )
         if ssm_summary:
@@ -507,16 +554,20 @@ class EnhancedConflictVisualizer:
             c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
             self.draw_future_trajectory(render_frame, r, color=trajectory_color(c))
 
-        for t in tracks:
-            tid = getattr(t, "track_id", None)
-            if tid is None:
-                continue
-            r = reading_map.get(tid)
-            if r:
-                c = conflict_map.get(tid) or ped_conflict_map.get(tid)
-                bbox = getattr(t, "bbox_xyxy", None)
-                if bbox is not None:
-                    self.draw_speed_badge(render_frame, bbox, r, c)
+        self._frame_badge_rects = []
+        try:
+            for t in tracks:
+                tid = getattr(t, "track_id", None)
+                if tid is None:
+                    continue
+                r = reading_map.get(tid)
+                if r:
+                    c = conflict_map.get(tid) or ped_conflict_map.get(tid)
+                    bbox = getattr(t, "bbox_xyxy", None)
+                    if bbox is not None:
+                        self.draw_speed_badge(render_frame, bbox, r, c)
+        finally:
+            self._frame_badge_rects = None
 
         for c in conflicts:
             self.draw_conflict_link(render_frame, c, reading_map)

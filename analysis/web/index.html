@@ -189,54 +189,14 @@
               </header>
 
               <div class="viewport-stage">
-                <!-- Simulation State -->
-                <div id="viewport-sim-panel" class="viewport-overlay">
-                  <div class="viewport-grid-head">
-                    <span class="mono muted-text">CAM-01 · 校门主干道斑马线</span>
-                    <span id="sim-calib-tag" class="mono muted-text">标定 6.0m x 15.0m</span>
-                  </div>
-                  <div class="sim-calib-box" aria-hidden="true">
-                    <svg class="sim-calib-svg" viewBox="0 0 420 116" fill="none">
-                      <polygon points="132,20 288,20 364,96 56,96" class="calib-roi"></polygon>
-                      <line x1="210" y1="20" x2="210" y2="96" class="calib-axis"></line>
-                      <g class="calib-zebra">
-                        <rect x="136" y="48" width="14" height="10" rx="1"></rect>
-                        <rect x="164" y="48" width="14" height="10" rx="1"></rect>
-                        <rect x="192" y="48" width="14" height="10" rx="1"></rect>
-                        <rect x="220" y="48" width="14" height="10" rx="1"></rect>
-                        <rect x="248" y="48" width="14" height="10" rx="1"></rect>
-                        <rect x="276" y="48" width="14" height="10" rx="1"></rect>
-                      </g>
-                      <circle cx="132" cy="20" r="3" class="calib-pt"></circle>
-                      <circle cx="288" cy="20" r="3" class="calib-pt"></circle>
-                      <circle cx="364" cy="96" r="3" class="calib-pt"></circle>
-                      <circle cx="56" cy="96" r="3" class="calib-pt"></circle>
-                      <text x="12" y="16" class="calib-note">H 3x3 -&gt; Ground 6.0m x 15.0m</text>
-                      <text x="12" y="108" class="calib-sub">P0(400,300) · P1(880,300) · P2(1150,680) · P3(130,680)</text>
-                    </svg>
-                  </div>
-                  <div class="viewport-telemetry">
-                    <div class="telemetry-row">
-                      <span class="telemetry-key">活跃场景</span>
-                      <span id="sim-scene-name" class="telemetry-val">斑马线急刹</span>
-                    </div>
-                    <div class="telemetry-row">
-                      <span class="telemetry-key">感知目标</span>
-                      <span id="sim-objects-summary" class="telemetry-val tabular">0 车辆 / 0 行人与骑行者</span>
-                    </div>
-                    <div class="telemetry-row">
-                      <span class="telemetry-key">瞬时风险评估</span>
-                      <span id="sim-risk-summary" class="telemetry-val tabular">等待采样</span>
-                    </div>
-                  </div>
-                  <div class="viewport-cta-row">
-                    <button type="button" id="btn-replay-sample" class="btn btn-primary">回放样本 run-20261020_201655</button>
-                  </div>
+                <!-- Simulation State: Live Synced 3D Oblique Perspective Canvas -->
+                <div id="viewport-sim-panel" class="viewport-media-wrap sim-canvas-wrap">
+                  <canvas id="sim-camera-canvas" aria-label="路侧单目相机 3D 透视模拟感知画面"></canvas>
                 </div>
 
                 <!-- Replay State -->
                 <div id="viewport-replay-panel" class="viewport-media-wrap" hidden>
-                  <video id="replay-video" class="media-frame" muted playsinline preload="metadata" hidden></video>
+                  <video id="replay-video" class="media-frame" muted playsinline preload="none" hidden></video>
                   <img id="replay-frame-img" class="media-frame" alt="历史分析标注帧">
                   <div id="replay-media-caption" class="media-caption mono tabular">回放就绪</div>
                 </div>
@@ -245,6 +205,15 @@
                 <div id="viewport-live-panel" class="viewport-media-wrap" hidden>
                   <img id="live-mjpeg-img" class="media-frame" alt="实时视频流标注画面">
                   <div id="live-media-caption" class="media-caption mono tabular">等待首帧图像</div>
+                </div>
+              </div>
+
+              <!-- Simulation Footer -->
+              <div id="sim-controls" class="card-controls">
+                <span id="sim-scene-telemetry" class="mono tabular control-readout">斑马线急刹 · 1 车辆 · 2 VRU</span>
+                <div class="control-actions">
+                  <button type="button" id="btn-import-video" class="btn btn-secondary">导入实拍分析</button>
+                  <button type="button" id="btn-replay-sample" class="btn btn-ghost">回放最新记录</button>
                 </div>
               </div>
 

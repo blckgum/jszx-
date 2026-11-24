@@ -806,9 +806,12 @@ class AnalysisService:
                     continue
                 resolved = entry.resolve()
                 if resolved not in seen_videos:
+                    rel_label = self._format_preset_label(resolved, roots=label_roots)
+                    is_fixture = "tracking-fixtures" in resolved.parts
                     seen_videos[resolved] = {
-                        "label": self._format_preset_label(resolved, roots=label_roots),
+                        "label": f"测试固件 · {resolved.name} (镜像静态图，非实拍)" if is_fixture else rel_label,
                         "path": str(resolved),
+                        "is_fixture": is_fixture,
                     }
 
         calib_dir = self.default_calib.parent
