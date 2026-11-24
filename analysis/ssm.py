@@ -18,6 +18,8 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .policy import ObjectPolicy, object_policy
+
 # 预计算 48 节点高斯-勒让德积分节点与权重，用于碰撞概率的一维无奇异积分。
 _GL_NODES, _GL_WEIGHTS = np.polynomial.legendre.leggauss(48)
 _GL_PAIRS: Tuple[Tuple[float, float], ...] = tuple(
@@ -138,6 +140,96 @@ def _ray_aabb_slab_interval(
     return (t_min, t_max)
 
 
+def _ray_disk_interval(
+    px: float,
+    py: float,
+    vx: float,
+    vy: float,
+    cx: float,
+    cy: float,
+    r: float,
+    horizon_s: float,
+) -> Optional[Tuple[float, float]]:
+    """计算相对射线 p + v*t 与角部圆 (cx, cy, r) 在 [0, horizon_s] 内的交集时间段。"""
+    if r <= 0.0:
+        return None
+    dx = px - cx
+    dy = py - cy
+    a = vx * vx + vy * vy
+    half_b = dx * vx + dy * vy
+    c = dx * dx + dy * dy - r * r
+    # 相对静止或极低相对速度时直接判定初始点是否位于圆内
+    if a <= 1e-18:
+        return (0.0, horizon_s) if c <= 1e-12 else None
+
+    disc = half_b * half_b - a * c
+    if disc < 0.0:
+        # 仅在极小浮点误差范围内视作切线相交，避免漏判临界相切
+        tol = 1e-12 * max(1.0, half_b * half_b, a * abs(c))
+        if disc >= -tol:
+            disc = 0.0
+        else:
+            return None
+
+    sqrt_disc = math.sqrt(disc)
+    # 数值稳定求根，防止 half_b 较大而 a*c 极小时的有效数字相消
+    if half_b >= 0.0:
+        q = -half_b - sqrt_disc
+    else:
+        q = -half_b + sqrt_disc
+
+    if abs(q) > 1e-18:
+        r1 = q / a
+        r2 = c / q
+    else:
+        r1 = (-half_b - sqrt_disc) / a
+        r2 = (-half_b + sqrt_disc) / a
+
+    t_enter, t_exit = (r1, r2) if r1 <= r2 else (r2, r1)
+    lo = max(0.0, t_enter)
+    hi = min(horizon_s, t_exit)
+    if lo > hi:
+        return None
+    return (lo + 0.0, hi + 0.0)
+
+
+def _ray_rounded_aabb_interval(
+    px: float,
+    py: float,
+    vx: float,
+    vy: float,
+    hx_core: float,
+    hy_core: float,
+    r: float,
+    horizon_s: float,
+) -> Optional[Tuple[float, float]]:
+    """计算相对射线与圆角矩形（两块正交板 + 四角圆）Minkowski 并集在 [0, horizon_s] 的交集区间。"""
+    intervals: list[Tuple[float, float]] = []
+    # 横跨板 [-(hx_core+r), hx_core+r] x [-hy_core, hy_core]
+    h_slab = _ray_aabb_slab_interval(px, py, vx, vy, hx_core + r, hy_core, horizon_s)
+    if h_slab is not None:
+        intervals.append(h_slab)
+    # 纵跨板 [-hx_core, hx_core] x [-(hy_core+r), hy_core+r]
+    v_slab = _ray_aabb_slab_interval(px, py, vx, vy, hx_core, hy_core + r, horizon_s)
+    if v_slab is not None:
+        intervals.append(v_slab)
+    # 四个角部圆心 (±hx_core, ±hy_core)，半径为 r
+    if r > 0.0:
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                disk_iv = _ray_disk_interval(
+                    px, py, vx, vy, sx * hx_core, sy * hy_core, r, horizon_s
+                )
+                if disk_iv is not None:
+                    intervals.append(disk_iv)
+    if not intervals:
+        return None
+    # 圆角矩形为凸集，其各凸子域交集并集必为单一闭区间 [min(t_enter), max(t_exit)]
+    t_enter = min(iv[0] for iv in intervals)
+    t_exit = max(iv[1] for iv in intervals)
+    return (t_enter + 0.0, t_exit + 0.0)
+
+
 def _segment_aabb_min_clearance(
     px: float,
     py: float,
@@ -255,21 +347,27 @@ def compute_obb_swept_ttc(
     local_vx = cos_h * dvx + sin_h * dvy
     local_vy = -sin_h * dvx + cos_h * dvy
 
-    hx_unmargined = 0.5 * length + ped_r
-    hy_unmargined = 0.5 * width + ped_r
-    hx = hx_unmargined + lon_margin
-    hy = hy_unmargined + lat_margin
+    # 构造核心带裕度矩形 [-hx_core, hx_core] x [-hy_core, hy_core]，
+    # 再按行人半径 ped_r 做真实圆角 Minkowski 膨胀（消除直角包络角部 ~0.41r 误报）。
+    hx_core = 0.5 * length + lon_margin
+    hy_core = 0.5 * width + lat_margin
+    hx = hx_core + ped_r
+    hy = hy_core + ped_r
 
-    slab = _ray_aabb_slab_interval(local_px, local_py, local_vx, local_vy, hx, hy, horizon)
-    min_clearance, t_min_clearance = _segment_aabb_min_clearance(
-        local_px, local_py, local_vx, local_vy, hx_unmargined, hy_unmargined, horizon
+    hit = _ray_rounded_aabb_interval(
+        local_px, local_py, local_vx, local_vy, hx_core, hy_core, ped_r, horizon
     )
+    # 物理最小净距：相对线段到裸车核心矩形 [-0.5*L, 0.5*L] x [-0.5*W, 0.5*W] 的精确欧氏距离减 ped_r 并钳位非负
+    d_car, t_min_clearance = _segment_aabb_min_clearance(
+        local_px, local_py, local_vx, local_vy, 0.5 * length, 0.5 * width, horizon
+    )
+    min_clearance = max(0.0, d_car - ped_r)
 
-    if slab is not None:
+    if hit is not None:
         return OBBCollisionResult(
             collides=True,
-            t_enter=slab[0],
-            t_exit=slab[1],
+            t_enter=hit[0],
+            t_exit=hit[1],
             min_clearance_m=min_clearance,
             t_min_clearance=t_min_clearance,
             local_pos_xy=(local_px, local_py),
@@ -616,6 +714,8 @@ class PETTracker:
         self._active_cells_by_track: Dict[int, set[Tuple[int, int]]] = {}
         # track_id -> (timestamp_s, x_m, y_m)，用于帧间轨迹插值防止高速目标越格漏检
         self._last_track_pos: Dict[int, Tuple[float, float, float]] = {}
+        # track_id -> 上一帧航向角（弧度），用于插值步间旋转角平滑过渡
+        self._last_track_heading: Dict[int, float] = {}
         self._last_timestamp_s: Optional[float] = None
 
     def reset(self) -> None:
@@ -623,43 +723,164 @@ class PETTracker:
         self._cell_visits.clear()
         self._active_cells_by_track.clear()
         self._last_track_pos.clear()
+        self._last_track_heading.clear()
         self._last_timestamp_s = None
 
     def _grid_cell(self, x_m: float, y_m: float) -> Tuple[int, int]:
         return (math.floor(x_m / self.cell_size_m), math.floor(y_m / self.cell_size_m))
 
+    def _obb_grid_cells(
+        self,
+        cx: float,
+        cy: float,
+        half_l: float,
+        half_w: float,
+        heading_rad: float,
+    ) -> list[Tuple[int, int]]:
+        """利用分离轴定理 (SAT) 栅格化旋转车体矩形包络占用的全部网格单元。"""
+        s = self.cell_size_m
+        hs = 0.5 * s
+        cos_h = math.cos(heading_rad)
+        sin_h = math.sin(heading_rad)
+        abs_cos = abs(cos_h)
+        abs_sin = abs(sin_h)
+
+        # 计算旋转矩形在世界坐标轴下的紧致包围盒半宽，缩小候选网格扫描范围
+        aabb_hx = half_l * abs_cos + half_w * abs_sin
+        aabb_hy = half_l * abs_sin + half_w * abs_cos
+        eps = 1e-9 * s
+        ix_min = math.floor((cx - aabb_hx + eps) / s)
+        ix_max = math.floor((cx + aabb_hx - eps) / s)
+        iy_min = math.floor((cy - aabb_hy + eps) / s)
+        iy_max = math.floor((cy + aabb_hy - eps) / s)
+
+        cell_proj = hs * (abs_cos + abs_sin)
+        thresh_x = half_l + cell_proj - eps
+        thresh_y = half_w + cell_proj - eps
+
+        cells: list[Tuple[int, int]] = []
+        for ix in range(ix_min, ix_max + 1):
+            dx = (ix + 0.5) * s - cx
+            for iy in range(iy_min, iy_max + 1):
+                dy = (iy + 0.5) * s - cy
+                # 将网格中心相对矢量投影到车体局部坐标系判定严格重叠
+                loc_x = cos_h * dx + sin_h * dy
+                loc_y = -sin_h * dx + cos_h * dy
+                if abs(loc_x) < thresh_x and abs(loc_y) < thresh_y:
+                    cells.append((ix, iy))
+
+        # 极端薄壁尺寸退化时兜底保留中心所在网格，避免漏记占用
+        if not cells:
+            cells.append(self._grid_cell(cx, cy))
+        return cells
+
+    def _resolve_vehicle_footprint(
+        self,
+        reading,
+        track_id: int,
+        x_m: float,
+        y_m: float,
+        object_policies: Optional[Dict[str, ObjectPolicy]],
+    ) -> Optional[Tuple[float, float, float]]:
+        """解析车辆物理半长/半宽与航向角 (half_l, half_w, heading_rad)；无尺寸或无航向返回 None。"""
+        raw_l = getattr(reading, "length_m", None)
+        raw_w = getattr(reading, "width_m", None)
+        if (
+            _is_finite_number(raw_l)
+            and float(raw_l) > 0.0
+            and _is_finite_number(raw_w)
+            and float(raw_w) > 0.0
+        ):
+            length_m = float(raw_l)
+            width_m = float(raw_w)
+        elif object_policies is not None:
+            pol = object_policy(
+                getattr(reading, "object_kind", None),
+                getattr(reading, "category", "vehicle"),
+                object_policies,
+            )
+            if pol.kind == "pedestrian":
+                return None
+            length_m = float(pol.length_m)
+            width_m = float(pol.width_m)
+        else:
+            return None
+
+        raw_h = getattr(reading, "heading_deg", None)
+        if raw_h is not None and _is_finite_number(raw_h):
+            heading_rad = math.radians(float(raw_h))
+        else:
+            # 缺失显式航向时优先回退速度矢量方向，再回退帧间位移方向
+            vx = getattr(reading, "vx_ms", None)
+            vy = getattr(reading, "vy_ms", None)
+            if (
+                _is_finite_number(vx)
+                and _is_finite_number(vy)
+                and math.hypot(float(vx), float(vy)) > 1e-6
+            ):
+                heading_rad = math.atan2(float(vy), float(vx))
+            else:
+                prev = self._last_track_pos.get(track_id)
+                if prev is not None and math.hypot(x_m - prev[1], y_m - prev[2]) > 1e-6:
+                    heading_rad = math.atan2(y_m - prev[2], x_m - prev[1])
+                else:
+                    return None
+
+        return (0.5 * length_m, 0.5 * width_m, heading_rad)
+
     def _sample_cells(
-        self, track_id: int, x_m: float, y_m: float, timestamp_s: float
+        self,
+        track_id: int,
+        x_m: float,
+        y_m: float,
+        timestamp_s: float,
+        footprint: Optional[Tuple[float, float, float]] = None,
     ) -> list[Tuple[Tuple[int, int], float, float]]:
         prev = self._last_track_pos.get(track_id)
         cells_with_ts: Dict[Tuple[int, int], Tuple[float, float]] = {}
+
+        def _record_cells(sx: float, sy: float, st: float, s_heading: float) -> None:
+            if footprint is None:
+                step_cells = (self._grid_cell(sx, sy),)
+            else:
+                step_cells = self._obb_grid_cells(sx, sy, footprint[0], footprint[1], s_heading)
+            for cell in step_cells:
+                if cell not in cells_with_ts:
+                    cells_with_ts[cell] = (st, st)
+                else:
+                    first_st, _ = cells_with_ts[cell]
+                    cells_with_ts[cell] = (first_st, st)
+
         if prev is not None:
             prev_t, prev_x, prev_y = prev
             dt = timestamp_s - prev_t
             dist = math.hypot(x_m - prev_x, y_m - prev_y)
             if 0.0 < dt <= 1.0 and 0.0 < dist <= 15.0:
                 steps = max(1, int(math.ceil(dist / (0.5 * self.cell_size_m))))
+                prev_h = self._last_track_heading.get(track_id) if footprint is not None else None
+                curr_h = footprint[2] if footprint is not None else 0.0
+                d_theta = (
+                    math.atan2(math.sin(curr_h - prev_h), math.cos(curr_h - prev_h))
+                    if prev_h is not None
+                    else 0.0
+                )
                 for idx in range(1, steps + 1):
                     alpha = idx / steps
                     sx = prev_x + (x_m - prev_x) * alpha
                     sy = prev_y + (y_m - prev_y) * alpha
                     st = prev_t + dt * alpha
-                    cell = self._grid_cell(sx, sy)
-                    if cell not in cells_with_ts:
-                        cells_with_ts[cell] = (st, st)
-                    else:
-                        first_st, _ = cells_with_ts[cell]
-                        cells_with_ts[cell] = (first_st, st)
-        end_cell = self._grid_cell(x_m, y_m)
-        if end_cell not in cells_with_ts:
-            cells_with_ts[end_cell] = (timestamp_s, timestamp_s)
-        else:
-            first_st, _ = cells_with_ts[end_cell]
-            cells_with_ts[end_cell] = (first_st, timestamp_s)
+                    s_h = (prev_h + d_theta * alpha) if prev_h is not None else curr_h
+                    _record_cells(sx, sy, st, s_h)
+
+        end_h = footprint[2] if footprint is not None else 0.0
+        _record_cells(x_m, y_m, timestamp_s, end_h)
         return [(cell, span[0], span[1]) for cell, span in cells_with_ts.items()]
 
     def update(
-        self, readings: Iterable, timestamp_s: float
+        self,
+        readings: Iterable,
+        timestamp_s: float,
+        object_policies: Optional[Dict[str, ObjectPolicy]] = None,
     ) -> Dict[Tuple[int, int], float]:
         """更新当前帧所有有效目标的网格占用，返回本帧跨类别交叉侵入 {(veh_id, ped_id): min_pet_s}。"""
         ts = _validate_non_negative_float(timestamp_s, "timestamp_s")
@@ -678,6 +899,7 @@ class PETTracker:
         for tid in list(self._last_track_pos.keys()):
             if self._last_track_pos[tid][0] < cutoff:
                 del self._last_track_pos[tid]
+                self._last_track_heading.pop(tid, None)
                 self._active_cells_by_track.pop(tid, None)
 
         near_misses: Dict[Tuple[int, int], float] = {}
@@ -705,10 +927,19 @@ class PETTracker:
                 continue
             if not (_is_finite_number(x_m) and _is_finite_number(y_m)):
                 continue
+            raw_heading = getattr(r, "heading_deg", None)
+            if raw_heading is not None and not _is_finite_number(raw_heading):
+                continue
             x_f, y_f = float(x_m), float(y_m)
 
+            footprint = (
+                self._resolve_vehicle_footprint(r, tid, x_f, y_f, object_policies)
+                if norm_cat == "vehicle"
+                else None
+            )
+
             prev_active = self._active_cells_by_track.get(tid, set())
-            touched_cells = self._sample_cells(tid, x_f, y_f, ts)
+            touched_cells = self._sample_cells(tid, x_f, y_f, ts, footprint=footprint)
             curr_active: set[Tuple[int, int]] = set()
 
             for cell, first_cell_ts, last_cell_ts in touched_cells:
@@ -729,6 +960,10 @@ class PETTracker:
 
             current_cells_by_track[tid] = curr_active
             self._last_track_pos[tid] = (ts, x_f, y_f)
+            if footprint is not None:
+                self._last_track_heading[tid] = footprint[2]
+            else:
+                self._last_track_heading.pop(tid, None)
 
         # 第二阶段：与输入顺序无关地比对同帧区间与历史访客占用。
         for cell, entries in frame_intervals.items():

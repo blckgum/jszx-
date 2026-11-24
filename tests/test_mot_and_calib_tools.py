@@ -602,8 +602,8 @@ class TestInteractiveCalibratorExtensions(unittest.TestCase):
                 ["--output", str(out_yaml)],
                 # --chessboard-dir 与 --intrinsics-yaml 互斥
                 ["--source", str(road_img), "--chessboard-dir", str(root), "--intrinsics-yaml", str(out_yaml), "--output", str(out_yaml)],
-                # --ground-points 缺少 --points
-                ["--source", str(road_img), "--ground-points", "0,0,6,0,6,15,0,15", "--output", str(out_yaml)],
+                # --ground-points 少于 4 对坐标
+                ["--source", str(road_img), "--ground-points", "0,0,6,0,6,15", "--output", str(out_yaml)],
                 # --points 与 --ground-points 点数不一致
                 ["--source", str(road_img), "--points", "400,300,880,300,1150,680,130,680", "--ground-points", "0,0,6,0,6,15,0,15,3,7.5", "--output", str(out_yaml)],
                 # --parking-zone 少于 3 个顶点

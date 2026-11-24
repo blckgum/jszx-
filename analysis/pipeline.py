@@ -13,12 +13,13 @@ import csv
 import json
 import math
 import statistics
+import threading
 import time
 from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 import cv2
 import numpy as np
@@ -139,6 +140,14 @@ class LiveStreamClock:
         return ts, "wall_clock"
 
 
+def _safe_dropped_frames(cap_obj) -> int:
+    """安全读取抓帧器丢弃旧帧计数，防止 mock.Mock 属性在收尾阶段触发 TypeError。"""
+    if cap_obj is None:
+        return 0
+    raw = getattr(cap_obj, "dropped_frames", 0)
+    return raw if type(raw) is int and raw > 0 else 0
+
+
 class ConflictPerceptionPipeline:
     """冲突感知与预警全流程管道执行器"""
 
@@ -175,6 +184,8 @@ class ConflictPerceptionPipeline:
         conflict_model: str = "cvm_circle",
         enable_stitching: bool = False,
         include_cyclist_vru: bool = False,
+        compensate_anchor_bias: bool = False,
+        live_drop_stale_frames: bool = False,
         live_reconnect_attempts: int = 3,
         live_reconnect_delay_s: float = 1.0,
     ):
@@ -242,14 +253,19 @@ class ConflictPerceptionPipeline:
             raise ValueError("跟踪配置路径不能为空")
         if is_blank_path(object_policy_config):
             raise ValueError("对象策略配置路径不能为空")
-        if type(speed_model) is not str or speed_model not in ("ema", "kalman"):
-            raise ValueError("speed_model 必须是 'ema' 或 'kalman'")
+        if type(speed_model) is not str or speed_model not in ("ema", "kalman", "ctrv"):
+            raise ValueError("speed_model 必须是 'ema'、'kalman' 或 'ctrv'")
         if type(conflict_model) is not str or conflict_model not in ("cvm_circle", "obb_ssm"):
             raise ValueError("conflict_model 必须是 'cvm_circle' 或 'obb_ssm'")
         if type(enable_stitching) is not bool:
             raise ValueError("enable_stitching 必须是布尔值")
         if type(include_cyclist_vru) is not bool:
             raise ValueError("include_cyclist_vru 必须是布尔值")
+        # 严格用精确 type() 校验新增开关，避免 0/1 或字符串穿透布尔校验。
+        if type(compensate_anchor_bias) is not bool:
+            raise ValueError("compensate_anchor_bias 必须是布尔值")
+        if type(live_drop_stale_frames) is not bool:
+            raise ValueError("live_drop_stale_frames 必须是布尔值")
         if type(live_reconnect_attempts) is not int or live_reconnect_attempts < 0:
             raise ValueError("live_reconnect_attempts 必须是 >= 0 的整数")
         if (
@@ -282,6 +298,8 @@ class ConflictPerceptionPipeline:
         self.conflict_model = conflict_model
         self.enable_stitching = enable_stitching
         self.include_cyclist_vru = include_cyclist_vru
+        self.compensate_anchor_bias = compensate_anchor_bias
+        self.live_drop_stale_frames = live_drop_stale_frames
         self.live_reconnect_attempts = live_reconnect_attempts
         self.live_reconnect_delay_s = float(live_reconnect_delay_s)
         self.window_size = window_size
@@ -369,6 +387,8 @@ class ConflictPerceptionPipeline:
             "conflict_model": self.conflict_model,
             "enable_stitching": self.enable_stitching,
             "include_cyclist_vru": self.include_cyclist_vru,
+            "compensate_anchor_bias": self.compensate_anchor_bias,
+            "live_drop_stale_frames": self.live_drop_stale_frames,
             "live_reconnect_attempts": self.live_reconnect_attempts,
             "live_reconnect_delay_s": self.live_reconnect_delay_s,
             "ema_alpha": self.ema_alpha,
@@ -568,6 +588,7 @@ class ConflictPerceptionPipeline:
         drain_events_cb,
         frame=None,
         writer=None,
+        alert_callback: Optional[Callable[[dict], object]] = None,
     ):
         """执行单帧标定投影、速度估计、冲突预测、去抖落盘与可选视频渲染。"""
         valid_tracks = []
@@ -593,30 +614,69 @@ class ConflictPerceptionPipeline:
 
         id_map: Dict[int, int] = {}
         if self.enable_stitching and self.stitcher is not None:
-            observations = [
-                (t.track_id, t.category, t.class_name, x_m, y_m)
-                for t, _, _, x_m, y_m in valid_tracks
-            ]
+            # 局部安全探测外观直方图提取器：有画面帧时抽取 HSV 特征传入 6 元组，离线无图时传 None。
+            from . import stitching as _stitching_mod
+
+            hist_fn = (
+                getattr(_stitching_mod, "extract_appearance_histogram", None)
+                if frame is not None
+                else None
+            )
+            observations = []
+            for t, _, _, x_m, y_m in valid_tracks:
+                bbox = getattr(t, "bbox_xyxy", None)
+                app_hist = (
+                    hist_fn(frame, bbox)
+                    if callable(hist_fn) and bbox is not None
+                    else None
+                )
+                observations.append((t.track_id, t.category, t.class_name, x_m, y_m, app_hist))
             id_map, _ = self.stitcher.resolve_frame(observations, timestamp_s)
 
         speed_readings: List[SpeedReading] = []
         reading_map: Dict[int, SpeedReading] = {}
         cov_fn = (
             getattr(self.calibrator, "ground_covariance_from_pixel", None)
-            if self.speed_model == "kalman"
+            if self.speed_model in ("kalman", "ctrv")
+            else None
+        )
+        comp_fn = (
+            getattr(self.calibrator, "compensate_vehicle_anchor", None)
+            if self.compensate_anchor_bias
             else None
         )
 
         for t, u_foot, v_foot, x_m, y_m in valid_tracks:
             eff_id = id_map.get(t.track_id, t.track_id) if self.enable_stitching else t.track_id
-            if self.speed_model == "kalman" and callable(cov_fn):
+            x_meas, y_meas = x_m, y_m
+            # 开启 2D 锚点偏置补偿时，沿视线方向把车辆底边接触点推进至车体几何中心再送入测速滤波器。
+            if callable(comp_fn) and t.category == "vehicle":
+                pol = object_policy(t.class_name, t.category, self.object_policies)
+                if pol.kind != "pedestrian":
+                    heading_hint = None
+                    prev_tracker = self.speed_estimator.tracks.get(eff_id)
+                    if prev_tracker is not None and prev_tracker.has_valid_velocity:
+                        vx_prev, vy_prev = prev_tracker.smoothed_vx, prev_tracker.smoothed_vy
+                        if (
+                            math.isfinite(vx_prev)
+                            and math.isfinite(vy_prev)
+                            and math.hypot(vx_prev, vy_prev) > 0.3
+                        ):
+                            heading_hint = (math.degrees(math.atan2(vy_prev, vx_prev)) + 360.0) % 360.0
+                    x_comp, y_comp = comp_fn(
+                        x_m, y_m, pol.length_m, pol.width_m, heading_deg=heading_hint
+                    )
+                    if math.isfinite(x_comp) and math.isfinite(y_comp):
+                        x_meas, y_meas = float(x_comp), float(y_comp)
+
+            if self.speed_model in ("kalman", "ctrv") and callable(cov_fn):
                 obs_cov_m2 = cov_fn(u_foot, v_foot)
                 reading = self.speed_estimator.update(
                     track_id=eff_id,
                     category=t.category,
                     timestamp_s=timestamp_s,
-                    x_m=x_m,
-                    y_m=y_m,
+                    x_m=x_meas,
+                    y_m=y_meas,
                     object_kind=t.class_name,
                     obs_cov_m2=obs_cov_m2,
                 )
@@ -625,8 +685,8 @@ class ConflictPerceptionPipeline:
                     track_id=eff_id,
                     category=t.category,
                     timestamp_s=timestamp_s,
-                    x_m=x_m,
-                    y_m=y_m,
+                    x_m=x_meas,
+                    y_m=y_meas,
                     object_kind=t.class_name,
                 )
             reading.in_parking_zone = self.calibrator.is_in_parking_zone(reading.x_m, reading.y_m)
@@ -655,6 +715,19 @@ class ConflictPerceptionPipeline:
         # 事件去抖状态机推进后立刻弹出已冷却归档的事件写入 events.jsonl。
         event_ids = self.event_tracker.update(conflicts, frame_idx, timestamp_s)
         drain_events_cb()
+
+        # 若注册了双端告警回调且当前帧存在有效预警，按驾驶员端与路旁行人端结构化分发。
+        if alert_callback is not None and any(
+            c.risk_level > RiskLevel.LEVEL_0_SAFE for c in conflicts
+        ):
+            from .service import format_dual_end_alerts
+
+            alert_payload = format_dual_end_alerts(
+                conflicts, event_ids=event_ids, timestamp_s=timestamp_s
+            )
+            if alert_payload["alert_count"] > 0:
+                alert_payload["frame_index"] = frame_idx
+                alert_callback(alert_payload)
 
         # conflicts.jsonl 保存逐帧原始评估（confirmed 帧回填 event_id，未确认瞬时帧为 null）。
         for c in conflicts:
@@ -808,10 +881,17 @@ class ConflictPerceptionPipeline:
         output_dir: str | Path,
         show_window: bool = False,
         max_frames: Optional[int] = None,
+        frame_callback: Optional[Callable[[int, float, Optional[np.ndarray]], object]] = None,
+        alert_callback: Optional[Callable[[dict], object]] = None,
+        stop_event: Optional[threading.Event] = None,
     ) -> dict:
         """端到端处理本地视频、USB 摄像头或 RTSP/HTTP 实时流，输出渲染视频与告警日志"""
         if max_frames is not None and (type(max_frames) is not int or max_frames < 0):
             raise ValueError("max_frames 必须是 >= 0 的整数")
+        if frame_callback is not None and not callable(frame_callback):
+            raise ValueError("frame_callback 必须是可调用对象")
+        if alert_callback is not None and not callable(alert_callback):
+            raise ValueError("alert_callback 必须是可调用对象")
         # 拒绝空白输出目录（含 Path("   ")），防止 Path("") 解析为当前工作目录 '.' 并污染工作区。
         if is_blank_path(output_dir):
             raise ValueError("输出目录不能为空")
@@ -963,6 +1043,7 @@ class ConflictPerceptionPipeline:
 
         frame_idx = 0
         live_reconnect_count = 0
+        live_dropped_frames = 0
         t_start = time.perf_counter()
         src_display = src_label if is_live_stream else Path(src_label).name
 
@@ -978,7 +1059,18 @@ class ConflictPerceptionPipeline:
         main_loop_failed = False
         close_exc: Optional[BaseException] = None
         try:
+            # 实时流开启丢旧帧开关且需要实际取帧时，包装 LatestFrameCapture 并交由 ExitStack 统一释放。
+            if is_live_stream and self.live_drop_stale_frames and (max_frames is None or max_frames > 0):
+                from .service import LatestFrameCapture
+
+                if not isinstance(cap, LatestFrameCapture):
+                    cap = LatestFrameCapture(cap)
+                    cap_holder[0] = cap
+
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    loop_state = "stopped"
+                    break
                 if max_frames is not None and frame_idx >= max_frames:
                     loop_state = "max_frames"
                     break
@@ -987,11 +1079,16 @@ class ConflictPerceptionPipeline:
                 if not ok or frame is None:
                     # 仅实时流在断流后触发有界重连；本地视频文件遇 EOF 或坏帧直接结束。
                     if is_live_stream and self.live_reconnect_attempts > 0:
+                        live_dropped_frames += _safe_dropped_frames(cap_holder[0])
                         reconnected, frame_re = self._reconnect_live_capture(
                             cap_holder, capture_arg, src_label, width, height
                         )
                         if not reconnected or frame_re is None:
                             break
+                        if self.live_drop_stale_frames:
+                            from .service import LatestFrameCapture
+
+                            cap_holder[0] = LatestFrameCapture(cap_holder[0])
                         cap = cap_holder[0]
                         frame = frame_re
                         live_reconnect_count += 1
@@ -1025,9 +1122,17 @@ class ConflictPerceptionPipeline:
                     drain_events_cb=_drain_alert_events,
                     frame=frame,
                     writer=writer,
+                    alert_callback=alert_callback,
                 )
                 if frame_max_speed > max_observed_speed_kmh:
                     max_observed_speed_kmh = frame_max_speed
+
+                if frame_callback is not None:
+                    keep_going = frame_callback(frame_idx, timestamp_s, render_frame)
+                    if keep_going is False:
+                        frame_idx += 1
+                        loop_state = "stopped"
+                        break
 
                 frame_idx += 1
 
@@ -1060,6 +1165,7 @@ class ConflictPerceptionPipeline:
                 _drain_alert_events()
             except Exception:
                 pass
+            live_dropped_frames += _safe_dropped_frames(cap_holder[0])
             try:
                 resources.close()
             except BaseException as exc:
@@ -1087,6 +1193,7 @@ class ConflictPerceptionPipeline:
                         "elapsed_seconds": round(max(0.0, time.perf_counter() - t_start), 2),
                         "max_observed_speed_kmh": round(max_observed_speed_kmh, 1),
                         "live_reconnect_count": live_reconnect_count,
+                        "live_dropped_frames": live_dropped_frames,
                     })
                 except Exception:
                     pass
@@ -1127,6 +1234,7 @@ class ConflictPerceptionPipeline:
                 self.stitcher.stitched_track_count if self.stitcher is not None else 0
             ),
             "live_reconnect_count": live_reconnect_count,
+            "live_dropped_frames": live_dropped_frames,
         }
 
         self._write_summary_file(out_dir, summary)
@@ -1148,10 +1256,17 @@ class ConflictPerceptionPipeline:
         video_path: Optional[str | Path] = None,
         show_window: bool = False,
         max_frames: Optional[int] = None,
+        frame_callback: Optional[Callable[[int, float, Optional[np.ndarray]], object]] = None,
+        alert_callback: Optional[Callable[[dict], object]] = None,
+        stop_event: Optional[threading.Event] = None,
     ) -> dict:
         """从已有 tracks.jsonl 离线复盘测速、TTC 与事件去抖（无需重跑检测与跟踪）。"""
         if max_frames is not None and (type(max_frames) is not int or max_frames < 0):
             raise ValueError("max_frames 必须是 >= 0 的整数")
+        if frame_callback is not None and not callable(frame_callback):
+            raise ValueError("frame_callback 必须是可调用对象")
+        if alert_callback is not None and not callable(alert_callback):
+            raise ValueError("alert_callback 必须是可调用对象")
         # 拒绝空白输出目录（含 Path("   ")），防止 Path("") 解析为当前工作目录 '.' 并污染工作区。
         if is_blank_path(output_dir):
             raise ValueError("输出目录不能为空")
@@ -1304,6 +1419,9 @@ class ConflictPerceptionPipeline:
         close_exc: Optional[BaseException] = None
         try:
             for row in raw_frames:
+                if stop_event is not None and stop_event.is_set():
+                    loop_state = "stopped"
+                    break
                 if max_frames is not None and frames_processed >= max_frames:
                     loop_state = "max_frames"
                     break
@@ -1361,11 +1479,18 @@ class ConflictPerceptionPipeline:
                     drain_events_cb=_drain_alert_events,
                     frame=frame,
                     writer=writer,
+                    alert_callback=alert_callback,
                 )
                 if frame_max_speed > max_observed_speed_kmh:
                     max_observed_speed_kmh = frame_max_speed
 
                 frames_processed += 1
+
+                if frame_callback is not None:
+                    keep_going = frame_callback(frame_idx, timestamp_s, render_frame)
+                    if keep_going is False:
+                        loop_state = "stopped"
+                        break
 
                 if show_window and render_frame is not None:
                     cv2.imshow("Campus Vehicle-Pedestrian Conflict System", render_frame)

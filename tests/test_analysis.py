@@ -1161,11 +1161,18 @@ class TestPipelineIO(unittest.TestCase):
             calib = RoadCalibrator(
                 [(10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0)], 4.0, 4.0
             )
+            # 隔离 TrackingSession 避免冷跑环境下因缺少 yolov8n.pt 触网下载模型
             pipeline = ConflictPerceptionPipeline(calibrator=calib)
-            with mock.patch("analysis.pipeline.cv2.VideoWriter") as m_writer:
+            with mock.patch("analysis.pipeline.TrackingSession") as m_session, \
+                 mock.patch("analysis.pipeline.cv2.VideoWriter") as m_writer:
                 m_writer.return_value.isOpened.return_value = False
-                with self.assertRaises(RuntimeError):
+                with self.assertRaisesRegex(RuntimeError, "无法创建渲染输出视频"):
                     pipeline.process_video(vpath, Path(d) / "out")
+            m_session.assert_called_once()
+            m_writer.return_value.release.assert_called_once()
+            summary = json.loads((Path(d) / "out" / "summary.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["stop_reason"], "initialization")
 
     def test_cli_rejects_invalid_numeric_args(self):
         from analysis.__main__ import main

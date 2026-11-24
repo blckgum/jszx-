@@ -25,9 +25,11 @@ import yaml
 from detection.core import IMAGE_SUFFIXES, is_blank_path
 from .calibration import (
     RoadCalibrator,
+    _compute_ground_bounds,
     _validate_camera_matrix,
     _validate_dist_coeffs,
     _validate_finite_float,
+    _validate_point_2d,
 )
 
 
@@ -189,6 +191,172 @@ def load_intrinsics_yaml(
     return cam_list, dist_list
 
 
+def _collect_points_via_gui(
+    image: np.ndarray,
+    *,
+    width_m: float,
+    length_m: float,
+    ground_points: Optional[List[Tuple[float, float]]] = None,
+) -> Tuple[List[Tuple[float, float]], List[List[Tuple[float, float]]]]:
+    """打开 OpenCV 交互窗口采集地面标定点与可选路侧停车区多边形。"""
+    expected_count = len(ground_points) if ground_points is not None else 4
+    points: List[Tuple[float, float]] = []
+    gui_parking_zones: List[List[Tuple[float, float]]] = []
+    current_parking_pts: List[Tuple[float, float]] = []
+    state = {"mode": "ground"}  # "ground" 为地面对应点模式，"parking" 为停车区多边形模式
+    window_name = (
+        f"Campus Road Calibrator (Click {expected_count} ground points | 'P': Parking Mode)"
+        if ground_points is not None
+        else "Campus Road Calibrator (Click 4 ground corners: TL -> TR -> BR -> BL)"
+    )
+
+    def on_mouse(event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        if state["mode"] == "parking":
+            current_parking_pts.append((float(x), float(y)))
+            print(f"[*] 停车区 #{len(gui_parking_zones) + 1} 添加顶点 {len(current_parking_pts)}: 像素坐标 ({x}, {y})")
+        elif len(points) < expected_count:
+            points.append((float(x), float(y)))
+            print(f"[*] 选取第 {len(points)}/{expected_count} 个角点: 像素坐标 ({x}, {y})")
+
+    print("=" * 60)
+    print("[*] 交互式空间标定窗口已打开:")
+    if ground_points is not None:
+        print(f"    当前为多点对应标定模式：请按 --ground-points 顺序点击 {expected_count} 个地面对应点。")
+    else:
+        print("    请用鼠标左键按顺时针依次点击道路地面的 4 个角点:")
+        print("    [1] 左上角 -> [2] 右上角 -> [3] 右下角 -> [4] 左下角")
+    print("    按键说明: 'P' 切换停车区多边形模式, 'N' 闭合当前停车区, 'R' 重置当前点集, 'Enter'/'Space' 确认, 'Q' 取消。")
+    print("=" * 60)
+
+    # 将窗口创建、鼠标回调绑定与主刷新循环整体放入 try...finally：
+    # 无论用户按 Q/Esc、点击窗口右上角关闭按钮还是途中出错，都确保销毁 GUI 窗口不挂起进程。
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(window_name, on_mouse)
+        while True:
+            display = image.copy()
+            for idx, pt in enumerate(points):
+                px, py = int(pt[0]), int(pt[1])
+                cv2.circle(display, (px, py), 6, (0, 0, 255), -1)
+                cv2.putText(
+                    display,
+                    f"P{idx + 1}",
+                    (px + 8, py - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+
+            if len(points) >= 2:
+                pts_arr = np.array(points, dtype=np.int32)
+                is_closed_ground = ground_points is None and len(points) == 4
+                cv2.polylines(display, [pts_arr], isClosed=is_closed_ground, color=(0, 255, 0), thickness=2)
+
+            # 绘制已闭合的停车区及当前正在点选的停车区多边形草稿。
+            for z_idx, zone_pts in enumerate(gui_parking_zones):
+                z_arr = np.array(zone_pts, dtype=np.int32)
+                cv2.polylines(display, [z_arr], isClosed=True, color=(200, 180, 60), thickness=2)
+                zx, zy = int(zone_pts[0][0]), int(zone_pts[0][1])
+                cv2.putText(
+                    display,
+                    f"PARK#{z_idx + 1}",
+                    (zx + 4, max(16, zy - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (200, 180, 60),
+                    1,
+                )
+            for idx, pt in enumerate(current_parking_pts):
+                px, py = int(pt[0]), int(pt[1])
+                cv2.circle(display, (px, py), 5, (255, 160, 0), -1)
+                cv2.putText(
+                    display,
+                    f"Z{idx + 1}",
+                    (px + 6, py - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 200, 80),
+                    1,
+                )
+            if len(current_parking_pts) >= 2:
+                cur_arr = np.array(current_parking_pts, dtype=np.int32)
+                cv2.polylines(display, [cur_arr], isClosed=False, color=(255, 160, 0), thickness=2)
+
+            if state["mode"] == "parking":
+                status_text = (
+                    f"MODE: PARKING | Zone #{len(gui_parking_zones) + 1} pts: {len(current_parking_pts)} | "
+                    f"Ground: {len(points)}/{expected_count}"
+                )
+            elif ground_points is not None:
+                if len(points) < expected_count:
+                    gx_hint, gy_hint = ground_points[len(points)]
+                    hint = f"Next P{len(points) + 1}: ({gx_hint:.1f}, {gy_hint:.1f})m"
+                else:
+                    hint = "Ready (Enter/Space to confirm)"
+                status_text = f"Selected: {len(points)}/{expected_count} | {hint}"
+            else:
+                status_text = f"Selected: {len(points)}/4 | Width: {width_m}m Length: {length_m}m"
+
+            cv2.putText(
+                display,
+                status_text,
+                (16, 32),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (255, 255, 255),
+                2,
+            )
+            cv2.putText(
+                display,
+                f"Zones:{len(gui_parking_zones)} | 'P':Parking 'N':Close 'R':Reset Enter:Save 'Q':Quit",
+                (16, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (220, 220, 220),
+                1,
+            )
+
+            cv2.imshow(window_name, display)
+            key = cv2.waitKey(20) & 0xFF
+            # 用户点击窗口右上角关闭按钮不会向 waitKey 发送按键，需同时轮询 WND_PROP_VISIBLE < 1。
+            if (
+                key in (27, ord("q"), ord("Q"))
+                or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1
+            ):
+                raise KeyboardInterrupt("用户取消了交互式标定")
+            elif key in (ord("p"), ord("P")):
+                state["mode"] = "parking" if state["mode"] == "ground" else "ground"
+                mode_label = "停车区多边形点选模式" if state["mode"] == "parking" else "地面标定点点选模式"
+                print(f"[*] 已切换至 {mode_label}。")
+            elif key in (ord("n"), ord("N")):
+                if state["mode"] == "parking":
+                    if len(current_parking_pts) >= 3:
+                        gui_parking_zones.append(list(current_parking_pts))
+                        current_parking_pts.clear()
+                        print(f"[*] 已闭合第 {len(gui_parking_zones)} 个停车区（确认保存时自动映射登记）。")
+                    else:
+                        print("[!] 停车区至少需要 3 个顶点才能闭合。")
+            elif key in (ord("r"), ord("R")):
+                if state["mode"] == "parking":
+                    current_parking_pts.clear()
+                    print("[*] 已重置当前停车区顶点集。")
+                else:
+                    points.clear()
+                    print(f"[*] 已重置地面标定点，请重新选取 {expected_count} 个角点。")
+            elif key in (13, 32) and len(points) == expected_count:
+                if current_parking_pts:
+                    print("[!] 尚有未闭合的停车区顶点：请先按 'N' 闭合或按 'R' 重置后再按 Enter 确认。")
+                    continue
+                break
+    finally:
+        cv2.destroyAllWindows()
+
+    return points, gui_parking_zones
+
+
 def run_interactive_calibration(
     source_path: str | Path,
     width_m: float = 6.0,
@@ -204,7 +372,7 @@ def run_interactive_calibration(
     camera_matrix: Optional[List[List[float]]] = None,
     dist_coeffs: Optional[List[float]] = None,
 ) -> RoadCalibrator:
-    """执行交互式或参数化地面空间标定流程（兼容 4 点矩形与 N>=4 对应点 RANSAC）。"""
+    """执行交互式或参数化地面空间标定流程（兼容 4 点矩形、N>=4 多点对应与 GUI 停车区框选）。"""
     if (
         type(width_m) not in (int, float)
         or type(length_m) not in (int, float)
@@ -223,6 +391,16 @@ def run_interactive_calibration(
     if type(use_ransac) is not bool:
         raise ValueError("use_ransac 必须是布尔值")
 
+    parsed_ground_points: Optional[List[Tuple[float, float]]] = None
+    if ground_points is not None:
+        if not isinstance(ground_points, (list, tuple, np.ndarray)) or len(ground_points) < 4:
+            raise ValueError("ground_points 至少需要提供 4 对有限二维坐标")
+        parsed_ground_points = [
+            _validate_point_2d(pt, f"第 {idx + 1} 个地面对应点")
+            for idx, pt in enumerate(ground_points)
+        ]
+        _compute_ground_bounds(parsed_ground_points, label="ground_points")
+
     src = Path(source_path).expanduser().resolve()
     if not src.is_file():
         raise FileNotFoundError(f"未找到标定底图或视频文件: {src}")
@@ -239,17 +417,28 @@ def run_interactive_calibration(
         if not ok or image is None:
             raise RuntimeError(f"无法从视频中解码读取首帧用于标定: {src}")
 
-    if ground_points is not None:
-        if predefined_points is None:
-            raise ValueError("提供 ground_points 时必须同时提供 predefined_points")
-        if len(predefined_points) < 4:
-            raise ValueError(f"多点对应标定至少需要 4 个角点，当前提供了 {len(predefined_points)} 个")
-        if len(predefined_points) != len(ground_points):
-            raise ValueError("predefined_points 与 ground_points 数量必须一致")
-        points = list(predefined_points)
+    gui_parking_zones: List[List[Tuple[float, float]]] = []
+    if parsed_ground_points is not None:
+        if predefined_points is not None:
+            if len(predefined_points) < 4:
+                raise ValueError(f"多点对应标定至少需要 4 个角点，当前提供了 {len(predefined_points)} 个")
+            if len(predefined_points) != len(parsed_ground_points):
+                raise ValueError("predefined_points 与 ground_points 数量必须一致")
+            points = list(predefined_points)
+        else:
+            # 未提供 predefined_points 时打开 GUI，按 ground_points 数量交互式采集图像像素角点与停车区。
+            points, gui_parking_zones = _collect_points_via_gui(
+                image,
+                width_m=width_m,
+                length_m=length_m,
+                ground_points=parsed_ground_points,
+            )
+            if len(points) != len(parsed_ground_points):
+                raise ValueError(f"标定未完成，必须准确选取 {len(parsed_ground_points)} 个地面对应点")
+
         calibrator = RoadCalibrator.from_correspondences(
             image_points=points,
-            ground_points=list(ground_points),
+            ground_points=parsed_ground_points,
             name=src.stem,
             use_ransac=use_ransac,
             ransac_reproj_threshold_m=ransac_reproj_threshold_m,
@@ -263,71 +452,12 @@ def run_interactive_calibration(
             points = list(predefined_points)
             print(f"[*] 使用预设参数标定 4 点: {points}")
         else:
-            # 交互式窗口标定
-            points = []
-            window_name = "Campus Road Calibrator (Click 4 ground corners: TL -> TR -> BR -> BL)"
-
-            def on_mouse(event, x, y, flags, param):
-                if event == cv2.EVENT_LBUTTONDOWN and len(points) < 4:
-                    points.append((float(x), float(y)))
-                    print(f"[*] 选取第 {len(points)}/4 个角点: 像素坐标 ({x}, {y})")
-
-            print("=" * 60)
-            print("[*] 交互式空间标定窗口已打开:")
-            print("    请用鼠标左键按顺时针依次点击道路地面的 4 个角点:")
-            print("    [1] 左上角 -> [2] 右上角 -> [3] 右下角 -> [4] 左下角")
-            print("    按键盘 'R' 重置选点，点满 4 点后按 'Enter' 或 'Space' 保存退出，'Q' 取消。")
-            print("=" * 60)
-
-            # 将窗口创建、鼠标回调绑定与主刷新循环整体放入 try...finally：
-            # 无论用户按 Q/Esc、点击窗口右上角关闭按钮还是途中出错，都确保销毁 GUI 窗口不挂起进程。
-            try:
-                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-                cv2.setMouseCallback(window_name, on_mouse)
-                while True:
-                    display = image.copy()
-                    for idx, pt in enumerate(points):
-                        px, py = int(pt[0]), int(pt[1])
-                        cv2.circle(display, (px, py), 6, (0, 0, 255), -1)
-                        cv2.putText(
-                            display,
-                            f"P{idx+1}",
-                            (px + 8, py - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 255, 255),
-                            2,
-                        )
-
-                    if len(points) >= 2:
-                        pts_arr = np.array(points, dtype=np.int32)
-                        cv2.polylines(display, [pts_arr], isClosed=(len(points) == 4), color=(0, 255, 0), thickness=2)
-
-                    cv2.putText(
-                        display,
-                        f"Selected: {len(points)}/4 | Width: {width_m}m Length: {length_m}m",
-                        (16, 32),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (255, 255, 255),
-                        2,
-                    )
-
-                    cv2.imshow(window_name, display)
-                    key = cv2.waitKey(20) & 0xFF
-                    # 用户点击窗口右上角关闭按钮不会向 waitKey 发送按键，需同时轮询 WND_PROP_VISIBLE < 1。
-                    if (
-                        key in (27, ord("q"), ord("Q"))
-                        or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1
-                    ):
-                        raise KeyboardInterrupt("用户取消了交互式标定")
-                    elif key in (ord("r"), ord("R")):
-                        points.clear()
-                        print("[*] 已重置标定点，请重新选取 4 个角点。")
-                    elif (key == 13 or key == 32) and len(points) == 4:
-                        break
-            finally:
-                cv2.destroyAllWindows()
+            points, gui_parking_zones = _collect_points_via_gui(
+                image,
+                width_m=width_m,
+                length_m=length_m,
+                ground_points=None,
+            )
 
         if len(points) != 4:
             raise ValueError("标定未完成，必须准确选取 4 个地面角点")
@@ -341,9 +471,9 @@ def run_interactive_calibration(
             dist_coeffs=dist_coeffs,
         )
 
-    if parking_zones:
-        for poly in parking_zones:
-            calibrator.add_parking_zone_pixels(poly)
+    all_parking_zones = list(parking_zones or []) + gui_parking_zones
+    for poly in all_parking_zones:
+        calibrator.add_parking_zone_pixels(poly)
 
     if save_output:
         saved_yaml = calibrator.to_yaml(output_path)
@@ -388,7 +518,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--ground-points",
         type=str,
         default=None,
-        help="可选与 --points 一一对应的地面米制坐标序列: x1,y1,x2,y2,... (>=4 对)",
+        help="可选地面米制对应坐标序列: x1,y1,x2,y2,... (>=4 对)；省略 --points 时进入交互式多点点击模式",
     )
     parser.add_argument(
         "--no-ransac",
@@ -495,18 +625,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     ):
         parser.error("仅传 --chessboard-dir 进行内参标定时不能使用地面标点、停车区或检查点参数")
 
-    if args.ground_points is not None and args.points is None:
-        parser.error("--ground-points 必须与 --points 一起提供")
-
     pts = None
     ground_pts = None
     if args.ground_points is not None:
         try:
-            pts = _parse_coord_pairs(args.points, "--points", min_pairs=4)
             ground_pts = _parse_coord_pairs(args.ground_points, "--ground-points", min_pairs=4)
+            if args.points is not None:
+                pts = _parse_coord_pairs(args.points, "--points", min_pairs=4)
         except ValueError as exc:
             parser.error(str(exc))
-        if len(pts) != len(ground_pts):
+        if pts is not None and len(pts) != len(ground_pts):
             parser.error("--points 与 --ground-points 点数必须一致")
     elif args.points is not None:
         try:

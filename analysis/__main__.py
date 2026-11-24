@@ -197,9 +197,9 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--speed-model",
         type=str,
-        choices=("ema", "kalman"),
+        choices=("ema", "kalman", "ctrv"),
         default="ema",
-        help="物理测速模型：ema (滑窗差分+EMA，默认) 或 kalman (二维匀加速卡尔曼+雅可比协方差)",
+        help="物理测速模型：ema (滑窗差分+EMA，默认)、kalman (二维匀加速卡尔曼+雅可比协方差) 或 ctrv (恒定转弯速率与速度 EKF)",
     )
     parser.add_argument(
         "--conflict-model",
@@ -217,6 +217,16 @@ def main(argv: list[str] | None = None):
         "--include-cyclist-vru",
         action="store_true",
         help="将自行车与摩托车骑行者纳入弱势交通参与者 (VRU) 冲突研判",
+    )
+    parser.add_argument(
+        "--compensate-anchor-bias",
+        action="store_true",
+        help="开启车辆 2D 底边锚点到几何中心的一阶视线偏置补偿",
+    )
+    parser.add_argument(
+        "--live-drop-stale-frames",
+        action="store_true",
+        help="实时流模式下使用后台线程持续抓帧并丢弃积压旧帧，保持低延迟",
     )
     parser.add_argument(
         "--live-reconnect-attempts",
@@ -401,6 +411,8 @@ def main(argv: list[str] | None = None):
         conflict_model=args.conflict_model,
         enable_stitching=args.enable_stitching,
         include_cyclist_vru=args.include_cyclist_vru,
+        compensate_anchor_bias=args.compensate_anchor_bias,
+        live_drop_stale_frames=args.live_drop_stale_frames,
         live_reconnect_attempts=args.live_reconnect_attempts,
         live_reconnect_delay_s=args.live_reconnect_delay,
     )

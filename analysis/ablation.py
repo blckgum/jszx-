@@ -364,6 +364,95 @@ def _compare_tracklet_stitching() -> dict:
     }
 
 
+def run_turn_speed_ablation(
+    speeds_kmh: tuple[float, ...] = (21.6, 32.4),
+    turn_rates_rad_s: tuple[float, ...] = (0.25, 0.45),
+    fps: float = 25.0,
+    frames: int = 80,
+    warmup_frames: int = 15,
+    pos_noise_std_m: float = 0.08,
+) -> list[dict]:
+    """在弯道圆弧轨迹上对比 EMA、Kalman(CA) 与 CTRV 的速度及航向收敛误差。"""
+    if type(fps) is bool or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
+        raise ValueError("fps 必须为有限正数")
+    if type(frames) is not int or frames < 10:
+        raise ValueError("frames 必须是 >= 10 的整数")
+    if type(warmup_frames) is not int or warmup_frames < 0:
+        raise ValueError("warmup_frames 必须是非负整数")
+    if (
+        type(pos_noise_std_m) is bool
+        or not isinstance(pos_noise_std_m, (int, float))
+        or not math.isfinite(pos_noise_std_m)
+        or pos_noise_std_m < 0
+    ):
+        raise ValueError("pos_noise_std_m 必须为有限非负数")
+
+    dt = 1.0 / float(fps)
+    eff_warmup = min(warmup_frames, max(4, frames // 3))
+    rows: list[dict] = []
+
+    for speed_kmh in speeds_kmh:
+        if type(speed_kmh) is bool or not isinstance(speed_kmh, (int, float)) or not math.isfinite(speed_kmh) or speed_kmh <= 0:
+            raise ValueError("speeds_kmh 必须全为有限正数")
+        v_ms = float(speed_kmh) / 3.6
+        for turn_rate in turn_rates_rad_s:
+            if type(turn_rate) is bool or not isinstance(turn_rate, (int, float)) or not math.isfinite(turn_rate):
+                raise ValueError("turn_rates_rad_s 必须全为有限数值")
+            w_rad = float(turn_rate)
+            # 对固定速度与转向角速度生成可复现的带噪圆弧地面观测序列
+            rng = np.random.default_rng(123)
+            x_t, y_t, psi_t = 3.0, 2.0, math.pi / 4.0
+            obs_seq: list[tuple[float, float, float]] = []
+            true_psi: list[float] = []
+            for idx in range(frames):
+                if idx > 0:
+                    if abs(w_rad) < 1e-6:
+                        x_t += v_ms * dt * math.cos(psi_t)
+                        y_t += v_ms * dt * math.sin(psi_t)
+                        psi_t = math.atan2(math.sin(psi_t + w_rad * dt), math.cos(psi_t + w_rad * dt))
+                    else:
+                        psi_next = psi_t + w_rad * dt
+                        x_t += (v_ms / w_rad) * (math.sin(psi_next) - math.sin(psi_t))
+                        y_t += (v_ms / w_rad) * (-math.cos(psi_next) + math.cos(psi_t))
+                        psi_t = math.atan2(math.sin(psi_next), math.cos(psi_next))
+                nx = x_t + (float(rng.normal(0.0, pos_noise_std_m)) if pos_noise_std_m > 0 else 0.0)
+                ny = y_t + (float(rng.normal(0.0, pos_noise_std_m)) if pos_noise_std_m > 0 else 0.0)
+                obs_seq.append((idx * dt, nx, ny))
+                true_psi.append(psi_t)
+
+            obs_cov = (max(pos_noise_std_m, 1e-2) ** 2) * np.eye(2, dtype=np.float64)
+            for mode in ("ema", "kalman", "ctrv"):
+                estimator = SpeedEstimator(estimator_mode=mode)
+                spd_errs: list[float] = []
+                hdg_errs: list[float] = []
+                for idx, (t_s, gx, gy) in enumerate(obs_seq):
+                    reading = estimator.update(
+                        1,
+                        "vehicle",
+                        t_s,
+                        gx,
+                        gy,
+                        object_kind="car",
+                        obs_cov_m2=obs_cov if mode != "ema" else None,
+                    )
+                    if idx >= eff_warmup:
+                        spd_errs.append(abs(float(reading.speed_kmh) - float(speed_kmh)))
+                        dpsi = math.radians(float(reading.heading_deg)) - true_psi[idx]
+                        wrapped = math.atan2(math.sin(dpsi), math.cos(dpsi))
+                        hdg_errs.append(abs(math.degrees(wrapped)))
+
+                rows.append({
+                    "estimator_mode": mode,
+                    "target_speed_kmh": round(float(speed_kmh), 6),
+                    "turn_rate_rad_s": round(w_rad, 6),
+                    "mean_abs_error_kmh": round(float(sum(spd_errs) / len(spd_errs)), 6),
+                    "max_abs_error_kmh": round(float(max(spd_errs)), 6),
+                    "mean_heading_error_deg": round(float(sum(hdg_errs) / len(hdg_errs)), 6),
+                    "max_heading_error_deg": round(float(max(hdg_errs)), 6),
+                })
+    return rows
+
+
 def run_algorithm_comparison() -> dict:
     """运行 EMA vs Kalman、CVM vs OBB-SSM、未缝合 vs TrackletStitcher 综合对比实验。"""
     return {
@@ -380,7 +469,13 @@ def run_default_ablation() -> dict:
         "speed": run_speed_ablation(),
         "conflict": run_conflict_ablation(),
         "algorithm_comparison": run_algorithm_comparison(),
+        "turn_speed_ablation": run_turn_speed_ablation(),
     }
+
+
+def run_all_ablations() -> dict:
+    """运行全套消融实验（含基础测速、冲突、算法对比及弯道 CTRV 消融）。"""
+    return run_default_ablation()
 
 
 def main(argv: list[str] | None = None) -> int:

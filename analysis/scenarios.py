@@ -26,6 +26,7 @@ def _reading(
     heading_deg: float = 0.0,
     ax_ms2: float = 0.0,
     ay_ms2: float = 0.0,
+    yaw_rate_rad_s: float = 0.0,
 ):
     # 构造确定性物理读数供回归场景使用，绕过图像检测与单应性变换噪声。
     speed_ms = (vx * vx + vy * vy) ** 0.5
@@ -46,6 +47,7 @@ def _reading(
         is_stationary=stationary,
         ax_ms2=ax_ms2,
         ay_ms2=ay_ms2,
+        yaw_rate_rad_s=yaw_rate_rad_s,
     )
 
 
@@ -148,6 +150,38 @@ def obb_ssm_scenarios() -> tuple[SyntheticScenario, ...]:
     )
 
 
+def ctrv_turn_scenarios() -> tuple[SyntheticScenario, ...]:
+    """面向弯道转向 CTRV 向心加速度外推与 OBB-SSM 冲突检测的回归场景。"""
+    return (
+        SyntheticScenario(
+            "ctrv_left_turn_conflict_critical",
+            "左转弯道向心加速度扫掠冲突：直行不碰撞，左转向内侧扫掠进入行人位置触发紧急预警",
+            (
+                _reading(
+                    1, "vehicle", 3.0, 2.0, 0.0, 6.0,
+                    object_kind="car", heading_deg=90.0,
+                    ax_ms2=-3.0, ay_ms2=0.0, yaw_rate_rad_s=0.5,
+                ),
+                _reading(2, "pedestrian", 0.8, 9.2, 0.0, 0.0, object_kind="pedestrian"),
+            ),
+            (RiskLevel.LEVEL_3_CRITICAL.name,),
+        ),
+        SyntheticScenario(
+            "ctrv_right_turn_clear_safe",
+            "右转远离路侧行人：向心加速度向相反方向偏转，不产生误报冲突",
+            (
+                _reading(
+                    1, "vehicle", 3.0, 2.0, 0.0, 6.0,
+                    object_kind="car", heading_deg=90.0,
+                    ax_ms2=3.0, ay_ms2=0.0, yaw_rate_rad_s=-0.5,
+                ),
+                _reading(2, "pedestrian", 0.8, 9.2, 0.0, 0.0, object_kind="pedestrian"),
+            ),
+            (RiskLevel.LEVEL_0_SAFE.name,),
+        ),
+    )
+
+
 def run_scenarios(scenarios=None, analyzer=None) -> list[dict]:
     analyzer = analyzer or ConflictAnalyzer()
     results = []
@@ -172,6 +206,12 @@ def run_obb_ssm_scenarios(scenarios=None, analyzer=None) -> list[dict]:
     return run_scenarios(scenarios=scenarios or obb_ssm_scenarios(), analyzer=analyzer)
 
 
+def run_ctrv_turn_scenarios(scenarios=None, analyzer=None) -> list[dict]:
+    """使用 OBB+SSM 冲突分析器运行弯道转向 CTRV 回归场景。"""
+    analyzer = analyzer or ConflictAnalyzer(conflict_model="obb_ssm")
+    return run_scenarios(scenarios=scenarios or ctrv_turn_scenarios(), analyzer=analyzer)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="运行无视频的确定性冲突场景回归")
     parser.add_argument("--output", help="输出 JSON 文件；不指定则打印")
@@ -184,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema_version": 1,
         "description": "合成规则场景，不代表真实校园检测或测速准确率。",
         "results": run_scenarios() + run_obb_ssm_scenarios(),
+        "ctrv_turn_results": run_ctrv_turn_scenarios(),
     }
     text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False)
     if args.output:

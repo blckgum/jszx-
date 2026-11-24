@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import math
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -76,6 +76,111 @@ def _parse_cov_2x2(cov: Any) -> Optional[np.ndarray]:
     return mat
 
 
+def _validate_appearance_hist(hist: Any) -> Optional[np.ndarray]:
+    """校验并 L1 归一化外观直方图；无效、全零、含 NaN/Inf 或布尔数组返回 None。"""
+    if hist is None or isinstance(hist, (bool, np.bool_, str, bytes)):
+        return None
+    try:
+        arr = np.asarray(hist)
+    except (TypeError, ValueError):
+        return None
+    if arr.dtype == np.bool_ or not np.issubdtype(arr.dtype, np.number):
+        return None
+    if arr.ndim < 1 or arr.size == 0:
+        return None
+    with np.errstate(over="ignore", invalid="ignore"):
+        arr_f = arr.astype(np.float64, copy=True)
+        if not np.all(np.isfinite(arr_f)) or np.any(arr_f < 0.0):
+            return None
+        total = float(arr_f.sum())
+        if not math.isfinite(total) or total <= 0.0:
+            return None
+        arr_f /= total
+    return arr_f
+
+
+def extract_appearance_histogram(frame_bgr: Any, bbox_xyxy: Any) -> Optional[np.ndarray]:
+    """截取检测框中心内缩区域（约 60% 宽高避开背景边缘），返回 16x8 H-S L1 归一化二维直方图。"""
+    if frame_bgr is None or isinstance(frame_bgr, (bool, np.bool_, str, bytes)):
+        return None
+    try:
+        arr = np.asarray(frame_bgr)
+    except (TypeError, ValueError):
+        return None
+    if (
+        arr.ndim != 3
+        or arr.shape[2] != 3
+        or arr.shape[0] < 2
+        or arr.shape[1] < 2
+        or arr.dtype == np.bool_
+        or not np.issubdtype(arr.dtype, np.number)
+    ):
+        return None
+
+    if isinstance(bbox_xyxy, (str, bytes)) or not isinstance(bbox_xyxy, (Sequence, np.ndarray)):
+        return None
+    if len(bbox_xyxy) != 4:
+        return None
+    if not all(_is_finite_number(v) for v in bbox_xyxy):
+        return None
+
+    fx1, fy1, fx2, fy2 = (float(v) for v in bbox_xyxy)
+    if fx2 <= fx1 or fy2 <= fy1:
+        return None
+
+    img_h, img_w = int(arr.shape[0]), int(arr.shape[1])
+    # 将检测框裁剪至图像合法范围，过滤越界无效框或尺寸过小框
+    cx1 = max(0.0, min(float(img_w), fx1))
+    cy1 = max(0.0, min(float(img_h), fy1))
+    cx2 = max(0.0, min(float(img_w), fx2))
+    cy2 = max(0.0, min(float(img_h), fy2))
+    bw = cx2 - cx1
+    bh = cy2 - cy1
+    if bw < 4.0 or bh < 4.0:
+        return None
+
+    # 内缩两侧各 20%，保留中心约 60% 宽高区域以减弱背景边缘干扰
+    margin_x = 0.2 * bw
+    margin_y = 0.2 * bh
+    ix1 = max(0, int(math.floor(cx1 + margin_x)))
+    iy1 = max(0, int(math.floor(cy1 + margin_y)))
+    ix2 = min(img_w, int(math.ceil(cx2 - margin_x)))
+    iy2 = min(img_h, int(math.ceil(cy2 - margin_y)))
+    if (ix2 - ix1) < 2 or (iy2 - iy1) < 2:
+        return None
+
+    patch = arr[iy1:iy2, ix1:ix2]
+    if patch.size == 0:
+        return None
+    if patch.dtype != np.uint8:
+        with np.errstate(over="ignore", invalid="ignore"):
+            if not np.all(np.isfinite(patch)):
+                return None
+            patch = np.clip(patch, 0, 255).astype(np.uint8)
+
+    # 仅在提取图像外观直方图时延迟加载 cv2，保证纯运动学离线模式零额外依赖
+    import cv2
+
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
+    return _validate_appearance_hist(hist)
+
+
+def appearance_bhattacharyya_distance(hist_a: Any, hist_b: Any) -> Optional[float]:
+    """纯 NumPy 计算两个外观直方图间的有界 Bhattacharyya 距离，值域 [0.0, 1.0]。"""
+    ha = _validate_appearance_hist(hist_a)
+    hb = _validate_appearance_hist(hist_b)
+    if ha is None or hb is None or ha.shape != hb.shape:
+        return None
+    with np.errstate(over="ignore", invalid="ignore"):
+        bc = float(np.sum(np.sqrt(ha * hb)))
+    if not math.isfinite(bc):
+        return None
+    bc = max(0.0, min(1.0, bc))
+    dist = math.sqrt(max(0.0, 1.0 - bc))
+    return max(0.0, min(1.0, dist))
+
+
 @dataclass(frozen=True)
 class TrackObservation:
     """单帧地面投影观测输入数据结构"""
@@ -84,6 +189,7 @@ class TrackObservation:
     object_kind: str
     x_m: float
     y_m: float
+    appearance_hist: Optional[np.ndarray] = None
 
 
 @dataclass(frozen=True)
@@ -117,18 +223,22 @@ class _TrackletState:
     is_reliable: bool = False
     frames_seen: int = 1
     _has_external_kinematics: bool = False
+    appearance_hist: Optional[np.ndarray] = None
 
 
 def _extract_observation(obs: Any) -> Optional[TrackObservation]:
     """兼容元组、字典或对象形式的观测输入；非有限地面坐标返回 None 跳过。"""
+    raw_hist: Any = None
     if isinstance(obs, (tuple, list)):
-        if len(obs) == 5:
+        if len(obs) == 6:
+            raw_id, category, object_kind, x_m, y_m, raw_hist = obs
+        elif len(obs) == 5:
             raw_id, category, object_kind, x_m, y_m = obs
         elif len(obs) == 4:
             raw_id, category, x_m, y_m = obs
             object_kind = ""
         else:
-            raise ValueError("观测元组长度必须为 4 或 5")
+            raise ValueError("观测元组长度必须为 4、5 或 6")
     elif isinstance(obs, dict):
         # 显式传入 raw_track_id=None 时仍按约定回退读取 track_id，保留 0/False 以触发校验报错
         raw_id = obs.get("raw_track_id")
@@ -138,6 +248,7 @@ def _extract_observation(obs: Any) -> Optional[TrackObservation]:
         object_kind = obs.get("object_kind", "")
         x_m = obs.get("x_m")
         y_m = obs.get("y_m")
+        raw_hist = obs.get("appearance_hist")
     else:
         # 对象属性 raw_track_id 显式为 None 时同样回退读取 track_id
         raw_id = getattr(obs, "raw_track_id", None)
@@ -147,6 +258,7 @@ def _extract_observation(obs: Any) -> Optional[TrackObservation]:
         object_kind = getattr(obs, "object_kind", "")
         x_m = getattr(obs, "x_m", None)
         y_m = getattr(obs, "y_m", None)
+        raw_hist = getattr(obs, "appearance_hist", None)
 
     if raw_id is None:
         return None
@@ -167,12 +279,15 @@ def _extract_observation(obs: Any) -> Optional[TrackObservation]:
     if not (math.isfinite(x_val) and math.isfinite(y_val)):
         return None
 
+    appearance_hist = _validate_appearance_hist(raw_hist)
+
     return TrackObservation(
         raw_track_id=int(raw_id),
         category=norm_cat,
         object_kind=kind_str,
         x_m=x_val,
         y_m=y_val,
+        appearance_hist=appearance_hist,
     )
 
 
@@ -186,6 +301,8 @@ class TrackletStitcher:
     # 航向一致性检查的速度与位移门限，避免低速/极短步长下方向角被投影抖动支配
     _MIN_HEADING_SPEED_MS = 0.8
     _MIN_HEADING_DISP_M = 0.5
+    # 活跃帧外观直方图 EMA 平滑更新系数
+    _APPEARANCE_EMA_ALPHA = 0.3
 
     def __init__(
         self,
@@ -195,6 +312,8 @@ class TrackletStitcher:
         max_heading_diff_deg: float = 45.0,
         velocity_noise_ms: float = 1.5,
         max_lost_pool: int = 256,
+        max_appearance_dist: float = 0.55,
+        appearance_weight: float = 2.0,
     ):
         for name, val in (
             ("max_gap_s", max_gap_s),
@@ -207,6 +326,14 @@ class TrackletStitcher:
                 raise ValueError(f"{name} 必须为有限正数")
         if not _is_positive_int(max_lost_pool):
             raise ValueError("max_lost_pool 必须为正整数")
+        if (
+            not _is_finite_number(max_appearance_dist)
+            or float(max_appearance_dist) <= 0.0
+            or float(max_appearance_dist) > 1.0
+        ):
+            raise ValueError("max_appearance_dist 必须在 (0, 1] 区间")
+        if not _is_finite_number(appearance_weight) or float(appearance_weight) < 0.0:
+            raise ValueError("appearance_weight 必须为有限非负数")
 
         self.max_gap_s = float(max_gap_s)
         self.max_distance_m = float(max_distance_m)
@@ -214,6 +341,8 @@ class TrackletStitcher:
         self.max_heading_diff_deg = float(max_heading_diff_deg)
         self.velocity_noise_ms = float(velocity_noise_ms)
         self.max_lost_pool = int(max_lost_pool)
+        self.max_appearance_dist = float(max_appearance_dist)
+        self.appearance_weight = float(appearance_weight)
 
         self._active_tracks: Dict[int, _TrackletState] = {}
         self._lost_tracks: Dict[int, _TrackletState] = {}
@@ -312,14 +441,24 @@ class TrackletStitcher:
         tr.y_m = obs.y_m
         tr.last_seen_s = timestamp_s
         tr.frames_seen += 1
+        # 若当前观测携带有效外观直方图，在活跃帧中按 EMA 平滑并维持 L1 归一化
+        if obs.appearance_hist is not None:
+            if tr.appearance_hist is None or tr.appearance_hist.shape != obs.appearance_hist.shape:
+                tr.appearance_hist = obs.appearance_hist.copy()
+            else:
+                alpha = TrackletStitcher._APPEARANCE_EMA_ALPHA
+                blended = (1.0 - alpha) * tr.appearance_hist + alpha * obs.appearance_hist
+                total = float(blended.sum())
+                if math.isfinite(total) and total > 0.0:
+                    tr.appearance_hist = blended / total
 
     def _evaluate_stitch_candidate(
         self,
         lost: _TrackletState,
         obs: TrackObservation,
         timestamp_s: float,
-    ) -> Optional[Tuple[float, float, float, Optional[float]]]:
-        """检验丢失轨迹与新观测的时空/运动学一致性，通过返回 (d_M, dist_m, dt, heading_diff)。"""
+    ) -> Optional[Tuple[float, float, float, float, Optional[float]]]:
+        """检验丢失轨迹与新观测的时空/运动学/外观一致性，返回 (fused_cost, d_M, dist_m, dt, heading_diff)。"""
         if lost.category != obs.category:
             return None
         dt = timestamp_s - lost.last_seen_s
@@ -370,7 +509,18 @@ class TrackletStitcher:
             if heading_diff_deg > self.max_heading_diff_deg:
                 return None
 
-        return (d_m, dist_m, dt, heading_diff_deg)
+        # 仅当双方均带有效外观直方图时启用外观门控与代价融合，否则 100% 退化为纯运动学
+        fused_cost = d_m
+        if lost.appearance_hist is not None and obs.appearance_hist is not None:
+            app_dist = appearance_bhattacharyya_distance(
+                lost.appearance_hist, obs.appearance_hist
+            )
+            if app_dist is not None:
+                if app_dist > self.max_appearance_dist:
+                    return None
+                fused_cost = d_m + self.appearance_weight * app_dist
+
+        return (fused_cost, d_m, dist_m, dt, heading_diff_deg)
 
     def resolve_frame(
         self,
@@ -435,29 +585,46 @@ class TrackletStitcher:
                     x_m=obs.x_m,
                     y_m=obs.y_m,
                     last_seen_s=ts,
+                    appearance_hist=(
+                        obs.appearance_hist.copy()
+                        if obs.appearance_hist is not None
+                        else None
+                    ),
                 )
             id_map[obs.raw_track_id] = known_cid
 
         # 2) 先将本帧缺席的活跃轨迹退入丢失池，支持瞬时切换及多帧遮挡后的缝合匹配
         self._retire_missing_active(seen_cids_this_frame, ts)
 
-        # 3) 对新出现的 raw_track_id，与未过期丢失轨迹执行一对一运动学与马氏距离匹配
-        candidates: List[Tuple[float, float, float, int, int, Optional[float], TrackObservation]] = []
+        # 3) 对新出现的 raw_track_id，与未过期丢失轨迹执行一对一运动学、马氏距离及外观融合匹配
+        candidates: List[
+            Tuple[float, float, float, float, int, int, Optional[float], TrackObservation]
+        ] = []
         for obs in unknown_obs:
             for lost_cid, lost_tr in self._lost_tracks.items():
                 metrics = self._evaluate_stitch_candidate(lost_tr, obs, ts)
                 if metrics is None:
                     continue
-                d_m, dist_m, gap_s, heading_diff_deg = metrics
+                fused_cost, d_m, dist_m, gap_s, heading_diff_deg = metrics
                 candidates.append(
-                    (d_m, dist_m, gap_s, obs.raw_track_id, lost_cid, heading_diff_deg, obs)
+                    (
+                        fused_cost,
+                        d_m,
+                        dist_m,
+                        gap_s,
+                        obs.raw_track_id,
+                        lost_cid,
+                        heading_diff_deg,
+                        obs,
+                    )
                 )
 
-        candidates.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4]))
+        # 优先按融合代价（无外观时即纯马氏距离）排序，依次贪心分配一对一缝合
+        candidates.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4], row[5]))
         matched_raw: set[int] = set()
         matched_lost: set[int] = set()
 
-        for d_m, dist_m, gap_s, raw_id, lost_cid, heading_diff_deg, obs in candidates:
+        for _fused, d_m, dist_m, gap_s, raw_id, lost_cid, heading_diff_deg, obs in candidates:
             if raw_id in matched_raw or lost_cid in matched_lost:
                 continue
             matched_raw.add(raw_id)
@@ -508,6 +675,11 @@ class TrackletStitcher:
                 x_m=obs.x_m,
                 y_m=obs.y_m,
                 last_seen_s=ts,
+                appearance_hist=(
+                    obs.appearance_hist.copy()
+                    if obs.appearance_hist is not None
+                    else None
+                ),
             )
             id_map[obs.raw_track_id] = cid
 

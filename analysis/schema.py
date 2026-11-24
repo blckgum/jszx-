@@ -170,14 +170,18 @@ def validate_configuration(data):
     _integer(data["alert_confirm_frames"], "configuration.alert_confirm_frames", minimum=1)
     _integer(data["alert_cooldown_frames"], "configuration.alert_cooldown_frames", minimum=0)
     if "speed_model" in data:
-        if not isinstance(data["speed_model"], str) or data["speed_model"] not in {"ema", "kalman"}:
-            raise SchemaValidationError("configuration.speed_model 必须是 ema 或 kalman")
+        if not isinstance(data["speed_model"], str) or data["speed_model"] not in {"ema", "kalman", "ctrv"}:
+            raise SchemaValidationError("configuration.speed_model 必须是 ema、kalman 或 ctrv")
     if "conflict_model" in data:
         if not isinstance(data["conflict_model"], str) or data["conflict_model"] not in {"cvm_circle", "obb_ssm"}:
             raise SchemaValidationError("configuration.conflict_model 必须是 cvm_circle 或 obb_ssm")
     if "enable_stitching" in data and type(data["enable_stitching"]) is not bool:
         raise SchemaValidationError("configuration.enable_stitching 必须是布尔值")
-    # 兼容骑行者 VRU 与实时流断流重连配置开关（旧版配置省略时保持向后兼容）。
+    # 兼容车辆锚点偏置补偿、实时流丢旧帧、骑行者 VRU 与断流重连配置开关（旧版配置省略时保持向后兼容）。
+    if "compensate_anchor_bias" in data and type(data["compensate_anchor_bias"]) is not bool:
+        raise SchemaValidationError("configuration.compensate_anchor_bias 必须是布尔值")
+    if "live_drop_stale_frames" in data and type(data["live_drop_stale_frames"]) is not bool:
+        raise SchemaValidationError("configuration.live_drop_stale_frames 必须是布尔值")
     if "include_cyclist_vru" in data and type(data["include_cyclist_vru"]) is not bool:
         raise SchemaValidationError("configuration.include_cyclist_vru 必须是布尔值")
     if "live_reconnect_attempts" in data:
@@ -224,9 +228,11 @@ def validate_summary(data):
             _integer(data[key], f"summary.{key}", minimum=0)
     if "stitched_track_count" in data:
         _integer(data["stitched_track_count"], "summary.stitched_track_count", minimum=0)
-    # 兼容实时流重连次数统计字段。
+    # 兼容实时流重连次数与丢弃旧帧计数统计字段。
     if "live_reconnect_count" in data:
         _integer(data["live_reconnect_count"], "summary.live_reconnect_count", minimum=0)
+    if "live_dropped_frames" in data:
+        _integer(data["live_dropped_frames"], "summary.live_dropped_frames", minimum=0)
     return data
 
 
@@ -421,7 +427,29 @@ def validate_ablation(data):
             raise SchemaValidationError(f"ablation.conflict[{idx}].risk_level 必须是非空字符串")
     if "algorithm_comparison" in data:
         _validate_algorithm_comparison(data["algorithm_comparison"])
+    # 兼容可选弯道 CTRV 测速消融对照表（旧版 JSON 省略时保持向后兼容）。
+    if "turn_speed_ablation" in data:
+        _validate_turn_speed_ablation(data["turn_speed_ablation"])
     return data
+
+
+def _validate_turn_speed_ablation(rows):
+    if not isinstance(rows, list) or not rows:
+        raise SchemaValidationError("ablation.turn_speed_ablation 必须是非空列表")
+    for idx, row_raw in enumerate(rows):
+        prefix = f"ablation.turn_speed_ablation[{idx}]"
+        item = _mapping(row_raw, prefix)
+        _required(
+            item,
+            ("estimator_mode", "target_speed_kmh", "turn_rate_rad_s", "mean_abs_error_kmh", "max_abs_error_kmh"),
+            prefix,
+        )
+        if not isinstance(item["estimator_mode"], str) or item["estimator_mode"] not in {"ema", "kalman", "ctrv"}:
+            raise SchemaValidationError(f"{prefix}.estimator_mode 必须是 ema、kalman 或 ctrv")
+        _finite_number(item["target_speed_kmh"], f"{prefix}.target_speed_kmh", minimum=0)
+        _finite_number(item["turn_rate_rad_s"], f"{prefix}.turn_rate_rad_s")
+        _finite_number(item["mean_abs_error_kmh"], f"{prefix}.mean_abs_error_kmh", minimum=0)
+        _finite_number(item["max_abs_error_kmh"], f"{prefix}.max_abs_error_kmh", minimum=0)
 
 
 def _validate_algorithm_comparison(comp):

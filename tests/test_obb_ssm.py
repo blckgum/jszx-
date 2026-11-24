@@ -184,14 +184,16 @@ class TestSSMPrimitives(unittest.TestCase):
             horizon_s=3.0,
         )
         self.assertFalse(res.collides)
-        hx_unm = 0.5 * 4.5 + 0.4
-        hy_unm = 0.5 * 1.9 + 0.4
+        # 裸车核心矩形 [-0.5*L, 0.5*L] x [-0.5*W, 0.5*W] 到行人轨迹的精确欧氏距离减 ped_radius_m
+        hx_car = 0.5 * 4.5
+        hy_car = 0.5 * 1.9
+        ped_r = 0.4
         ts = np.linspace(0.0, 3.0, 30001)
         px = 7.0 - 4.0 * ts
         py = 4.5 - 0.8 * ts
-        dx_b = np.maximum(0.0, np.abs(px) - hx_unm)
-        dy_b = np.maximum(0.0, np.abs(py) - hy_unm)
-        dists = np.hypot(dx_b, dy_b)
+        dx_b = np.maximum(0.0, np.abs(px) - hx_car)
+        dy_b = np.maximum(0.0, np.abs(py) - hy_car)
+        dists = np.maximum(0.0, np.hypot(dx_b, dy_b) - ped_r)
         min_idx = int(np.argmin(dists))
         self.assertAlmostEqual(res.min_clearance_m, float(dists[min_idx]), delta=1e-4)
         self.assertAlmostEqual(res.t_min_clearance, float(ts[min_idx]), delta=1e-3)

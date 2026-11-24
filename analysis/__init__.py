@@ -15,12 +15,24 @@ from .visualization import EnhancedConflictVisualizer
 
 
 def __getattr__(name: str):
-    # 延迟导出 .mot_eval 符号，避免 python -m analysis.mot_eval 在 -W error::RuntimeWarning
-    # 下触发 runpy 对 sys.modules 预加载子模块的 RuntimeWarning。
+    # 延迟导出 .mot_eval / .benchmark / .charts 符号，避免 python -m analysis.<submod>
+    # 在 -W error::RuntimeWarning 下触发 runpy 对 sys.modules 预加载子模块的 RuntimeWarning。
     if name in ("evaluate_mot", "evaluate_mot_files"):
         from . import mot_eval
 
         value = getattr(mot_eval, name)
+        globals()[name] = value
+        return value
+    if name in ("profile_pipeline_stages", "summarize_stage_timings"):
+        from . import benchmark
+
+        value = getattr(benchmark, name)
+        globals()[name] = value
+        return value
+    if name in ("plot_ablation_charts", "plot_run_timeline"):
+        from . import charts
+
+        value = getattr(charts, name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -32,6 +44,10 @@ __all__ = [
     "ConstantAccelerationKalman2D",
     "evaluate_mot",
     "evaluate_mot_files",
+    "profile_pipeline_stages",
+    "summarize_stage_timings",
+    "plot_ablation_charts",
+    "plot_run_timeline",
     "ConflictAnalyzer",
     "ConflictAssessment",
     "RiskLevel",

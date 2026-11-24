@@ -573,7 +573,10 @@ class ConflictAnalyzer:
 
         pet_map: Dict[Tuple[int, int], float] = {}
         if self.conflict_model == "obb_ssm" and self.pet_tracker is not None and timestamp_s is not None:
-            pet_map = self.pet_tracker.update(valid_readings, float(timestamp_s))
+            # 传入对象策略字典，使 PETTracker 能按车型物理尺寸做整车旋转占地栅格化
+            pet_map = self.pet_tracker.update(
+                valid_readings, float(timestamp_s), object_policies=self.object_policies
+            )
 
         assessments: List[ConflictAssessment] = []
 

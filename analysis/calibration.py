@@ -1010,3 +1010,191 @@ class RoadCalibrator:
             "max_error_m": max(errors),
             "points": point_reports,
         }
+
+    def estimate_camera_ground_xy(self) -> Optional[Tuple[float, float]]:
+        """估算相机光心在地面坐标系下的投影位置 (X, Y)；无效或奇异时安全返回 None。"""
+        h_mat = getattr(self, "H", None)
+        h_inv = getattr(self, "H_inv", None)
+        if (
+            not isinstance(h_mat, np.ndarray)
+            or not isinstance(h_inv, np.ndarray)
+            or h_mat.shape != (3, 3)
+            or h_inv.shape != (3, 3)
+            or not (np.isfinite(h_mat).all() and np.isfinite(h_inv).all())
+        ):
+            return None
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            det_h = float(np.linalg.det(h_mat))
+            det_hinv = float(np.linalg.det(h_inv))
+        if not (math.isfinite(det_h) and math.isfinite(det_hinv)) or abs(det_h) <= 1e-12 or abs(det_hinv) <= 1e-12:
+            return None
+
+        gd_pts = getattr(self, "ground_points", None)
+        img_pts = getattr(self, "image_points", None)
+        if not isinstance(gd_pts, (list, tuple)) or not isinstance(img_pts, (list, tuple)) or len(gd_pts) < 4 or len(img_pts) < 4:
+            return None
+        if not all(_is_finite_real(px) and _is_finite_real(py) for px, py in gd_pts):
+            return None
+        g_cx = sum(float(px) for px, _ in gd_pts) / len(gd_pts)
+        g_cy = sum(float(py) for _, py in gd_pts) / len(gd_pts)
+
+        # 若已配置相机内参 K，优先尝试单应性矩阵分解 K^-1 * H_inv = lambda * [r1, r2, t]
+        k_mat = getattr(self, "_camera_matrix_np", None)
+        k_inv = getattr(self, "_camera_matrix_inv_np", None)
+        if k_mat is not None:
+            if (
+                not isinstance(k_inv, np.ndarray)
+                or k_inv.shape != (3, 3)
+                or not np.isfinite(k_inv).all()
+            ):
+                return None
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                if abs(float(np.linalg.det(k_inv))) <= 1e-12:
+                    return None
+                m_mat = k_inv @ h_inv
+                if not np.isfinite(m_mat).all():
+                    return None
+                m1, m2, m3 = m_mat[:, 0], m_mat[:, 1], m_mat[:, 2]
+                n1 = float(np.linalg.norm(m1))
+                n2 = float(np.linalg.norm(m2))
+                if not (math.isfinite(n1) and math.isfinite(n2)) or n1 <= 1e-9 or n2 <= 1e-9:
+                    return None
+                # 仅当内参 K 与地面单应性尺度/正交性物理自洽时直接采用外参反算光心；
+                # 若二者尺幅严重失配（如手工梯形配固定示范 K），自动退回图像底边射线外推。
+                scale_ratio = max(n1, n2) / min(n1, n2)
+                cos_orth = abs(float(np.dot(m1 / n1, m2 / n2)))
+                if scale_ratio <= 1.8 and cos_orth <= 0.35:
+                    lam = 0.5 * (n1 + n2)
+                    r1, r2, t_vec = m1 / lam, m2 / lam, m3 / lam
+                    # 用标定地面中心点的相机深度符号校正齐次尺度正负（保证目标位于相机前方 Z_c > 0）
+                    if float(r1[2] * g_cx + r2[2] * g_cy + t_vec[2]) < 0.0:
+                        r1, r2, t_vec = -r1, -r2, -t_vec
+                    r3 = np.cross(r1, r2)
+                    r_approx = np.column_stack([r1, r2, r3])
+                    if not np.isfinite(r_approx).all() or abs(float(np.linalg.det(r_approx))) <= 1e-9:
+                        return None
+                    u_mat, _, vt_mat = np.linalg.svd(r_approx)
+                    r_mat = u_mat @ vt_mat
+                    if float(np.linalg.det(r_mat)) < 0.0:
+                        u_mat[:, -1] *= -1.0
+                        r_mat = u_mat @ vt_mat
+                    cam_world = -r_mat.T @ t_vec
+                    if not np.isfinite(cam_world).all():
+                        return None
+                    # 光心紧贴地面平面（高度接近 0）属于退化共面奇异配置，安全返回 None
+                    if abs(float(cam_world[2])) <= 1e-4:
+                        return None
+                    cx_w, cy_w = float(cam_world[0]), float(cam_world[1])
+                    if math.hypot(cx_w - g_cx, cy_w - g_cy) > 1e-6:
+                        return cx_w, cy_w
+                    return None
+
+        # 未提供匹配内参时：从标定区域底边中点沿画面下方中心射线外推估算相机侧地面原点
+        try:
+            pts_uv = self._undistort_points_array(list(img_pts))
+        except (ValueError, cv2.error):
+            return None
+        if pts_uv.ndim != 2 or pts_uv.shape[0] < 4 or pts_uv.shape[1] != 2 or not np.isfinite(pts_uv).all():
+            return None
+
+        if len(pts_uv) == 4:
+            best_edge = max(
+                range(4),
+                key=lambda i: 0.5 * (float(pts_uv[i, 1]) + float(pts_uv[(i + 1) % 4, 1])),
+            )
+            p_a = pts_uv[best_edge]
+            p_b = pts_uv[(best_edge + 1) % 4]
+            u_bot = 0.5 * (float(p_a[0]) + float(p_b[0]))
+            v_bot = 0.5 * (float(p_a[1]) + float(p_b[1]))
+        else:
+            order = np.argsort(pts_uv[:, 1])[::-1]
+            u_bot = 0.5 * (float(pts_uv[order[0], 0]) + float(pts_uv[order[1], 0]))
+            v_bot = 0.5 * (float(pts_uv[order[0], 1]) + float(pts_uv[order[1], 1]))
+
+        span_v = float(np.max(pts_uv[:, 1]) - np.min(pts_uv[:, 1]))
+        span_u = float(np.max(pts_uv[:, 0]) - np.min(pts_uv[:, 0]))
+        if not (math.isfinite(span_v) and math.isfinite(span_u)) or span_v <= 1e-6:
+            return None
+        step_v = max(span_v, 0.25 * span_u)
+        front_sign = getattr(self, "_front_w_sign", 1)
+
+        for scale_k in (2.0, 1.5, 1.0, 0.5, 0.25):
+            u_ex = u_bot
+            v_ex = v_bot + scale_k * step_v
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                p_g = h_mat @ np.array([u_ex, v_ex, 1.0], dtype=np.float64)
+                w = float(p_g[2])
+                if not math.isfinite(w) or abs(w) < 1e-8:
+                    continue
+                gx = float(p_g[0] / w)
+                gy = float(p_g[1] / w)
+                if not (math.isfinite(gx) and math.isfinite(gy)):
+                    continue
+                w_inv = float((h_inv @ np.array([gx, gy, 1.0], dtype=np.float64))[2])
+            # 外推原点必须位于相机主平面前方且与标定区中心不重合
+            if math.isfinite(w_inv) and w_inv * front_sign > 1e-8 and math.hypot(gx - g_cx, gy - g_cy) > 1e-6:
+                return gx, gy
+        return None
+
+    def compensate_vehicle_anchor(
+        self,
+        x_m: float,
+        y_m: float,
+        length_m: float,
+        width_m: float,
+        heading_deg: Optional[float] = None,
+    ) -> Tuple[float, float]:
+        """将 2D 检测框底边地面投影点沿视线向车体内部推进一阶有效半纵深，抑制几何中心偏置。"""
+        if not _is_finite_real(x_m) or not _is_finite_real(y_m):
+            raise ValueError("x_m 与 y_m 必须为有限实数")
+        if not _is_finite_real(length_m) or not _is_finite_real(width_m):
+            raise ValueError("length_m 与 width_m 必须为有限实数")
+        fx, fy = float(x_m), float(y_m)
+        flen, fwid = float(length_m), float(width_m)
+        if flen <= 0.0 or fwid <= 0.0:
+            raise ValueError("length_m 与 width_m 必须大于 0")
+
+        cam_xy = self.estimate_camera_ground_xy()
+        if cam_xy is None:
+            return fx, fy
+        cam_x, cam_y = cam_xy
+        if not (_is_finite_real(cam_x) and _is_finite_real(cam_y)):
+            return fx, fy
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            dx = fx - float(cam_x)
+            dy = fy - float(cam_y)
+            if not (math.isfinite(dx) and math.isfinite(dy)):
+                # 极值坐标差值上溢时先减半缩放再归一化求单位方向
+                dx = 0.5 * fx - 0.5 * float(cam_x)
+                dy = 0.5 * fy - 0.5 * float(cam_y)
+            max_c = max(abs(dx), abs(dy))
+            if not math.isfinite(max_c) or max_c <= 1e-9:
+                return fx, fy
+            nx = dx / max_c
+            ny = dy / max_c
+            unit_norm = math.hypot(nx, ny)
+            if not math.isfinite(unit_norm) or unit_norm <= 1e-12:
+                return fx, fy
+            if max_c <= 1e-6 and max_c * unit_norm <= 1e-6:
+                return fx, fy
+            ux = nx / unit_norm
+            uy = ny / unit_norm
+
+        max_half = 0.5 * max(flen, fwid)
+        if _is_finite_real(heading_deg):
+            psi = math.radians(float(heading_deg))
+            cos_p = math.cos(psi)
+            sin_p = math.sin(psi)
+            # 有限航向角下取车体矩形沿视线方向 (ux, uy) 的半支撑投影
+            proj_half = 0.5 * flen * abs(ux * cos_p + uy * sin_p) + 0.5 * fwid * abs(-ux * sin_p + uy * cos_p)
+        else:
+            proj_half = 0.5 * fwid
+        offset_m = min(proj_half, max_half)
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            comp_x = fx + offset_m * ux
+            comp_y = fy + offset_m * uy
+        if not (math.isfinite(comp_x) and math.isfinite(comp_y)):
+            return fx, fy
+        return float(comp_x), float(comp_y)

@@ -16,7 +16,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from .kalman import ConstantAccelerationKalman2D
+from .kalman import ConstantAccelerationKalman2D, ConstantTurnRateKalman2D
 from .policy import ObjectPolicy, object_policy
 
 
@@ -31,8 +31,8 @@ def _is_finite_number(value) -> bool:
 
 
 def _validate_estimator_mode(estimator_mode: str) -> str:
-    if type(estimator_mode) is not str or estimator_mode not in ("ema", "kalman"):
-        raise ValueError("estimator_mode 必须是 'ema' 或 'kalman'")
+    if type(estimator_mode) is not str or estimator_mode not in ("ema", "kalman", "ctrv"):
+        raise ValueError("estimator_mode 必须是 'ema'、'kalman' 或 'ctrv'")
     return estimator_mode
 
 
@@ -89,6 +89,7 @@ class SpeedReading:
     ay_ms2: float = 0.0        # Y 轴加速度分量 (米/秒^2)
     pos_std_m: Optional[float] = None  # 滤波位置标准差 (米)
     pos_cov_m2: Optional[Tuple[float, float, float, float]] = None  # 2x2 位置协方差展开 (cxx, cxy, cyx, cyy)
+    yaw_rate_rad_s: float = 0.0  # 横摆角速度 (弧度/秒，CTRV 模式下有效)
 
     def __post_init__(self):
         if not self.object_kind:
@@ -155,12 +156,15 @@ class TrackMotionTracker:
         self.smoothed_vy = 0.0
         self.has_valid_velocity = False
 
-        # 卡尔曼滤波器实例（仅 kalman 模式创建）
-        self._kalman: Optional[ConstantAccelerationKalman2D] = (
-            ConstantAccelerationKalman2D(category=clean_category)
-            if estimator_mode == "kalman"
-            else None
-        )
+        # 卡尔曼滤波器实例（kalman 使用 6 维 CA，ctrv 使用 5 维 CTRV EKF）
+        if estimator_mode == "kalman":
+            self._kalman: Optional[ConstantAccelerationKalman2D | ConstantTurnRateKalman2D] = (
+                ConstantAccelerationKalman2D(category=clean_category)
+            )
+        elif estimator_mode == "ctrv":
+            self._kalman = ConstantTurnRateKalman2D(category=clean_category)
+        else:
+            self._kalman = None
 
         # 最后一个有限观测位置/时间戳与持续静止帧计数
         self._last_valid_xy: Optional[Tuple[float, float]] = None
@@ -189,10 +193,12 @@ class TrackMotionTracker:
             self.category = clean_category
             self._pending_category, self._pending_count = None, 0
 
-    def _kalman_extras(self) -> Tuple[float, float, Optional[float], Optional[Tuple[float, float, float, float]]]:
-        """读取卡尔曼加速度与位置不确定度；未初始化或 EMA 模式返回默认值。"""
+    def _kalman_extras(
+        self,
+    ) -> Tuple[float, float, Optional[float], Optional[Tuple[float, float, float, float]], float]:
+        """读取卡尔曼加速度、位置不确定度与横摆角速度；未初始化或 EMA 模式返回默认值。"""
         if self._kalman is None or self._kalman.update_count == 0:
-            return 0.0, 0.0, None, None
+            return 0.0, 0.0, None, None, 0.0
         ax, ay = self._kalman.acceleration_xy
         cov = self._kalman.pos_cov_2x2
         pos_cov_tuple = (
@@ -201,7 +207,8 @@ class TrackMotionTracker:
             float(cov[1, 0]),
             float(cov[1, 1]),
         )
-        return ax, ay, self._kalman.pos_std_m, pos_cov_tuple
+        yaw_rate = float(getattr(self._kalman, "yaw_rate_rad_s", 0.0))
+        return ax, ay, self._kalman.pos_std_m, pos_cov_tuple, yaw_rate
 
     def _apply_micro_truncation(self, mag_ms: float) -> Tuple[float, float]:
         """应用行人与车辆微动速度显示截断，返回 (speed_ms, speed_kmh)。"""
@@ -224,6 +231,7 @@ class TrackMotionTracker:
         ay_ms2: float = 0.0,
         pos_std_m: Optional[float] = None,
         pos_cov_m2: Optional[Tuple[float, float, float, float]] = None,
+        yaw_rate_rad_s: float = 0.0,
     ) -> SpeedReading:
         """统一计算静止滞回、微动截断、航向角、超速与可信度判定。"""
         # 静止判定必须使用截断前的平滑速度幅值：
@@ -238,7 +246,16 @@ class TrackMotionTracker:
         is_stationary = self._stationary_streak >= self.stationary_min_frames
 
         speed_ms, speed_kmh = self._apply_micro_truncation(smoothed_mag)
-        heading = (math.degrees(math.atan2(vy_ms, vx_ms)) + 360.0) % 360.0
+        # 静止且 CTRV 已建立先验航向时沿用滤波航向，避免 0 矢量下 atan2 退化为 0
+        if (
+            smoothed_mag <= 1e-9
+            and self.estimator_mode == "ctrv"
+            and self._kalman is not None
+            and self._kalman.update_count >= 2
+        ):
+            heading = float(self._kalman.heading_deg)
+        else:
+            heading = (math.degrees(math.atan2(vy_ms, vx_ms)) + 360.0) % 360.0
         is_speeding = (
             len(self.history) >= 3
             and (self.category == "vehicle")
@@ -266,6 +283,7 @@ class TrackMotionTracker:
             ay_ms2=ay_ms2,
             pos_std_m=pos_std_m,
             pos_cov_m2=pos_cov_m2,
+            yaw_rate_rad_s=float(yaw_rate_rad_s),
         )
 
     def update(
@@ -281,7 +299,7 @@ class TrackMotionTracker:
         # 读数回填最后有效位置，不把 NaN 暴露给下游渲染/研判
         if not (_is_finite_number(timestamp_s) and _is_finite_number(x_m) and _is_finite_number(y_m)):
             x_out, y_out = self._last_valid_xy if self._last_valid_xy is not None else (0.0, 0.0)
-            ax_out, ay_out, std_out, cov_out = self._kalman_extras()
+            ax_out, ay_out, std_out, cov_out, yaw_out = self._kalman_extras()
             return SpeedReading(
                 track_id=self.track_id,
                 category=self.category,
@@ -300,6 +318,7 @@ class TrackMotionTracker:
                 ay_ms2=ay_out,
                 pos_std_m=std_out,
                 pos_cov_m2=cov_out,
+                yaw_rate_rad_s=yaw_out,
             )
 
         ts = float(timestamp_s)
@@ -311,7 +330,7 @@ class TrackMotionTracker:
         if self._last_timestamp_s is not None and ts <= self._last_timestamp_s:
             raise ValueError("timestamp_s 必须逐帧严格递增")
 
-        if self.estimator_mode == "kalman":
+        if self.estimator_mode in ("kalman", "ctrv"):
             assert self._kalman is not None
             self._last_timestamp_s = ts
             self.history.append((ts, xm, ym))
@@ -319,7 +338,7 @@ class TrackMotionTracker:
 
             kf_x, kf_y = self._kalman.position_xy
             kf_vx, kf_vy = self._kalman.velocity_xy
-            kf_ax, kf_ay, pos_std, pos_cov_tuple = self._kalman_extras()
+            kf_ax, kf_ay, pos_std, pos_cov_tuple, yaw_rate = self._kalman_extras()
             self._last_valid_xy = (kf_x, kf_y)
             self.smoothed_vx = kf_vx
             self.smoothed_vy = kf_vy
@@ -335,6 +354,7 @@ class TrackMotionTracker:
                 ay_ms2=kf_ay,
                 pos_std_m=pos_std,
                 pos_cov_m2=pos_cov_tuple,
+                yaw_rate_rad_s=yaw_rate,
             )
 
         self._last_timestamp_s = ts

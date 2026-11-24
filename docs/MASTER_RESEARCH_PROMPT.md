@@ -18,12 +18,12 @@
 ### 1.3 明确的系统边界定义
 * 明确做的工作 (In Scope)：
   1. 基于 YOLOv8 的实时机动车与行人高精度目标检测。
-  2. 基于 ByteTrack 的跨帧目标关联、稳健 ID 分配与遮挡轨迹恢复。
-  3. 基于单应性矩阵 (Homography) 的相机像素到物理地面坐标 (X, Y) 映射。
-  4. 基于物理位移微分与指数移动平均 (EMA) 的车辆与行人平滑测速。
-  5. 基于二阶运动学外推 (CVM) 的轨迹交叉判定与碰撞时间 (TTC) 闭式求解。
-  6. 结合 30 km/h 限速与 TTC 的四级预警体系建立与多端可视化联动。
-  7. 结构化日志落盘 (JSONL 冲突事件、CSV 速度轨迹)。
+  2. 基于 ByteTrack 的跨帧目标关联、稳健 ID 分配与可选短时遮挡断轨缝合 (`TrackletStitcher`)。
+  3. 基于单应性矩阵 (Homography) 的相机像素到物理地面坐标 (X, Y) 映射（支持 4 点/多点 RANSAC 与棋盘格去畸变）。
+  4. 基于滑窗微分+EMA、2D 匀加速卡尔曼滤波 (CA Kalman) 与弯道恒定转弯率滤波 (CTRV) 的平滑测速。
+  5. 基于等速圆包络 (CVM/TTC) 与旋转矩形安全替代指标 (OBB-SSM: MTTC/DRAC/PET/碰撞概率，支持骑行者 VRU) 的冲突研判。
+  6. 结合 30 km/h 限速与动态冲突的四级去抖预警体系、OpenCV 可视化渲染与轻量双端接口推送 (`analysis.service`)。
+  7. 结构化日志落盘 (JSONL 冲突事件、CSV 速度轨迹) 及离线 MOT 评测、参数消融、分阶段耗时基准与图表生成。
 * 坚决不做的工作 (Out of Scope)：
   1. 不做底层车辆动力学控制（如刹车执行器、方向盘转向控制等自动驾驶闭环）。
   2. 不做全量城市道路高精地图匹配与复杂多色红绿灯全套判读。
@@ -139,30 +139,55 @@ D:\AI\jszx_partner\
 │       └── yolov8n.pt             # 官方检测基底权重
 ├── configs\
 │   ├── bytetrack.yaml             # ByteTrack 核心追踪超参
-│   └── calibration.yaml          # 道路地面单应性变换参数文件
+│   ├── motion.yaml                # 像素运动状态配置
+│   ├── object_policy.yaml         # 道路目标几何与安全半径策略
+│   ├── calibration.yaml           # 道路地面单应性变换参数文件
+│   └── ground_truth.example.yaml  # 人工真值评测模板
 ├── detection\
-│   └── core.py                    # YOLOv8 推理接口与数据结构校验
+│   └── core.py                    # YOLOv8 推理、训练与评估接口
 ├── tracking\
 │   ├── core.py                    # ByteTrack 会话跟踪引擎
+│   ├── motion.py                  # 像素级时间自适应运动估计
 │   ├── records.py                 # 跨帧轨迹状态模型
 │   └── demo.py                    # 模拟场景生成器
-├── analysis\                      # [本次完整构建的核心研判体系]
-│   ├── calibration.py             # 4点单应性透视映射 (H矩阵求逆/正反变换)
-│   ├── speed.py                   # 物理空间 EMA 平滑测速与 30km/h 限速研判
-│   ├── conflict.py                # CVM 轨迹外推、TTC 计算与四级预警决策
-│   ├── visualization.py           # 增强 HUD 看板、未来虚线轨迹、碰撞热区圈
-│   ├── interactive_calibrator.py  # 图像路面 4 点交互式标定工具
-│   ├── pipeline.py                # 跟踪+测速+冲突+渲染端到端管道
-│   ├── __init__.py                # 模块导出定义
+├── analysis\                      # 核心研判、评测、基准与服务体系
+│   ├── calibration.py             # 4 点/多点 RANSAC 单应性映射与去畸变
+│   ├── kalman.py                  # 2D CA / CTRV 卡尔曼滤波器
+│   ├── speed.py                   # EMA / Kalman / CTRV 测速与 30 km/h 限速研判
+│   ├── ssm.py                     # 圆角 OBB 扫掠、MTTC、DRAC、PET 与碰撞概率
+│   ├── conflict.py                # CVM / OBB-SSM 冲突研判与 VRU 四级决策
+│   ├── stitching.py               # 短时遮挡断轨缝合与外观直方图代价
+│   ├── events.py                  # 告警事件去抖状态机与峰值指标聚合
+│   ├── policy.py                  # 细分类别几何包络策略读取与校验
+│   ├── visualization.py           # HUD 看板、OBB 轮廓、二阶未来轨迹与碰撞热区
+│   ├── interactive_calibrator.py  # 交互式 4 点/多点/停车区/棋盘格内参标定工具
+│   ├── pipeline.py                # 在线视频/实时流与离线轨迹端到端管线
+│   ├── batch.py                   # 目录级批量分析调度器
+│   ├── evaluate.py                # 产物描述性统计与真值 MAE/F1 评测
+│   ├── ablation.py                # 测速/冲突/缝合确定性参数消融对比
+│   ├── scenarios.py               # 物理冲突与弯道转向回归场景库
+│   ├── schema.py                  # 全产物 JSON/JSONL/CSV 输出契约校验
+│   ├── mot_eval.py                # MOTA / MOTP / IDF1 / HOTA / IDSW 跟踪评测
+│   ├── benchmark.py               # 分阶段耗时基准与端到端吞吐统计
+│   ├── charts.py                  # 无界面 Agg 实验对比图表生成器 (PNG)
+│   ├── service.py                 # 标准库 HTTP / 可选 FastAPI 双端预警服务
+│   ├── provenance.py              # 实验环境、配置与权重 SHA256 溯源
+│   ├── __init__.py                # 模块惰性导出定义
 │   └── __main__.py                # 统一命令行入口
-├── tests\                         # 45 项单元与集成测试（100% 通过）
-│   ├── test_detection.py
-│   ├── test_tracking.py
-│   ├── test_tracking_exports.py
-│   ├── test_tracking_integration.py
-│   └── test_analysis.py           # 空间标定、测速与 TTC 冲突单元测试
+├── tests\                         # 单元、集成与异常路径回归测试集（详见 README.md 实测总数）
+│   ├── test_detection.py          # 检测接口与边界校验
+│   ├── test_tracking.py           # 跟踪与像素运动状态测试
+│   ├── test_analysis.py           # 标定、测速、TTC 与管线核心测试
+│   ├── test_kalman_calib.py       # 卡尔曼协方差与单应性标定测试
+│   ├── test_obb_ssm.py            # OBB-SSM / MTTC / DRAC / PET 测试
+│   ├── test_stitching_integration.py # 断轨缝合与管线集成测试
+│   ├── test_mot_and_calib_tools.py   # MOT 评测与多点/棋盘格标定测试
+│   └── test_benchmark_and_charts.py  # 分阶段耗时基准与无界面图表测试
 └── docs\
-    └── MASTER_RESEARCH_PROMPT.md  # 本指导书
+    ├── 课题需求与技术路线.md
+    ├── MASTER_RESEARCH_PROMPT.md  # 本指导书
+    ├── 车辆行人检测方案.md
+    └── modules\                   # 各阶段详细原理解释文档
 ```
 
 ---
@@ -177,27 +202,31 @@ cd D:\AI\jszx_partner
 D:\AI\plant_yolo_env\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-### 4.2 进行路面单应性 4 点标定
-若已有校园道路空景图（例如 `campus_road.jpg`），使用交互式标定工具获取实际长宽和 4 个角点：
+### 4.2 进行路面单应性标定与棋盘格内参标定
+若已有校园道路空景图或视频（例如 `campus_road.jpg`），使用交互式标定工具获取实际长宽和 4 个角点：
 ```powershell
 cd D:\AI\jszx_partner
-D:\AI\plant_yolo_env\Scripts\python.exe -m analysis.interactive_calibrator --image campus_road.jpg --width 6.0 --length 15.0 --output configs/calibration.yaml
+D:\AI\plant_yolo_env\Scripts\python.exe -m analysis.interactive_calibrator --source campus_road.jpg --width 6.0 --length 15.0 --output configs/calibration.yaml
 ```
 操作说明：在弹出窗口中依次点击路面参考矩形的四个角点：
 1. 左上角 (Top-Left)
 2. 右上角 (Top-Right)
 3. 右下角 (Bottom-Right)
 4. 左下角 (Bottom-Left)
-按 `s` 保存并生成 `configs/calibration.yaml`。
+点满 4 点后按 `Enter` 或 `Space` 保存并生成 `configs/calibration.yaml`（按 `R` 重置，按 `Q` 取消；窗口内亦支持按 `P`/`N` 框选路侧停车区，或通过 `--ground-points`、`--parking-zone`、`--chessboard-dir` / `--intrinsics-yaml` 执行非交互多点 RANSAC 与相机去畸变标定）。
 
-### 4.3 运行全流程端到端冲突感知与预警分析
+### 4.3 运行全流程端到端冲突感知、基准统计与图表分析
 ```powershell
 cd D:\AI\jszx_partner
 D:\AI\plant_yolo_env\Scripts\python.exe -m analysis --source 你的校园视频.mp4 --calib configs/calibration.yaml --output runs/analysis/test_result --device 0
 ```
-如需在屏幕上实时播放预览，添加 `--show` 参数：
+如需在屏幕上实时播放预览、无实测标定时演示、离线基于 `tracks.jsonl` 复盘或开启升级算法组合：
 ```powershell
 D:\AI\plant_yolo_env\Scripts\python.exe -m analysis --source 你的校园视频.mp4 --show
+D:\AI\plant_yolo_env\Scripts\python.exe -m analysis --source 你的校园视频.mp4 --demo --speed-model kalman --conflict-model obb_ssm --enable-stitching
+D:\AI\plant_yolo_env\Scripts\python.exe -m analysis --tracks runs/yolo/track/run-*/tracks.jsonl --calib configs/calibration.yaml
+D:\AI\plant_yolo_env\Scripts\python.exe -m analysis.benchmark --source 你的校园视频.mp4 --demo --max-frames 30 --output runs/analysis/bench.json
+D:\AI\plant_yolo_env\Scripts\python.exe -m analysis.charts --benchmark runs/analysis/bench.json --run runs/analysis/test_result --output-dir runs/analysis/charts
 ```
 
 ---
