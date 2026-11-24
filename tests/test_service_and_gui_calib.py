@@ -7,8 +7,10 @@ import builtins
 import contextlib
 import csv
 import http.client
+import inspect
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -38,6 +40,7 @@ from analysis.schema import (
     validate_run,
 )
 from analysis.service import (
+    _ALLOWED_JOB_REQUEST_KEYS,
     AnalysisService,
     DEFAULT_WEB_ROOT,
     LatestFrameCapture,
@@ -1187,6 +1190,62 @@ class TestPipelineCtrvAnchorAndLiveDropIntegration(unittest.TestCase):
             self.assertEqual(len(cb_frames), 1)
             raw_cap.release.assert_called_once()
             self.assertTrue(validate_run(live_out)["valid"])
+
+    def test_get_system_info_headless_linux_disables_can_browse_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calib = _sample_calibrator()
+            calib_file = root / "calib.yaml"
+            calib.to_yaml(calib_file)
+            service = AnalysisService(runs_root=root / "runs", default_calib=calib_file)
+
+            clean_env = dict(os.environ)
+            clean_env.pop("DISPLAY", None)
+            clean_env.pop("WAYLAND_DISPLAY", None)
+            with (
+                mock.patch("analysis.service.sys.platform", "linux"),
+                mock.patch("analysis.service.importlib.util.find_spec", return_value=object()),
+                mock.patch.dict(os.environ, clean_env, clear=True),
+            ):
+                info_headless = service.get_system_info()
+            self.assertFalse(info_headless["can_browse_files"])
+
+            with (
+                mock.patch("analysis.service.sys.platform", "linux"),
+                mock.patch("analysis.service.importlib.util.find_spec", return_value=object()),
+                mock.patch.dict(os.environ, {**clean_env, "WAYLAND_DISPLAY": "wayland-0"}, clear=True),
+            ):
+                info_wayland = service.get_system_info()
+            self.assertTrue(info_wayland["can_browse_files"])
+
+    def test_job_request_allowed_keys_match_start_job_and_reject_unknown(self):
+        sig_params = set(inspect.signature(AnalysisService.start_job).parameters.keys())
+        self.assertTrue(_ALLOWED_JOB_REQUEST_KEYS.issubset(sig_params))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calib_file = root / "calib.yaml"
+            _sample_calibrator().to_yaml(calib_file)
+            service = AnalysisService(runs_root=root / "runs", default_calib=calib_file)
+            server = create_http_server(service, host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base_url = f"http://127.0.0.1:{server.server_address[1]}"
+                req = Request(
+                    f"{base_url}/api/jobs",
+                    data=json.dumps({"source": "demo.mp4", "unexpected_kwarg": 123}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx:
+                    urlopen(req, timeout=5)
+                self.assertEqual(ctx.exception.code, 400)
+                body = json.loads(ctx.exception.read().decode("utf-8"))
+                self.assertIn("unexpected_kwarg", body["error"])
+            finally:
+                server.shutdown()
+                server.server_close()
 
 
 if __name__ == "__main__":

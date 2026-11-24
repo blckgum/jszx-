@@ -227,6 +227,8 @@ def _bind_server_with_port_scan(
 ):
     """绑定指定端口或自动扫描 8000..8020 首个可用端口并返回 HTTPServer 实例。"""
     if requested_port is not None:
+        if requested_port != 0 and _is_tcp_port_in_use(host, requested_port):
+            raise OSError(f"指定端口 {requested_port} 已被占用")
         return create_http_server(service, host=host, port=requested_port)
 
     last_exc: Optional[Exception] = None

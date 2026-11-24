@@ -72,6 +72,7 @@
       playing: false,
       timerId: null,
       useJpegFallback: false,
+      noVideo: false,
       isFixture: false,
       data: null
     },
@@ -83,6 +84,7 @@
       lastMaxSpeed: null,
       lastMinTtc: null,
       activeAlertsCount: 0,
+      quietPolls: 0,
       notifiedDone: false
     },
     systemInfo: {
@@ -582,6 +584,7 @@
 
     if (typeof CM.CampusRoadTwinCanvas === "function") {
       widgets.roadTwin = new CM.CampusRoadTwinCanvas(dom.roadTwinCanvas, {
+        config: state.pipelineConfig,
         onTelemetry: handleTwinTelemetry,
         onRenderState: function (renderState) {
           if (state.mode === "simulation" && widgets.simCamera) {
@@ -589,6 +592,9 @@
           }
         }
       });
+      if (typeof widgets.roadTwin.setConfig === "function") {
+        widgets.roadTwin.setConfig(state.pipelineConfig);
+      }
       if (widgets.simCamera && typeof widgets.roadTwin.getCurrentRenderState === "function") {
         widgets.simCamera.renderState(widgets.roadTwin.getCurrentRenderState());
       }
@@ -988,6 +994,9 @@
       (summary && typeof summary.frames_processed === "number" ? summary.frames_processed : 0),
       maxFrameIdx + 1
     );
+    var speedsTotalRows = speedsRes && typeof speedsRes.total_rows === "number" ? speedsRes.total_rows : speedRows.length;
+    var speedsTruncated = Boolean(speedsRes && speedsRes.truncated);
+    var conflictsTruncated = conflicts.length >= 5000;
 
     return {
       runId: runId,
@@ -995,6 +1004,9 @@
       events: events,
       conflicts: conflicts,
       speedRows: speedRows,
+      speedsTotalRows: speedsTotalRows,
+      speedsTruncated: speedsTruncated,
+      conflictsTruncated: conflictsTruncated,
       speedsByFrame: speedsByFrame,
       conflictsByFrame: conflictsByFrame,
       totalFrames: totalFrames,
@@ -1201,13 +1213,19 @@
       idx + " / " + maxIdx + " (" + formatNumber(framePayload.timestampS, 1, "0.0") + "s)";
     dom.replayMediaCaption.textContent =
       dataset.runId + " · 帧 #" + idx + " · " + riskText(framePayload.riskLevel) +
-      (state.replay.isFixture ? " · 测试固件(非实拍)" : "");
+      (state.replay.isFixture ? " · 测试固件(非实拍)" : "") +
+      (state.replay.noVideo ? " · 纯轨迹回放（无标注视频）" : "");
 
     if (dom.replayFrameImg && (state.replay.useJpegFallback || !state.replay.playing)) {
-      dom.replayFrameImg.hidden = false;
-      dom.replayVideo.hidden = true;
-      dom.replayFrameImg.src =
-        "/api/runs/" + encodeURIComponent(dataset.runId) + "/frame?index=" + idx;
+      if (state.replay.noVideo) {
+        dom.replayFrameImg.hidden = true;
+        dom.replayVideo.hidden = true;
+      } else {
+        dom.replayFrameImg.hidden = false;
+        dom.replayVideo.hidden = true;
+        dom.replayFrameImg.src =
+          "/api/runs/" + encodeURIComponent(dataset.runId) + "/frame?index=" + idx;
+      }
     }
 
     if (widgets.roadTwin) {
@@ -1258,11 +1276,11 @@
   function startJpegReplayLoop() {
     state.replay.useJpegFallback = true;
     dom.replayVideo.hidden = true;
-    dom.replayFrameImg.hidden = false;
+    dom.replayFrameImg.hidden = Boolean(state.replay.noVideo);
 
     state.replay.timerId = window.setInterval(function () {
       if (!state.replay.playing || !state.replay.data) return;
-      if (dom.replayFrameImg && !dom.replayFrameImg.complete) return;
+      if (!state.replay.noVideo && dom.replayFrameImg && !dom.replayFrameImg.complete) return;
       var maxIdx = Math.max(0, state.replay.data.totalFrames - 1);
       var nextIdx = state.replay.currentIndex + 1;
       if (nextIdx > maxIdx) nextIdx = 0;
@@ -1274,15 +1292,29 @@
     setMonitorMode("replay");
     state.replay.runId = runId;
     state.replay.useJpegFallback = true;
+    state.replay.noVideo = false;
     state.replay.isFixture = false;
+    if (dom.replayFrameImg) {
+      dom.replayFrameImg.hidden = false;
+      dom.replayFrameImg.onerror = function () {
+        if (state.mode !== "replay" || state.replay.runId !== runId || state.replay.noVideo) return;
+        state.replay.noVideo = true;
+        dom.replayFrameImg.hidden = true;
+        dom.replayFrameImg.removeAttribute("src");
+        if (state.replay.data) {
+          dom.replayMediaCaption.textContent =
+            runId + " · 无标注视频（纯轨迹回放 · 右侧鸟瞰孪生同步运行）";
+        }
+      };
+    }
     setSidebarTarget(runId);
     dom.replayMediaCaption.textContent = "正在加载历史记录 " + runId;
 
     return Promise.all([
       fetchJson("/api/runs/" + encodeURIComponent(runId) + "/summary"),
       fetchJson("/api/runs/" + encodeURIComponent(runId) + "/events"),
-      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/conflicts?limit=500"),
-      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/speeds?limit=500")
+      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/conflicts?limit=5000"),
+      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/speeds?limit=5000")
     ])
       .then(function (results) {
         var dataset = buildRunDataset(runId, results[0], results[1], results[2], results[3]);
@@ -1326,6 +1358,7 @@
     state.liveJob.lastMaxSpeed = null;
     state.liveJob.lastMinTtc = null;
     state.liveJob.activeAlertsCount = 0;
+    state.liveJob.quietPolls = 0;
     state.liveJob.notifiedDone = false;
 
     setMonitorMode("live");
@@ -1333,6 +1366,22 @@
     dom.liveMediaCaption.textContent = "实时流 · " + job.job_id;
     dom.liveJobStatusText.textContent = "状态: " + job.status + " · 0 帧";
     dom.btnStopJob.disabled = false;
+
+    widgets.kpiMaxSpeed.setValue(null);
+    widgets.kpiMinTtc.setValue(null);
+    widgets.kpiActiveAlerts.setValue(0);
+    widgets.kpiFrames.setValue(0);
+    dom.kpiFramesMeta.textContent = "等待视频帧解码...";
+    updateRiskPill(0);
+    if (widgets.pipeline) {
+      widgets.pipeline.setRiskLevel(0);
+    }
+    updateDualEndMirrors({
+      riskLevel: 0,
+      timestampS: 0,
+      driverAlerts: [],
+      pedestrianAlerts: []
+    });
 
     state.liveJob.pollTimerId = window.setInterval(pollLiveJobState, 700);
     pollLiveJobState();
@@ -1359,8 +1408,10 @@
         dom.liveJobStatusText.textContent =
           "作业 " + statusObj.job_id + " · " + statusObj.status + " · " + (statusObj.frames_processed || 0) + " 帧";
 
-        if (alertsObj && Array.isArray(alertsObj.alerts) && alertsObj.alerts.length > 0) {
-          alertsObj.alerts.forEach(function (batch) {
+        var receivedAlerts = alertsObj && Array.isArray(alertsObj.alerts) ? alertsObj.alerts : [];
+        if (receivedAlerts.length > 0) {
+          state.liveJob.quietPolls = 0;
+          receivedAlerts.forEach(function (batch) {
             if (typeof batch.seq === "number" && batch.seq > state.liveJob.sinceSeq) {
               state.liveJob.sinceSeq = batch.seq;
             }
@@ -1394,9 +1445,30 @@
               pedestrianAlerts: batch.pedestrian_alerts || []
             });
           });
+        } else {
+          state.liveJob.quietPolls += 1;
+          var isDone =
+            statusObj.status === "completed" ||
+            statusObj.status === "stopped" ||
+            statusObj.status === "failed";
+          if ((isDone || state.liveJob.quietPolls >= 3) && state.liveJob.activeAlertsCount > 0) {
+            state.liveJob.activeAlertsCount = 0;
+            widgets.kpiActiveAlerts.setValue(0);
+            updateRiskPill(0);
+            if (widgets.pipeline) widgets.pipeline.setRiskLevel(0);
+            updateDualEndMirrors({
+              riskLevel: 0,
+              timestampS: statusObj.latest_timestamp_s || 0,
+              driverAlerts: [],
+              pedestrianAlerts: []
+            });
+          }
         }
 
         if (statusObj.status === "completed" || statusObj.status === "stopped" || statusObj.status === "failed") {
+          if (statusObj.summary && typeof statusObj.summary.max_observed_speed_kmh === "number") {
+            widgets.kpiMaxSpeed.setValue(statusObj.summary.max_observed_speed_kmh);
+          }
           dom.btnStopJob.disabled = true;
           if (statusObj.error) {
             dom.liveMediaCaption.textContent = "作业失败: " + statusObj.error;
@@ -1670,8 +1742,8 @@
     return Promise.all([
       fetchJson("/api/runs/" + encodeURIComponent(runId) + "/summary"),
       fetchJson("/api/runs/" + encodeURIComponent(runId) + "/events"),
-      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/conflicts?limit=500"),
-      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/speeds?limit=500")
+      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/conflicts?limit=5000"),
+      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/speeds?limit=5000")
     ])
       .then(function (results) {
         var dataset = buildRunDataset(runId, results[0], results[1], results[2], results[3]);
@@ -1701,19 +1773,26 @@
   function renderHistoryTimeline(dataset) {
     if (!widgets.speedChart) return;
     var byFrame = {};
+    var hasVehicleRows = dataset.speedRows.some(function (row) {
+      var catLow = String(row.category || "").toLowerCase();
+      return catLow && catLow !== "pedestrian" && catLow !== "person";
+    });
 
     dataset.speedRows.forEach(function (row) {
       var fIdx = parseInt(row.frame_idx, 10);
       if (!Number.isFinite(fIdx)) return;
       var spd = parseFloat(row.speed_kmh) || 0;
+      var catLow = String(row.category || "").toLowerCase();
+      var isPedOnly = catLow === "pedestrian" || catLow === "person";
+      var chartSpeed = (!hasVehicleRows || !isPedOnly) ? spd : 0;
       var t = parseFloat(row.timestamp_s) || fIdx * 0.1;
       var ttc = row.ttc_s !== "" && row.ttc_s != null ? parseFloat(row.ttc_s) : null;
       var risk = parseRiskLevel(row.risk_level);
 
       if (!byFrame[fIdx]) {
-        byFrame[fIdx] = { frameIndex: fIdx, t: t, speedKmh: spd, ttcS: ttc, riskLevel: risk };
+        byFrame[fIdx] = { frameIndex: fIdx, t: t, speedKmh: chartSpeed, ttcS: ttc, riskLevel: risk };
       } else {
-        if (spd > byFrame[fIdx].speedKmh) byFrame[fIdx].speedKmh = spd;
+        if (chartSpeed > byFrame[fIdx].speedKmh) byFrame[fIdx].speedKmh = chartSpeed;
         if (risk > byFrame[fIdx].riskLevel) byFrame[fIdx].riskLevel = risk;
         if (ttc !== null && Number.isFinite(ttc)) {
           if (byFrame[fIdx].ttcS === null || ttc < byFrame[fIdx].ttcS) {
@@ -1869,13 +1948,14 @@
       dom.eventsTbody.appendChild(eFrag);
     }
 
-    // 3. Speeds table
+    // 3. Speeds table (cap DOM rows at 500 for smooth table rendering)
     dom.speedsTbody.textContent = "";
     if (!dataset.speedRows.length) {
       dom.speedsTbody.appendChild(makeEmptyTableRow("该记录暂无轨迹测速明细"));
     } else {
       var sFrag = document.createDocumentFragment();
-      dataset.speedRows.forEach(function (row) {
+      var displaySpeedRows = dataset.speedRows.slice(0, 500);
+      displaySpeedRows.forEach(function (row) {
         var fIdx = parseInt(row.frame_idx, 10) || 0;
         var lvl = parseRiskLevel(row.risk_level);
         var tr = document.createElement("tr");
@@ -1917,11 +1997,25 @@
     });
 
     if (state.historyData) {
-      var count = 0;
-      if (tab === "conflicts") count = state.historyData.conflicts.length;
-      else if (tab === "events") count = state.historyData.events.length;
-      else count = state.historyData.speedRows.length;
-      dom.historyTableMeta.textContent = "共 " + count + " 条记录（点击行跳转回放）";
+      var hd = state.historyData;
+      var metaMsg = "";
+      if (tab === "conflicts") {
+        metaMsg = hd.conflictsTruncated
+          ? ("已加载前 " + hd.conflicts.length + " 条碰撞评估（点击行跳转回放）")
+          : ("共 " + hd.conflicts.length + " 条记录（点击行跳转回放）");
+      } else if (tab === "events") {
+        metaMsg = "共 " + hd.events.length + " 条记录（点击行跳转回放）";
+      } else {
+        var shownSpeed = Math.min(hd.speedRows.length, 500);
+        if (hd.speedsTruncated) {
+          metaMsg = "展示前 " + shownSpeed + " 条 / CSV 总计 " + hd.speedsTotalRows + " 行（已加载前 " + hd.speedRows.length + " 行用于时间轴与孪生）";
+        } else if (hd.speedRows.length > shownSpeed) {
+          metaMsg = "表内展示前 " + shownSpeed + " / " + hd.speedRows.length + " 条（点击行跳转回放）";
+        } else {
+          metaMsg = "共 " + hd.speedRows.length + " 条记录（点击行跳转回放）";
+        }
+      }
+      dom.historyTableMeta.textContent = metaMsg;
     }
   }
 
@@ -2715,6 +2809,9 @@
     if (widgets.pipeline) {
       widgets.pipeline.setConfig(state.pipelineConfig);
     }
+    if (widgets.roadTwin && typeof widgets.roadTwin.setConfig === "function") {
+      widgets.roadTwin.setConfig(state.pipelineConfig);
+    }
 
     dom.jobDialogSubmit.disabled = true;
     dom.jobDialogSubmit.textContent = "启动中...";
@@ -2871,7 +2968,11 @@
     }
 
     dom.btnReplaySample.addEventListener("click", function () {
-      var targetId = (state.runs.length && state.runs[0].run_id) || SAMPLE_RUN_FALLBACK;
+      if (!state.runs.length) {
+        showToast("暂无可回放的历史分析记录，请先导入视频分析");
+        return;
+      }
+      var targetId = state.runs[0].run_id || SAMPLE_RUN_FALLBACK;
       enterReplayMode(targetId, 0);
     });
 
@@ -2919,12 +3020,18 @@
       state.pipelineConfig.stitching = Boolean(dom.toggleStitching.checked);
       updateAlgorithmBadges();
       if (widgets.pipeline) widgets.pipeline.setConfig(state.pipelineConfig);
+      if (widgets.roadTwin && typeof widgets.roadTwin.setConfig === "function") {
+        widgets.roadTwin.setConfig(state.pipelineConfig);
+      }
     });
 
     dom.toggleCyclistVru.addEventListener("change", function () {
       state.pipelineConfig.cyclistVru = Boolean(dom.toggleCyclistVru.checked);
       updateAlgorithmBadges();
       if (widgets.pipeline) widgets.pipeline.setConfig(state.pipelineConfig);
+      if (widgets.roadTwin && typeof widgets.roadTwin.setConfig === "function") {
+        widgets.roadTwin.setConfig(state.pipelineConfig);
+      }
     });
 
     document.querySelectorAll(".pipeline-node").forEach(function (node) {

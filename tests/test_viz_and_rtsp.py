@@ -22,6 +22,7 @@ from analysis.pipeline import ConflictPerceptionPipeline
 from analysis.schema import load_json_strict, validate_run
 from analysis.speed import SpeedReading
 from analysis.visualization import EnhancedConflictVisualizer
+from tracking.records import FrameRecord, TargetRecord
 
 
 def _sample_calibrator() -> RoadCalibrator:
@@ -625,6 +626,91 @@ class TestPipelineObbAndRtspReconnect(unittest.TestCase):
         hud_calls = [c for c in calls if "CRITICAL CONFLICT ALERT" in c[0]]
         self.assertEqual(len(hud_calls), 1)
         self.assertLess(hud_calls[0][2], 0.65)
+
+    def test_pipeline_renders_non_overlapping_badges_and_reserves_hud_zone(self):
+        calib = _sample_calibrator()
+        pipe = ConflictPerceptionPipeline(calibrator=calib, speed_model="ema")
+
+        raw_cap = mock.Mock()
+        raw_cap.isOpened.return_value = True
+        raw_cap.get.side_effect = lambda prop: {
+            cv2.CAP_PROP_FPS: 10.0,
+            cv2.CAP_PROP_FRAME_WIDTH: 800.0,
+            cv2.CAP_PROP_FRAME_HEIGHT: 600.0,
+            cv2.CAP_PROP_POS_MSEC: 0.0,
+        }.get(prop, 0.0)
+        raw_cap.read.return_value = (True, np.zeros((600, 800, 3), dtype=np.uint8))
+
+        t1 = TargetRecord(
+            track_id=1,
+            class_id=2,
+            class_name="car",
+            category="vehicle",
+            confidence=0.92,
+            bbox_xyxy=(280.0, 220.0, 360.0, 320.0),
+            anchor_xy=(320.0, 320.0),
+        )
+        t2 = TargetRecord(
+            track_id=2,
+            class_id=0,
+            class_name="person",
+            category="pedestrian",
+            confidence=0.89,
+            bbox_xyxy=(284.0, 220.0, 340.0, 315.0),
+            anchor_xy=(312.0, 315.0),
+        )
+        t_top = TargetRecord(
+            track_id=3,
+            class_id=0,
+            class_name="person",
+            category="pedestrian",
+            confidence=0.88,
+            bbox_xyxy=(380.0, 18.0, 420.0, 160.0),
+            anchor_xy=(400.0, 160.0),
+        )
+        fake_sess = mock.Mock()
+        fake_sess.process.return_value = FrameRecord(
+            session_id="viz-pipe-test",
+            source="dummy.mp4",
+            frame_index=0,
+            timestamp_s=0.0,
+            timestamp_source="fps_estimate",
+            width=800,
+            height=600,
+            tracks=[t1, t2, t_top],
+        )
+        fake_sess.retained_ids.return_value = {1, 2, 3}
+
+        drawn_rects = []
+        orig_badge = pipe.visualizer.draw_speed_badge
+
+        def _spy_badge(frame, box_xyxy, reading, conflict=None, event_id=None):
+            active = pipe.visualizer._frame_badge_rects
+            self.assertIsNotNone(active)
+            before = len(active)
+            orig_badge(frame, box_xyxy, reading, conflict, event_id=event_id)
+            self.assertEqual(len(active), before + 1)
+            drawn_rects.append(active[-1])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "pipe_badge_out"
+            with (
+                mock.patch("analysis.pipeline.cv2.VideoCapture", return_value=raw_cap),
+                mock.patch("analysis.pipeline.TrackingSession", return_value=fake_sess),
+                mock.patch.object(pipe.visualizer, "draw_speed_badge", side_effect=_spy_badge),
+            ):
+                summary = pipe.process_video("dummy.mp4", out_dir, max_frames=1)
+
+            self.assertEqual(summary["status"], "ok")
+            self.assertEqual(len(drawn_rects), 3)
+            for idx_a in range(len(drawn_rects)):
+                ra = drawn_rects[idx_a]
+                # All badges stay clear of the top 50px HUD banner
+                self.assertGreaterEqual(ra[1], 50)
+                for idx_b in range(idx_a + 1, len(drawn_rects)):
+                    rb = drawn_rects[idx_b]
+                    overlaps = not (ra[2] <= rb[0] or ra[0] >= rb[2] or ra[3] <= rb[1] or ra[1] >= rb[3])
+                    self.assertFalse(overlaps)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import socket
 import sys
 import tempfile
 import threading
@@ -1045,6 +1047,41 @@ class TestStandaloneDesktopHost(unittest.TestCase):
                 desktop_mod.main(["--host", "   "])
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 desktop_mod.main(["--port", "70000"])
+
+    def test_bind_server_rejects_already_occupied_explicit_port(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calib_file = root / "calib.yaml"
+            RoadCalibrator(
+                [(200.0, 120.0), (600.0, 120.0), (760.0, 520.0), (40.0, 520.0)],
+                8.0,
+                24.0,
+            ).to_yaml(calib_file)
+            service = AnalysisService(runs_root=root / "runs", default_calib=calib_file)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+                occupied.bind(("127.0.0.1", 0))
+                occupied.listen(1)
+                occupied_port = int(occupied.getsockname()[1])
+                with self.assertRaises(OSError):
+                    desktop_mod._bind_server_with_port_scan(service, "127.0.0.1", occupied_port)
+
+    def test_frontend_web_contract_and_zero_emoji(self):
+        web_dir = REPO_ROOT / "analysis" / "web"
+        html = (web_dir / "index.html").read_text(encoding="utf-8")
+        app_js = (web_dir / "assets" / "app.js").read_text(encoding="utf-8")
+        motion_js = (web_dir / "assets" / "motion.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="btn-replay-sample" class="btn btn-ghost" hidden', html)
+        self.assertIn("widgets.roadTwin.setConfig", app_js)
+        self.assertIn("dom.replayFrameImg.onerror", app_js)
+        self.assertIn("CampusRoadTwinCanvas.prototype.setConfig", motion_js)
+        self.assertIn("SCENARIO_CYCLE_S", motion_js)
+
+        emoji_re = re.compile(
+            "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0000FE0F]"
+        )
+        for rel, content in (("index.html", html), ("app.js", app_js), ("motion.js", motion_js)):
+            self.assertIsNone(emoji_re.search(content), f"{rel} 发现未清理的 emoji 字符")
 
 
 if __name__ == "__main__":

@@ -335,7 +335,7 @@ class EnhancedConflictVisualizer:
         if active_rects is not None:
             step_y = box_h + 4
             candidates_y = [by2]
-            for mul in range(1, 6):
+            for mul in range(1, 8):
                 candidates_y.append(by2 - mul * step_y)
                 candidates_y.append(by2 + mul * step_y)
             for cand_by2 in candidates_y:

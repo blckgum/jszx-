@@ -80,6 +80,29 @@ _ALLOWED_RUN_EXPORT_FILES: Dict[str, str] = {
     "annotated_conflict.mp4": "video/mp4",
 }
 _ALLOWED_DIALOG_KINDS = ("video", "calib", "folder")
+_ALLOWED_JOB_REQUEST_KEYS = frozenset({
+    "source",
+    "calib_path",
+    "demo",
+    "allow_legacy_calib",
+    "output_dir",
+    "max_frames",
+    "speed_limit_kmh",
+    "speed_model",
+    "conflict_model",
+    "enable_stitching",
+    "include_cyclist_vru",
+    "compensate_anchor_bias",
+    "live_drop_stale_frames",
+    "live_reconnect_attempts",
+    "live_reconnect_delay_s",
+    "weights",
+    "tracker_config",
+    "object_policy_config",
+    "fps",
+    "device",
+    "conf",
+})
 _DIALOG_LOCK = threading.Lock()
 _VIDEO_STREAM_CHUNK_SIZE = 65536
 
@@ -1202,7 +1225,13 @@ class AnalysisService:
         """探测运行环境、图形文件对话框能力、CUDA 可用性及本地权重清单。"""
         can_browse = False
         try:
-            can_browse = importlib.util.find_spec("tkinter") is not None
+            if importlib.util.find_spec("tkinter") is not None:
+                if sys.platform.startswith("linux"):
+                    can_browse = bool(
+                        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+                    )
+                else:
+                    can_browse = True
         except Exception:
             can_browse = False
 
@@ -2044,30 +2073,7 @@ def create_http_server(
                     body = self._read_json_body()
                     if "source" not in body:
                         raise ValueError("请求体缺少必需字段: source")
-                    allowed_keys = {
-                        "source",
-                        "calib_path",
-                        "demo",
-                        "allow_legacy_calib",
-                        "output_dir",
-                        "max_frames",
-                        "speed_limit_kmh",
-                        "speed_model",
-                        "conflict_model",
-                        "enable_stitching",
-                        "include_cyclist_vru",
-                        "compensate_anchor_bias",
-                        "live_drop_stale_frames",
-                        "live_reconnect_attempts",
-                        "live_reconnect_delay_s",
-                        "weights",
-                        "tracker_config",
-                        "object_policy_config",
-                        "fps",
-                        "device",
-                        "conf",
-                    }
-                    unknown = set(body.keys()) - allowed_keys
+                    unknown = set(body.keys()) - _ALLOWED_JOB_REQUEST_KEYS
                     if unknown:
                         raise ValueError(f"包含不支持的作业参数: {', '.join(sorted(unknown))}")
                     job = service.start_job(**body)
@@ -2408,6 +2414,9 @@ def create_fastapi_app(service: Optional[AnalysisService] = None):
             _reject_non_finite_tree(body, "request_body")
             if not isinstance(body, dict) or "source" not in body:
                 raise ValueError("请求体必须是包含 source 字段的 JSON 对象")
+            unknown = set(body.keys()) - _ALLOWED_JOB_REQUEST_KEYS
+            if unknown:
+                raise ValueError(f"包含不支持的作业参数: {', '.join(sorted(unknown))}")
             return _json_response(svc.start_job(**body), status_code=201)
         except Exception as exc:
             _raise_http(exc)

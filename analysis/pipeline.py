@@ -793,29 +793,46 @@ class ConflictPerceptionPipeline:
                     render_frame, r, color=trajectory_color(c)
                 )
 
-            for t in tracks:
-                if t.track_id is None:
-                    continue
-                if self.enable_stitching and self.stitcher is not None:
-                    # 仅对本帧通过标定区筛选并完成缝合映射的区内目标渲染徽章，禁止区外旧 raw_id 回退撞名
-                    if t.track_id not in id_map:
+            occupied_badge_rects: list[tuple[int, int, int, int]] = []
+            if render_frame.shape[0] > 120:
+                has_ssm = any(
+                    getattr(c, "mttc_seconds", None) is not None
+                    or getattr(c, "drac_ms2", None) is not None
+                    or getattr(c, "pet_seconds", None) is not None
+                    or getattr(c, "collision_prob", None) is not None
+                    for c in conflicts
+                )
+                hud_reserve_h = 76 if has_ssm else 50
+                occupied_badge_rects.append((0, 0, render_frame.shape[1], hud_reserve_h))
+
+            prev_badge_rects = getattr(self.visualizer, "_frame_badge_rects", None)
+            self.visualizer._frame_badge_rects = occupied_badge_rects
+            try:
+                for t in tracks:
+                    if t.track_id is None:
                         continue
-                    eff_id = id_map[t.track_id]
-                else:
-                    # 未开启缝合时同样跳过已进入 out_of_zone_ids 的标定区外目标
-                    if t.track_id in out_of_zone_ids:
-                        continue
-                    eff_id = t.track_id
-                r = reading_map.get(eff_id)
-                if r:
-                    c = conflict_map.get(eff_id) or ped_conflict_map.get(eff_id)
-                    eid = (
-                        event_ids.get((c.veh_track_id, c.ped_track_id))
-                        if c is not None else None
-                    )
-                    self.visualizer.draw_speed_badge(
-                        render_frame, t.bbox_xyxy, r, c, event_id=eid
-                    )
+                    if self.enable_stitching and self.stitcher is not None:
+                        # 仅对本帧通过标定区筛选并完成缝合映射的区内目标渲染徽章，禁止区外旧 raw_id 回退撞名
+                        if t.track_id not in id_map:
+                            continue
+                        eff_id = id_map[t.track_id]
+                    else:
+                        # 未开启缝合时同样跳过已进入 out_of_zone_ids 的标定区外目标
+                        if t.track_id in out_of_zone_ids:
+                            continue
+                        eff_id = t.track_id
+                    r = reading_map.get(eff_id)
+                    if r:
+                        c = conflict_map.get(eff_id) or ped_conflict_map.get(eff_id)
+                        eid = (
+                            event_ids.get((c.veh_track_id, c.ped_track_id))
+                            if c is not None else None
+                        )
+                        self.visualizer.draw_speed_badge(
+                            render_frame, t.bbox_xyxy, r, c, event_id=eid
+                        )
+            finally:
+                self.visualizer._frame_badge_rects = prev_badge_rects
 
             for c in conflicts:
                 self.visualizer.draw_conflict_link(render_frame, c, reading_map)
