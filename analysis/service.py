@@ -46,6 +46,118 @@ from .schema import (
 )
 
 
+DEFAULT_WEB_ROOT = Path(__file__).resolve().parent / "web"
+
+_WEB_MIME_TYPES: Dict[str, str] = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".json": "application/json; charset=utf-8",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+}
+_VIDEO_PRESET_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
+_CALIB_PRESET_EXTS = {".yaml", ".yml"}
+_NON_CALIB_CONFIG_NAMES = {
+    "bytetrack.yaml",
+    "motion.yaml",
+    "object_policy.yaml",
+    "ground_truth.example.yaml",
+    "traffic.example.yaml",
+}
+_VIDEO_STREAM_CHUNK_SIZE = 65536
+
+
+def _decode_and_validate_asset_subpath(raw_subpath: str) -> str:
+    """逐段解码并校验 /assets/ 子路径，在路径拼接前阻断目录穿越与非法分隔符。"""
+    if not isinstance(raw_subpath, str) or not raw_subpath.strip():
+        raise ValueError("静态资源路径不能为空")
+    if "\x00" in raw_subpath or "\\" in raw_subpath or ":" in raw_subpath or raw_subpath.startswith("/"):
+        raise ValueError(f"非法的静态资源路径: {raw_subpath}")
+
+    decoded_parts: List[str] = []
+    for raw_seg in raw_subpath.split("/"):
+        seg = unquote(raw_seg)
+        twice = unquote(seg)
+        if (
+            not seg
+            or not seg.strip()
+            or seg in (".", "..")
+            or twice in (".", "..")
+            or ".." in seg
+            or ".." in twice
+            or "/" in seg
+            or "/" in twice
+            or "\\" in seg
+            or "\\" in twice
+            or ":" in seg
+            or ":" in twice
+            or "\x00" in seg
+            or "\x00" in twice
+        ):
+            raise ValueError(f"非法的静态资源路径: {raw_subpath}")
+        decoded_parts.append(seg)
+    return "/".join(decoded_parts)
+
+
+def _parse_http_byte_range(range_header: str, total_size: int) -> Optional[tuple[int, int]]:
+    """解析单个 HTTP Range 字节区间；不可满足或格式非法返回 None（对应 416）。"""
+    if total_size <= 0 or not isinstance(range_header, str):
+        return None
+    stripped = range_header.strip()
+    if not stripped.lower().startswith("bytes="):
+        return None
+    spec = stripped[6:].strip()
+    if not spec or "," in spec or "-" not in spec:
+        return None
+    start_str, _, end_str = spec.partition("-")
+    if "-" in end_str:
+        return None
+    start_str = start_str.strip()
+    end_str = end_str.strip()
+    if not start_str and not end_str:
+        return None
+    if not start_str:
+        if not (end_str.isascii() and end_str.isdigit()):
+            return None
+        suffix_len = int(end_str)
+        if suffix_len <= 0:
+            return None
+        start = max(0, total_size - suffix_len)
+        return start, total_size - 1
+    if not (start_str.isascii() and start_str.isdigit()):
+        return None
+    start = int(start_str)
+    if start >= total_size:
+        return None
+    if not end_str:
+        return start, total_size - 1
+    if not (end_str.isascii() and end_str.isdigit()):
+        return None
+    end = int(end_str)
+    if start > end:
+        return None
+    return start, min(end, total_size - 1)
+
+
+def _iter_file_range(
+    path: Path, start: int, end: int, chunk_size: int = _VIDEO_STREAM_CHUNK_SIZE
+):
+    """按固定块大小流式读取文件闭区间 [start, end]。"""
+    remaining = max(0, end - start + 1)
+    if remaining == 0:
+        return
+    with path.open("rb") as stream:
+        stream.seek(start)
+        while remaining > 0:
+            chunk = stream.read(min(chunk_size, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
 def _is_finite_real(value: Any) -> bool:
     """判断输入是否为非布尔的有限实数（兼容 Python 与 NumPy 标量）。"""
     if value is None or type(value) is bool or isinstance(value, np.bool_):
@@ -368,20 +480,63 @@ class AnalysisService:
         runs_root: str | Path = "runs/analysis",
         *,
         default_calib: str | Path = "configs/calibration.yaml",
+        web_root: Optional[str | Path] = None,
         max_alert_queue: int = 200,
     ):
         if is_blank_path(runs_root) or type(runs_root) is bool or not isinstance(runs_root, (str, os.PathLike)):
             raise ValueError("runs_root 必须是非空目录路径")
         if is_blank_path(default_calib) or type(default_calib) is bool or not isinstance(default_calib, (str, os.PathLike)):
             raise ValueError("default_calib 必须是非空文件路径")
+        if web_root is not None and (
+            is_blank_path(web_root) or type(web_root) is bool or not isinstance(web_root, (str, os.PathLike))
+        ):
+            raise ValueError("web_root 必须是非空目录路径")
         if type(max_alert_queue) is not int or max_alert_queue < 1:
             raise ValueError("max_alert_queue 必须是 >= 1 的整数")
 
         self.runs_root = Path(runs_root).expanduser().resolve()
         self.default_calib = Path(default_calib).expanduser().resolve()
+        self.web_root = (
+            Path(web_root).expanduser().resolve() if web_root is not None else DEFAULT_WEB_ROOT
+        )
         self.max_alert_queue = max_alert_queue
         self._lock = threading.Lock()
         self._jobs: Dict[str, _ServiceJob] = {}
+
+    def resolve_web_asset(self, rel_path: str) -> tuple[Path, str]:
+        """严格校验并解析 Web 控制台静态资源路径与 MIME 类型。"""
+        if not isinstance(rel_path, str) or not rel_path.strip():
+            raise ValueError("静态资源路径不能为空")
+
+        decoded = unquote(rel_path)
+        twice = unquote(decoded)
+        for candidate in (rel_path, decoded, twice):
+            if (
+                not candidate.strip()
+                or candidate.startswith("/")
+                or "\\" in candidate
+                or ":" in candidate
+                or "\x00" in candidate
+                or ".." in candidate
+            ):
+                raise ValueError(f"非法的静态资源路径: {rel_path}")
+
+        parts = decoded.split("/")
+        if any(not part or part in (".", "..") for part in parts):
+            raise ValueError(f"非法的静态资源路径: {rel_path}")
+
+        base_root = self.web_root.resolve()
+        target = (base_root / "/".join(parts)).resolve()
+        # 确认解析后的真实路径仍在 web_root 目录内部且不是根目录自身。
+        if target == base_root or not target.is_relative_to(base_root):
+            raise ValueError(f"静态资源路径越出根目录: {rel_path}")
+
+        media_type = _WEB_MIME_TYPES.get(target.suffix.lower())
+        if media_type is None:
+            raise ValueError(f"不支持的静态资源类型: {target.suffix or '<none>'}")
+        if not target.is_file():
+            raise FileNotFoundError(f"未找到静态资源文件: {rel_path}")
+        return target, media_type
 
     def _resolve_run_dir(self, run_id: str) -> Path:
         """校验 run_id 为单层安全目录名，彻底阻止目录穿越与空白路径。"""
@@ -510,6 +665,120 @@ class AnalysisService:
             "total_rows": total_rows,
             "truncated": total_rows > len(rows),
             "rows": rows,
+        }
+
+    def get_run_conflicts(self, run_id: str, *, limit: Optional[int] = 300) -> List[dict]:
+        """严格读取指定运行目录的 conflicts.jsonl 帧级冲突序列。"""
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError("limit 必须是非负整数")
+        run_dir = self._resolve_run_dir(run_id)
+        conflicts_path = run_dir / "conflicts.jsonl"
+        if not conflicts_path.is_file():
+            return []
+        rows = load_jsonl_strict(conflicts_path)
+        return rows[:limit] if limit is not None else rows
+
+    def get_run_video_path(self, run_id: str) -> Path:
+        """校验并返回指定运行目录中标注输出视频 annotated_conflict.mp4 的安全路径。"""
+        run_dir = self._resolve_run_dir(run_id)
+        video_path = (run_dir / "annotated_conflict.mp4").resolve()
+        if video_path == run_dir or not video_path.is_relative_to(run_dir):
+            raise ValueError(f"非法的视频路径（越出运行目录）: {run_id}")
+        if not video_path.is_file():
+            raise FileNotFoundError(f"运行目录缺少 annotated_conflict.mp4: {run_id}")
+        return video_path
+
+    def get_run_frame_jpeg(self, run_id: str, frame_index: int = 0) -> bytes:
+        """从历史运行输出视频按帧号截取一帧并编码为 JPEG 字节流。"""
+        if type(frame_index) is not int or frame_index < 0:
+            raise ValueError("frame_index 必须是非负整数")
+        video_path = self.get_run_video_path(run_id)
+        cap = cv2.VideoCapture(str(video_path))
+        try:
+            if not cap.isOpened():
+                raise RuntimeError(f"无法打开运行视频文件: {video_path.name}")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, float(frame_index))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise FileNotFoundError(f"未找到指定视频帧: {frame_index}")
+            ok_enc, buf = cv2.imencode(
+                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 86]
+            )
+            if not ok_enc:
+                raise RuntimeError("视频帧 JPEG 编码失败")
+            return bytes(buf)
+        finally:
+            cap.release()
+
+    @staticmethod
+    def _format_preset_label(path: Path, *, roots: Iterable[Path]) -> str:
+        """优先返回相对仓库/工作区根的 POSIX 显示标签，回退至文件名。"""
+        for base in roots:
+            try:
+                return path.relative_to(base).as_posix()
+            except ValueError:
+                continue
+        return path.name
+
+    def list_presets(self) -> dict:
+        """发现本地预置测试视频与标定配置文件，返回供前端一键选用的规范条目。"""
+        cwd_resolved = Path.cwd().resolve()
+        label_roots = (cwd_resolved, self.runs_root.parent)
+
+        video_dirs = (
+            self.runs_root.parent / "tracking-fixtures",
+            cwd_resolved / "runs" / "tracking-fixtures",
+        )
+        seen_videos: Dict[Path, dict] = {}
+        for vdir in video_dirs:
+            if not vdir.is_dir():
+                continue
+            for entry in vdir.rglob("*"):
+                try:
+                    rel_parts = entry.relative_to(vdir).parts
+                except ValueError:
+                    continue
+                if any(part.startswith(".") for part in rel_parts):
+                    continue
+                if not entry.is_file() or entry.suffix.lower() not in _VIDEO_PRESET_EXTS:
+                    continue
+                resolved = entry.resolve()
+                if resolved not in seen_videos:
+                    seen_videos[resolved] = {
+                        "label": self._format_preset_label(resolved, roots=label_roots),
+                        "path": str(resolved),
+                    }
+
+        calib_dir = self.default_calib.parent
+        seen_calibs: Dict[Path, dict] = {}
+        if calib_dir.is_dir():
+            for entry in calib_dir.rglob("*"):
+                try:
+                    rel_parts = entry.relative_to(calib_dir).parts
+                except ValueError:
+                    continue
+                if any(part.startswith(".") for part in rel_parts):
+                    continue
+                if not entry.is_file() or entry.suffix.lower() not in _CALIB_PRESET_EXTS:
+                    continue
+                resolved = entry.resolve()
+                if (
+                    entry.name.lower() in _NON_CALIB_CONFIG_NAMES
+                    and resolved != self.default_calib
+                ):
+                    continue
+                if resolved not in seen_calibs:
+                    seen_calibs[resolved] = {
+                        "label": self._format_preset_label(resolved, roots=label_roots),
+                        "path": str(resolved),
+                    }
+
+        videos = sorted(seen_videos.values(), key=lambda item: (item["label"], item["path"]))
+        calibs = sorted(seen_calibs.values(), key=lambda item: (item["label"], item["path"]))
+        return {
+            "videos": videos,
+            "calibs": calibs,
+            "default_calib": str(self.default_calib),
         }
 
     def _resolve_job_calibrator(
@@ -823,6 +1092,46 @@ class AnalysisService:
                 break
 
 
+_WEB_ASSET_HEADERS: Dict[str, str] = {
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-cache",
+}
+
+
+def _prepare_video_stream(
+    service: AnalysisService, run_id: str, range_header: Optional[str]
+) -> tuple[int, Dict[str, str], Any]:
+    """准备视频流或 Byte-Range 响应元信息与 64KB 分块迭代器。"""
+    video_path = service.get_run_video_path(run_id)
+    total = video_path.stat().st_size
+    if not range_header:
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(total),
+        }
+        body_iter = _iter_file_range(video_path, 0, total - 1) if total > 0 else iter(())
+        return int(HTTPStatus.OK), headers, body_iter
+
+    parsed_range = _parse_http_byte_range(range_header, total)
+    if parsed_range is None:
+        err_body = _json_dumps({"error": "Range Not Satisfiable"}).encode("utf-8")
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Range": f"bytes */{total}",
+            "Content-Length": str(len(err_body)),
+        }
+        return int(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE), headers, err_body
+
+    start, end = parsed_range
+    length = end - start + 1
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Range": f"bytes {start}-{end}/{total}",
+        "Content-Length": str(length),
+    }
+    return int(HTTPStatus.PARTIAL_CONTENT), headers, _iter_file_range(video_path, start, end)
+
+
 class _AnalysisThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -852,6 +1161,23 @@ def create_http_server(
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_bytes(
+            self,
+            status_code: int,
+            body: bytes,
+            content_type: str,
+            *,
+            extra_headers: Optional[Dict[str, str]] = None,
+        ) -> None:
+            self.send_response(status_code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            if extra_headers:
+                for key, val in extra_headers.items():
+                    self.send_header(key, val)
             self.end_headers()
             self.wfile.write(body)
 
@@ -899,6 +1225,27 @@ def create_http_server(
             segments = [unquote(seg) for seg in raw_path.strip("/").split("/") if seg]
 
             try:
+                if raw_path in ("/", "/index.html"):
+                    asset_path, media_type = service.resolve_web_asset("index.html")
+                    self._send_bytes(
+                        HTTPStatus.OK,
+                        asset_path.read_bytes(),
+                        media_type,
+                        extra_headers=_WEB_ASSET_HEADERS,
+                    )
+                    return
+
+                if raw_path.startswith("/assets/"):
+                    subpath = _decode_and_validate_asset_subpath(raw_path[len("/assets/"):])
+                    asset_path, media_type = service.resolve_web_asset(f"assets/{subpath}")
+                    self._send_bytes(
+                        HTTPStatus.OK,
+                        asset_path.read_bytes(),
+                        media_type,
+                        extra_headers=_WEB_ASSET_HEADERS,
+                    )
+                    return
+
                 if raw_path == "/api/health":
                     jobs = service.list_jobs()
                     active = sum(1 for item in jobs if item["status"] in ("queued", "running"))
@@ -908,6 +1255,10 @@ def create_http_server(
                         "runs_root": str(service.runs_root),
                         "active_jobs": active,
                     })
+                    return
+
+                if raw_path == "/api/presets":
+                    self._send_json(HTTPStatus.OK, service.list_presets())
                     return
 
                 if raw_path == "/api/runs":
@@ -934,6 +1285,52 @@ def create_http_server(
                         limit = self._parse_int_query(query, "limit", 100)
                         assert limit is not None
                         self._send_json(HTTPStatus.OK, service.get_run_speeds_preview(run_id, limit=limit))
+                        return
+                    if sub == "conflicts":
+                        limit = self._parse_int_query(query, "limit", 300)
+                        conflicts = service.get_run_conflicts(run_id, limit=limit)
+                        self._send_json(HTTPStatus.OK, {
+                            "run_id": run_id,
+                            "count": len(conflicts),
+                            "conflicts": conflicts,
+                        })
+                        return
+                    if sub == "frame":
+                        frame_index = self._parse_int_query(query, "index", 0)
+                        assert frame_index is not None
+                        jpeg_bytes = service.get_run_frame_jpeg(run_id, frame_index=frame_index)
+                        self._send_bytes(
+                            HTTPStatus.OK,
+                            jpeg_bytes,
+                            "image/jpeg",
+                            extra_headers={"Cache-Control": "public, max-age=60"},
+                        )
+                        return
+                    if sub == "video":
+                        status_code, headers, body = _prepare_video_stream(
+                            service, run_id, self.headers.get("Range")
+                        )
+                        if status_code == int(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE):
+                            self._send_bytes(
+                                status_code,
+                                body,
+                                "application/json; charset=utf-8",
+                                extra_headers={
+                                    "Accept-Ranges": headers["Accept-Ranges"],
+                                    "Content-Range": headers["Content-Range"],
+                                },
+                            )
+                            return
+                        self.send_response(status_code)
+                        self.send_header("Content-Type", "video/mp4")
+                        for k, v in headers.items():
+                            self.send_header(k, v)
+                        self.end_headers()
+                        try:
+                            for chunk in body:
+                                self.wfile.write(chunk)
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                            self.close_connection = True
                         return
 
                 if raw_path == "/api/jobs":
@@ -1069,6 +1466,32 @@ def create_fastapi_app(service: Optional[AnalysisService] = None):
             raise HTTPException(status_code=404, detail=str(exc)) from None
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from None
 
+    @app.get("/")
+    @app.get("/index.html")
+    def web_index():
+        try:
+            asset_path, media_type = svc.resolve_web_asset("index.html")
+            return Response(
+                content=asset_path.read_bytes(),
+                media_type=media_type,
+                headers=dict(_WEB_ASSET_HEADERS),
+            )
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.get("/assets/{subpath:path}")
+    def web_asset(subpath: str):
+        try:
+            clean_sub = _decode_and_validate_asset_subpath(subpath)
+            asset_path, media_type = svc.resolve_web_asset(f"assets/{clean_sub}")
+            return Response(
+                content=asset_path.read_bytes(),
+                media_type=media_type,
+                headers=dict(_WEB_ASSET_HEADERS),
+            )
+        except Exception as exc:
+            _raise_http(exc)
+
     @app.get("/api/health")
     def health():
         jobs = svc.list_jobs()
@@ -1079,6 +1502,10 @@ def create_fastapi_app(service: Optional[AnalysisService] = None):
             "runs_root": str(svc.runs_root),
             "active_jobs": active,
         })
+
+    @app.get("/api/presets")
+    def list_presets():
+        return _json_response(svc.list_presets())
 
     @app.get("/api/runs")
     def list_runs():
@@ -1104,6 +1531,52 @@ def create_fastapi_app(service: Optional[AnalysisService] = None):
     def run_speeds(run_id: str, limit: int = 100):
         try:
             return _json_response(svc.get_run_speeds_preview(run_id, limit=limit))
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.get("/api/runs/{run_id}/conflicts")
+    def run_conflicts(run_id: str, limit: Optional[int] = 300):
+        try:
+            conflicts = svc.get_run_conflicts(run_id, limit=limit)
+            return _json_response({
+                "run_id": run_id,
+                "count": len(conflicts),
+                "conflicts": conflicts,
+            })
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.get("/api/runs/{run_id}/frame")
+    def run_frame(run_id: str, index: int = 0):
+        try:
+            jpeg_bytes = svc.get_run_frame_jpeg(run_id, frame_index=index)
+            return Response(
+                content=jpeg_bytes,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "public, max-age=60"},
+            )
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.get("/api/runs/{run_id}/video")
+    def run_video(run_id: str, request: Request):
+        try:
+            status_code, headers, body = _prepare_video_stream(
+                svc, run_id, request.headers.get("range")
+            )
+            if status_code == int(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE):
+                return Response(
+                    content=body,
+                    status_code=status_code,
+                    media_type="application/json; charset=utf-8",
+                    headers=headers,
+                )
+            return StreamingResponse(
+                body,
+                status_code=status_code,
+                media_type="video/mp4",
+                headers=headers,
+            )
         except Exception as exc:
             _raise_http(exc)
 

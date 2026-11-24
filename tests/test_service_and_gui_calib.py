@@ -6,6 +6,7 @@ from __future__ import annotations
 import builtins
 import contextlib
 import csv
+import http.client
 import io
 import json
 import sys
@@ -38,6 +39,7 @@ from analysis.schema import (
 )
 from analysis.service import (
     AnalysisService,
+    DEFAULT_WEB_ROOT,
     LatestFrameCapture,
     create_fastapi_app,
     create_http_server,
@@ -510,7 +512,7 @@ class TestAnalysisServiceAndBackend(unittest.TestCase):
 
         fake_responses = types.ModuleType("fastapi.responses")
         fake_responses.Response = dict
-        fake_responses.StreamingResponse = dict
+        fake_responses.StreamingResponse = lambda content, **kw: {"content": content, **kw}
 
         with tempfile.TemporaryDirectory() as tmp:
             svc = AnalysisService(Path(tmp))
@@ -521,13 +523,322 @@ class TestAnalysisServiceAndBackend(unittest.TestCase):
                 app = create_fastapi_app(svc)
             self.assertIsInstance(app, _FakeFastAPI)
             paths = {(m, p) for m, p, _ in registered_routes}
+            self.assertIn(("GET", "/"), paths)
+            self.assertIn(("GET", "/index.html"), paths)
+            self.assertIn(("GET", "/assets/{subpath:path}"), paths)
             self.assertIn(("GET", "/api/health"), paths)
+            self.assertIn(("GET", "/api/presets"), paths)
+            self.assertIn(("GET", "/api/runs/{run_id}/conflicts"), paths)
+            self.assertIn(("GET", "/api/runs/{run_id}/frame"), paths)
+            self.assertIn(("GET", "/api/runs/{run_id}/video"), paths)
             self.assertIn(("POST", "/api/jobs"), paths)
             self.assertIn(("GET", "/api/jobs/{job_id}/mjpeg"), paths)
             self.assertIn(("WS", "/ws/jobs/{job_id}/alerts"), paths)
 
+            # 直接验证新注册的 FastAPI 路由处理函数（使用桩 Response/StreamingResponse）。
+            route_map = {(m, p): fn for m, p, fn in registered_routes}
+            web_dir = Path(tmp) / "web"
+            (web_dir / "assets").mkdir(parents=True)
+            (web_dir / "index.html").write_text("<html>ok</html>", encoding="utf-8")
+            (web_dir / "assets" / "app.js").write_text("console.log(1);", encoding="utf-8")
+            run_dir = Path(tmp) / "run-fa"
+            run_dir.mkdir()
+            vpath = run_dir / "annotated_conflict.mp4"
+            _write_dummy_video(vpath, n_frames=3, fps=10.0, size=(64, 64))
+            (run_dir / "conflicts.jsonl").write_text(
+                json.dumps({"frame_index": 0, "timestamp_s": 0.0}, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            svc.web_root = web_dir
+
+            idx_resp = route_map[("GET", "/")]()
+            self.assertEqual(idx_resp["media_type"], "text/html; charset=utf-8")
+            self.assertEqual(idx_resp["headers"]["X-Content-Type-Options"], "nosniff")
+
+            js_resp = route_map[("GET", "/assets/{subpath:path}")]("app.js")
+            self.assertEqual(js_resp["media_type"], "application/javascript; charset=utf-8")
+
+            pre_resp = route_map[("GET", "/api/presets")]()
+            self.assertIn("default_calib", json.loads(pre_resp["content"]))
+
+            c_resp = route_map[("GET", "/api/runs/{run_id}/conflicts")]("run-fa", limit=10)
+            self.assertEqual(json.loads(c_resp["content"])["count"], 1)
+
+            f_resp = route_map[("GET", "/api/runs/{run_id}/frame")]("run-fa", index=0)
+            self.assertEqual(f_resp["media_type"], "image/jpeg")
+            self.assertTrue(f_resp["content"].startswith(b"\xff\xd8"))
+
+            v_206 = route_map[("GET", "/api/runs/{run_id}/video")](
+                "run-fa", SimpleNamespace(headers={"range": "bytes=0-15"})
+            )
+            self.assertEqual(v_206["status_code"], 206)
+            self.assertEqual(v_206["headers"]["Accept-Ranges"], "bytes")
+            self.assertEqual(len(b"".join(v_206["content"])), 16)
+
+            v_416 = route_map[("GET", "/api/runs/{run_id}/video")](
+                "run-fa", SimpleNamespace(headers={"range": "bytes=9999999-"})
+            )
+            self.assertEqual(v_416["status_code"], 416)
+
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             service_main(["--runs-root", "   "])
+
+    def test_web_assets_conflicts_video_range_frame_and_presets(self):
+        calib = _sample_calibrator()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs_root = root / "runs" / "analysis"
+            runs_root.mkdir(parents=True)
+            fixtures_dir = root / "runs" / "tracking-fixtures" / "cam01"
+            fixtures_dir.mkdir(parents=True)
+            cfg_dir = root / "configs"
+            cfg_dir.mkdir()
+            web_dir = root / "web"
+            (web_dir / "assets" / "sub").mkdir(parents=True)
+
+            # 写入全 7 种允许 MIME 类型的最小静态资源以及不被允许的 .txt 文件。
+            (web_dir / "index.html").write_text("<html><title>CampusMotion</title></html>", encoding="utf-8")
+            (web_dir / "assets" / "styles.css").write_text("body{color:#ededed;}", encoding="utf-8")
+            (web_dir / "assets" / "sub" / "foo.js").write_text("window.ok=true;", encoding="utf-8")
+            (web_dir / "assets" / "icon.svg").write_text("<svg></svg>", encoding="utf-8")
+            (web_dir / "assets" / "manifest.json").write_text("{}", encoding="utf-8")
+            (web_dir / "assets" / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (web_dir / "assets" / "favicon.ico").write_bytes(b"\x00\x00\x01\x00")
+            (web_dir / "assets" / "secret.txt").write_text("nope", encoding="utf-8")
+
+            calib_yaml = cfg_dir / "calibration.yaml"
+            calib.to_yaml(calib_yaml)
+            alt_calib_yml = cfg_dir / "gate_b.yml"
+            calib.to_yaml(alt_calib_yml)
+            # 确认非标定 YAML 不会混入 calibs 预置列表。
+            (cfg_dir / "bytetrack.yaml").write_text("tracker_type: bytetrack\n", encoding="utf-8")
+
+            fixture_vid = fixtures_dir / "clip_a.mp4"
+            _write_dummy_video(fixture_vid, n_frames=5, fps=10.0, size=(320, 240))
+
+            run_dir = self._create_sample_run(runs_root, "run-web-01")
+            conflict_rows = [
+                {
+                    "frame_index": i,
+                    "timestamp_s": round(i * 0.1, 2),
+                    "assessment": {
+                        "veh_track_id": 1,
+                        "ped_track_id": 7 if i >= 2 else None,
+                        "risk_level": 3 if i == 2 else 0,
+                        "veh_speed_kmh": 28.0 if i == 2 else 0.0,
+                        "ttc_seconds": 1.1 if i == 2 else None,
+                    },
+                }
+                for i in range(5)
+            ]
+            (run_dir / "conflicts.jsonl").write_text(
+                "\n".join(json.dumps(r, allow_nan=False) for r in conflict_rows) + "\n",
+                encoding="utf-8",
+            )
+            run_video = run_dir / "annotated_conflict.mp4"
+            # 写入纹理帧以产生 > 64KB 的真实 MP4，从而实测跨多个 64KB 分块的流式响应。
+            rng = np.random.default_rng(7)
+            writer = cv2.VideoWriter(
+                str(run_video), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (640, 480)
+            )
+            self.assertTrue(writer.isOpened())
+            for _ in range(5):
+                writer.write(rng.integers(0, 256, size=(480, 640, 3), dtype=np.uint8))
+            writer.release()
+            video_bytes = run_video.read_bytes()
+            self.assertGreater(len(video_bytes), 65536)
+
+            for bad_web in ("", "   ", Path("   "), True, 123):
+                with self.assertRaises(ValueError):
+                    AnalysisService(runs_root, default_calib=calib_yaml, web_root=bad_web)
+
+            default_svc = AnalysisService(runs_root, default_calib=calib_yaml)
+            self.assertEqual(default_svc.web_root, DEFAULT_WEB_ROOT)
+
+            svc = AnalysisService(runs_root, default_calib=calib_yaml, web_root=web_dir)
+
+            # 验证 7 种合法静态资源与 MIME 映射。
+            expected_mimes = {
+                "index.html": "text/html; charset=utf-8",
+                "assets/styles.css": "text/css; charset=utf-8",
+                "assets/sub/foo.js": "application/javascript; charset=utf-8",
+                "assets/icon.svg": "image/svg+xml",
+                "assets/manifest.json": "application/json; charset=utf-8",
+                "assets/logo.png": "image/png",
+                "assets/favicon.ico": "image/x-icon",
+            }
+            for rel, expected_mime in expected_mimes.items():
+                resolved_p, mime = svc.resolve_web_asset(rel)
+                self.assertTrue(resolved_p.is_file())
+                self.assertEqual(mime, expected_mime)
+
+            # 越界/穿越/不支持后缀/缺失文件校验。
+            for bad_asset in (
+                None,
+                123,
+                "",
+                "   ",
+                ".",
+                "..",
+                "../service.py",
+                "assets/../service.py",
+                "assets/%2e%2e/service.py",
+                "assets/%252e%252e/service.py",
+                "assets\\styles.css",
+                "C:styles.css",
+                "assets/bad\x00.js",
+                "/index.html",
+                "assets/secret.txt",
+                "assets/not_exist.py",
+            ):
+                with self.subTest(bad_asset=bad_asset), self.assertRaises(ValueError):
+                    svc.resolve_web_asset(bad_asset)
+            with self.assertRaises(FileNotFoundError):
+                svc.resolve_web_asset("assets/missing.js")
+
+            # 服务层新读方法单元测试。
+            self.assertEqual(len(svc.get_run_conflicts("run-web-01", limit=2)), 2)
+            self.assertEqual(len(svc.get_run_conflicts("run-web-01", limit=None)), 5)
+            self.assertEqual(svc.get_run_conflicts("run-web-01", limit=0), [])
+            for bad_limit in (-1, True, "2"):
+                with self.assertRaises(ValueError):
+                    svc.get_run_conflicts("run-web-01", limit=bad_limit)
+            for bad_idx in (-1, True, "0"):
+                with self.assertRaises(ValueError):
+                    svc.get_run_frame_jpeg("run-web-01", frame_index=bad_idx)
+            with self.assertRaises(FileNotFoundError):
+                svc.get_run_frame_jpeg("run-web-01", frame_index=999)
+
+            # 缺少 conflicts.jsonl / annotated_conflict.mp4 的历史目录处理。
+            bare_run = self._create_sample_run(runs_root, "run-bare")
+            self.assertTrue(bare_run.is_dir())
+            self.assertEqual(svc.get_run_conflicts("run-bare"), [])
+            with self.assertRaises(FileNotFoundError):
+                svc.get_run_video_path("run-bare")
+
+            presets = svc.list_presets()
+            self.assertEqual(presets["default_calib"], str(calib_yaml.resolve()))
+            self.assertTrue(any(v["path"] == str(fixture_vid.resolve()) for v in presets["videos"]))
+            calib_paths = {c["path"] for c in presets["calibs"]}
+            self.assertEqual(calib_paths, {str(calib_yaml.resolve()), str(alt_calib_yml.resolve())})
+
+            server = create_http_server(svc, host="127.0.0.1", port=0)
+            port = server.server_address[1]
+            srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            srv_thread.start()
+            try:
+                base = f"http://127.0.0.1:{port}"
+
+                # 静态首页与子目录资源请求。
+                for url_path, exp_ct, exp_snippet in (
+                    ("/", "text/html; charset=utf-8", b"CampusMotion"),
+                    ("/index.html", "text/html; charset=utf-8", b"CampusMotion"),
+                    ("/assets/styles.css", "text/css; charset=utf-8", b"color:#ededed"),
+                    ("/assets/sub/foo.js", "application/javascript; charset=utf-8", b"window.ok=true;"),
+                ):
+                    with urlopen(f"{base}{url_path}", timeout=5.0) as resp:
+                        self.assertEqual(resp.status, 200)
+                        self.assertEqual(resp.headers.get("Content-Type"), exp_ct)
+                        self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
+                        self.assertEqual(resp.headers.get("Cache-Control"), "no-cache")
+                        self.assertIn(exp_snippet, resp.read())
+
+                # 使用原始 HTTPConnection 发送未被客户端归一化改写的穿越路径。
+                for bad_raw in (
+                    "/assets/../service.py",
+                    "/assets/%2e%2e/service.py",
+                    "/assets/%2e%2e%2fservice.py",
+                    "/assets/..%5cservice.py",
+                    "/assets/sub/../styles.css",
+                    "/assets/secret.txt",
+                    "/assets/",
+                ):
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5.0)
+                    try:
+                        conn.request("GET", bad_raw)
+                        res = conn.getresponse()
+                        body = json.loads(res.read().decode("utf-8"))
+                    finally:
+                        conn.close()
+                    self.assertEqual(res.status, 400, msg=f"path={bad_raw}")
+                    self.assertIn("error", body)
+
+                st_miss, miss_body = _http_json(f"{base}/assets/missing.js")
+                self.assertEqual(st_miss, 404)
+                self.assertIn("error", miss_body)
+
+                # 新运行数据查询接口。
+                st_conf, conf_body = _http_json(f"{base}/api/runs/run-web-01/conflicts?limit=2")
+                self.assertEqual(st_conf, 200)
+                self.assertEqual(conf_body["run_id"], "run-web-01")
+                self.assertEqual(conf_body["count"], 2)
+                self.assertEqual(len(conf_body["conflicts"]), 2)
+
+                # 视频帧截取 JPEG 与越界 404。
+                with urlopen(f"{base}/api/runs/run-web-01/frame?index=0", timeout=5.0) as f_resp:
+                    self.assertEqual(f_resp.status, 200)
+                    self.assertEqual(f_resp.headers.get("Content-Type"), "image/jpeg")
+                    self.assertEqual(f_resp.headers.get("Cache-Control"), "public, max-age=60")
+                    jpg = f_resp.read()
+                self.assertTrue(jpg.startswith(b"\xff\xd8"))
+
+                st_f404, _ = _http_json(f"{base}/api/runs/run-web-01/frame?index=999")
+                self.assertEqual(st_f404, 404)
+                st_f400, _ = _http_json(f"{base}/api/runs/run-web-01/frame?index=-1")
+                self.assertEqual(st_f400, 400)
+
+                # 视频全量 200、部分 Range 206 与越界 416。
+                with urlopen(f"{base}/api/runs/run-web-01/video", timeout=5.0) as v_full:
+                    self.assertEqual(v_full.status, 200)
+                    self.assertEqual(v_full.headers.get("Content-Type"), "video/mp4")
+                    self.assertEqual(v_full.headers.get("Accept-Ranges"), "bytes")
+                    self.assertEqual(v_full.read(), video_bytes)
+
+                req_part = Request(
+                    f"{base}/api/runs/run-web-01/video",
+                    headers={"Range": "bytes=0-63"},
+                )
+                with urlopen(req_part, timeout=5.0) as v_part:
+                    self.assertEqual(v_part.status, 206)
+                    self.assertEqual(v_part.headers.get("Accept-Ranges"), "bytes")
+                    self.assertEqual(
+                        v_part.headers.get("Content-Range"),
+                        f"bytes 0-63/{len(video_bytes)}",
+                    )
+                    part_data = v_part.read()
+                self.assertEqual(len(part_data), 64)
+                self.assertEqual(part_data, video_bytes[:64])
+
+                req_suffix = Request(
+                    f"{base}/api/runs/run-web-01/video",
+                    headers={"Range": "bytes=-16"},
+                )
+                with urlopen(req_suffix, timeout=5.0) as v_suf:
+                    self.assertEqual(v_suf.status, 206)
+                    self.assertEqual(v_suf.read(), video_bytes[-16:])
+
+                for bad_range in ("bytes=9999999-", "bytes=50-10", "bytes=invalid"):
+                    req_bad = Request(
+                        f"{base}/api/runs/run-web-01/video",
+                        headers={"Range": bad_range},
+                    )
+                    with self.assertRaises(HTTPError) as ctx:
+                        urlopen(req_bad, timeout=5.0)
+                    self.assertEqual(ctx.exception.code, 416)
+                    self.assertEqual(
+                        ctx.exception.headers.get("Content-Range"),
+                        f"bytes */{len(video_bytes)}",
+                    )
+                    ctx.exception.close()
+
+                # /api/presets 校验。
+                st_pre, pre_body = _http_json(f"{base}/api/presets")
+                self.assertEqual(st_pre, 200)
+                self.assertTrue(any(v["path"] == str(fixture_vid.resolve()) for v in pre_body["videos"]))
+                self.assertEqual(pre_body["default_calib"], str(calib_yaml.resolve()))
+            finally:
+                server.shutdown()
+                server.server_close()
 
 
 class TestInteractiveCalibratorGuiExtensions(unittest.TestCase):

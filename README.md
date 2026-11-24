@@ -2,7 +2,7 @@
 
 面向校园道路固定路侧摄像头，研究车辆与行人的视觉感知、连续跟踪、实际速度估计和冲突风险预警。系统以 YOLOv8 + ByteTrack 提供检测与连续轨迹，`analysis` 模块完成道路标定、物理测速、TTC 冲突研判、事件去抖与四级预警，形成从视频输入到风险提示和事件记录的完整技术链路。
 
-**当前阶段：全链路已实现**（检测 → 跟踪 → 短时遮挡缝合 → 标定测速 → 冲突分析 → 预警与双端推送服务）。仓库共含 306 项单元与集成测试（在含 `lap 0.5.12` 与基础权重的验证环境下 306/306 全部通过、0 跳过；其中 `test_io_hardening.py`、`test_tracking.py`、`test_tracking_exports.py`、`test_tracking_integration.py` 共 4 个依赖 ByteTrack/`lap` 的 I/O 加固与跟踪测试模块需配合 `lap` 运行）；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
+**当前阶段：全链路已实现**（检测 → 跟踪 → 短时遮挡缝合 → 标定测速 → 冲突分析 → 预警与双端推送服务）。仓库共含 307 项单元与集成测试（在含 `lap 0.5.12` 与基础权重的验证环境下 307/307 全部通过、0 跳过；其中 `test_io_hardening.py`、`test_tracking.py`、`test_tracking_exports.py`、`test_tracking_integration.py` 共 4 个依赖 ByteTrack/`lap` 的 I/O 加固与跟踪测试模块需配合 `lap` 运行）；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
 
 ## 技术链路
 
@@ -71,8 +71,9 @@ python -m analysis.charts --ablation runs/analysis/ablation.json --run runs/anal
 python -m analysis.evaluate --run runs/analysis/run-<timestamp> --ground-truth configs/ground_truth.example.yaml --markdown --output runs/analysis/evaluation.md
 python -m analysis.schema --run runs/analysis/run-<timestamp>
 
-# 启动实时双端预警与历史运行查询后端（默认标准库 ThreadingHTTPServer，零额外 Web 依赖）
-python -m analysis.service --runs-root runs/analysis --host 127.0.0.1 --port 8000 --backend stdlib
+# 启动 Web 控制台与实时双端预警服务（默认标准库 ThreadingHTTPServer，零额外 Web 依赖）
+python -m analysis.service --host 127.0.0.1 --port 8000
+# 启动后在浏览器访问 http://127.0.0.1:8000/ （支持实时监测、历史回放与双端预警镜像）
 ```
 
 本次 CPU 验证环境：Python 3.12、PyTorch 2.11.0+cpu、torchvision 0.26.0、Ultralytics 8.4.182、opencv-python 5.0.0.93、lap 0.5.12。依赖中不存在的 lap 0.10.0 已修正。
@@ -108,7 +109,7 @@ detection/   YOLOv8 检测、训练与评估入口
 tracking/    ByteTrack 会话、轨迹与 px/s 运动记录、平滑、可视化、批处理
 analysis/    标定与偏置补偿 · EMA/CA/CTRV 测速 · CVM/圆角OBB-SSM 冲突研判 · 断轨缝合 · 事件去抖 · 真值评测 · 实时服务 · 基准与出图
 configs/     bytetrack.yaml、motion.yaml、object_policy.yaml、calibration.yaml、真值与数据配置模板
-tests/       单元、集成与异常路径测试（306 项）
+tests/       单元、集成与异常路径测试（307 项）
 docs/        课题需求、研究蓝图（含数学推导）与模块解释文档
 ```
 

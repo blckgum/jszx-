@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>CampusMotion | 校园道路冲突感知控制台</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="/assets/motion.js" defer></script>
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="控制台导航">
+      <div class="sidebar-header">
+        <div class="brand-lockup">
+          <svg class="brand-mark" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="4"></rect>
+            <path d="M8 16L12 7L16 16"></path>
+            <circle cx="12" cy="14" r="1.5"></circle>
+          </svg>
+          <div class="brand-copy">
+            <span class="brand-name">CampusMotion</span>
+            <span class="brand-sub">校园道路冲突感知控制台</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <p class="sidebar-label" id="sidebar-nav-label">监测工作区</p>
+        <nav class="sidebar-nav" aria-labelledby="sidebar-nav-label">
+          <span class="nav-indicator" aria-hidden="true"></span>
+          <button type="button" class="nav-item is-active" data-view="monitor" aria-current="page">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="4" width="18" height="12" rx="2"></rect>
+              <path d="M7 20h10"></path>
+              <path d="M12 16v4"></path>
+            </svg>
+            <span>实时监测台</span>
+          </button>
+          <button type="button" class="nav-item" data-view="alerts">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3l9 16H3L12 3z"></path>
+              <path d="M12 10v4"></path>
+              <path d="M12 17h.01"></path>
+            </svg>
+            <span>双端预警镜像</span>
+          </button>
+          <button type="button" class="nav-item" data-view="history">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 3v18h18"></path>
+              <path d="M7 15l4-4 3 3 5-6"></path>
+            </svg>
+            <span>历史档案与时间轴</span>
+          </button>
+        </nav>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="service-box">
+          <div class="service-row">
+            <span class="service-key">服务状态</span>
+            <span class="service-val">
+              <span id="service-health-dot" class="status-dot" data-state="checking"></span>
+              <span id="service-health-text">检测中</span>
+            </span>
+          </div>
+          <div class="service-row">
+            <span class="service-key">工作模式</span>
+            <span id="sidebar-mode-text" class="service-val mono">仿真演示</span>
+          </div>
+          <div class="service-row">
+            <span class="service-key">当前记录</span>
+            <span id="sidebar-target-text" class="service-val mono tabular">--</span>
+          </div>
+        </div>
+
+        <button type="button" id="sidebar-theme-btn" class="btn btn-secondary btn-block">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2"></path>
+            <path d="M12 20v2"></path>
+            <path d="M4.93 4.93l1.41 1.41"></path>
+            <path d="M17.66 17.66l1.41 1.41"></path>
+            <path d="M2 12h2"></path>
+            <path d="M20 12h2"></path>
+            <path d="M6.34 17.66l-1.41 1.41"></path>
+            <path d="M19.07 4.93l-1.41 1.41"></path>
+          </svg>
+          <span id="theme-toggle-label">切换浅色纸张</span>
+        </button>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="topbar-leading">
+          <button type="button" id="mobile-nav-open-btn" class="btn btn-icon mobile-only" aria-label="打开导航菜单">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 6h16"></path>
+              <path d="M4 12h16"></path>
+              <path d="M4 18h16"></path>
+            </svg>
+          </button>
+          <div class="topbar-heading">
+            <h1 id="view-title" class="page-title">实时监测台</h1>
+            <p id="view-subtitle" class="page-subtitle">单目单应投影测速 · CTRV 运动学 · OBB-SSM 冲突评估</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <div class="status-pill" id="topbar-risk-pill" data-risk="0">
+            <span class="status-dot" id="topbar-risk-dot"></span>
+            <span id="topbar-risk-text" class="tabular">L0 正常通行</span>
+          </div>
+          <button type="button" id="topbar-theme-btn" class="btn btn-ghost mobile-only" aria-label="切换明暗主题">
+            <span id="topbar-theme-label">浅色</span>
+          </button>
+          <button type="button" id="open-job-dialog-btn" class="btn btn-primary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 5v14"></path>
+              <path d="M5 12h14"></path>
+            </svg>
+            <span>新建检测任务</span>
+          </button>
+        </div>
+      </header>
+
+      <main class="main-content">
+        <!-- View 1: 实时监测台 -->
+        <section id="view-monitor" class="view-section" aria-labelledby="view-title">
+          <div class="kpi-grid">
+            <article class="panel kpi-card">
+              <p class="kpi-label">最高车速</p>
+              <div id="kpi-max-speed" class="kpi-value tabular">--</div>
+              <p id="kpi-speed-meta" class="kpi-meta tabular">限速基准 30.0 km/h</p>
+            </article>
+            <article class="panel kpi-card">
+              <p class="kpi-label">最小碰撞时间 TTC</p>
+              <div id="kpi-min-ttc" class="kpi-value tabular">--</div>
+              <p id="kpi-ttc-meta" class="kpi-meta tabular">临界阈值 1.50 s</p>
+            </article>
+            <article class="panel kpi-card">
+              <p class="kpi-label">当前活跃预警</p>
+              <div id="kpi-active-alerts" class="kpi-value tabular">--</div>
+              <p id="kpi-alerts-meta" class="kpi-meta tabular">车端与路侧实时分发</p>
+            </article>
+            <article class="panel kpi-card">
+              <p class="kpi-label">已处理帧数</p>
+              <div id="kpi-frames" class="kpi-value tabular">--</div>
+              <p id="kpi-frames-meta" class="kpi-meta tabular">累计时间 0.0 s</p>
+            </article>
+          </div>
+
+          <div class="monitor-grid">
+            <article class="panel monitor-card" id="viewport-card">
+              <header class="card-header">
+                <div class="card-title-group">
+                  <h2 class="card-title">视频感知视口</h2>
+                  <span id="viewport-mode-badge" class="meta-tag mono">仿真模式</span>
+                </div>
+                <div class="badge-strip" aria-label="当前启用算法配置">
+                  <span id="badge-speed-model" class="algo-chip mono">CTRV</span>
+                  <span id="badge-conflict-model" class="algo-chip mono">OBB-SSM</span>
+                  <span id="badge-vru-model" class="algo-chip mono">HSV+VRU</span>
+                </div>
+              </header>
+
+              <div class="viewport-stage">
+                <!-- Simulation State -->
+                <div id="viewport-sim-panel" class="viewport-overlay">
+                  <div class="viewport-grid-head">
+                    <span class="mono muted-text">CAM-01 · 校门主干道斑马线</span>
+                    <span id="sim-calib-tag" class="mono muted-text">标定 6.0m x 15.0m</span>
+                  </div>
+                  <div class="sim-calib-box" aria-hidden="true">
+                    <svg class="sim-calib-svg" viewBox="0 0 420 116" fill="none">
+                      <polygon points="132,20 288,20 364,96 56,96" class="calib-roi"></polygon>
+                      <line x1="210" y1="20" x2="210" y2="96" class="calib-axis"></line>
+                      <g class="calib-zebra">
+                        <rect x="136" y="48" width="14" height="10" rx="1"></rect>
+                        <rect x="164" y="48" width="14" height="10" rx="1"></rect>
+                        <rect x="192" y="48" width="14" height="10" rx="1"></rect>
+                        <rect x="220" y="48" width="14" height="10" rx="1"></rect>
+                        <rect x="248" y="48" width="14" height="10" rx="1"></rect>
+                        <rect x="276" y="48" width="14" height="10" rx="1"></rect>
+                      </g>
+                      <circle cx="132" cy="20" r="3" class="calib-pt"></circle>
+                      <circle cx="288" cy="20" r="3" class="calib-pt"></circle>
+                      <circle cx="364" cy="96" r="3" class="calib-pt"></circle>
+                      <circle cx="56" cy="96" r="3" class="calib-pt"></circle>
+                      <text x="12" y="16" class="calib-note">H 3x3 -&gt; Ground 6.0m x 15.0m</text>
+                      <text x="12" y="108" class="calib-sub">P0(400,300) · P1(880,300) · P2(1150,680) · P3(130,680)</text>
+                    </svg>
+                  </div>
+                  <div class="viewport-telemetry">
+                    <div class="telemetry-row">
+                      <span class="telemetry-key">活跃场景</span>
+                      <span id="sim-scene-name" class="telemetry-val">斑马线急刹</span>
+                    </div>
+                    <div class="telemetry-row">
+                      <span class="telemetry-key">感知目标</span>
+                      <span id="sim-objects-summary" class="telemetry-val tabular">0 车辆 / 0 行人与骑行者</span>
+                    </div>
+                    <div class="telemetry-row">
+                      <span class="telemetry-key">瞬时风险评估</span>
+                      <span id="sim-risk-summary" class="telemetry-val tabular">等待采样</span>
+                    </div>
+                  </div>
+                  <div class="viewport-cta-row">
+                    <button type="button" id="btn-replay-sample" class="btn btn-primary">回放样本 run-20261020_201655</button>
+                  </div>
+                </div>
+
+                <!-- Replay State -->
+                <div id="viewport-replay-panel" class="viewport-media-wrap" hidden>
+                  <video id="replay-video" class="media-frame" muted playsinline preload="metadata" hidden></video>
+                  <img id="replay-frame-img" class="media-frame" alt="历史分析标注帧">
+                  <div id="replay-media-caption" class="media-caption mono tabular">回放就绪</div>
+                </div>
+
+                <!-- Live Job State -->
+                <div id="viewport-live-panel" class="viewport-media-wrap" hidden>
+                  <img id="live-mjpeg-img" class="media-frame" alt="实时视频流标注画面">
+                  <div id="live-media-caption" class="media-caption mono tabular">等待首帧图像</div>
+                </div>
+              </div>
+
+              <!-- Replay Controls -->
+              <div id="replay-controls" class="card-controls" hidden>
+                <button type="button" id="btn-replay-toggle" class="btn btn-secondary">播放回放</button>
+                <label class="scrubber-wrap" for="replay-scrubber">
+                  <span class="sr-only">回放帧进度</span>
+                  <input id="replay-scrubber" class="scrubber-input" type="range" min="0" max="0" step="1" value="0">
+                </label>
+                <span id="replay-frame-label" class="mono tabular control-readout">0 / 0</span>
+                <button type="button" id="btn-back-sim" class="btn btn-ghost">返回仿真</button>
+              </div>
+
+              <!-- Live Job Controls -->
+              <div id="live-controls" class="card-controls" hidden>
+                <span id="live-job-status-text" class="mono tabular control-readout">任务初始化中</span>
+                <div class="control-actions">
+                  <button type="button" id="btn-stop-job" class="btn btn-danger-outline">停止任务</button>
+                  <button type="button" id="btn-live-to-sim" class="btn btn-ghost">返回仿真</button>
+                </div>
+              </div>
+            </article>
+
+            <article class="panel monitor-card" id="twin-card">
+              <header class="card-header">
+                <div class="card-title-group">
+                  <h2 class="card-title">鸟瞰物理路网孪生</h2>
+                  <span id="twin-mode-label" class="meta-tag mono">6.0m x 15.0m</span>
+                </div>
+                <div class="twin-controls">
+                  <label class="sr-only" for="scenario-select">仿真场景选择</label>
+                  <select id="scenario-select" class="select-compact">
+                    <option value="crosswalk_braking">斑马线急刹</option>
+                    <option value="cyclist_vru_cutin">骑行者切入</option>
+                    <option value="ctrv_curve_yield">弯道 CTRV</option>
+                  </select>
+                  <button type="button" id="btn-twin-pause" class="btn btn-secondary">暂停演示</button>
+                </div>
+              </header>
+
+              <div class="twin-stage">
+                <canvas id="road-twin-canvas" aria-label="校园道路鸟瞰物理路网孪生图"></canvas>
+              </div>
+
+              <footer class="twin-legend">
+                <div class="legend-items">
+                  <span class="legend-item"><i class="swatch swatch-safe"></i>安全通行</span>
+                  <span class="legend-item"><i class="swatch swatch-caution"></i>注意礼让</span>
+                  <span class="legend-item"><i class="swatch swatch-critical"></i>临界冲突</span>
+                  <span class="legend-item"><i class="swatch swatch-line"></i>CTRV 预测</span>
+                </div>
+                <span id="twin-counts" class="mono tabular muted-text">车辆 0 · 行人/骑行 0</span>
+              </footer>
+            </article>
+          </div>
+
+          <article class="panel pipeline-card" id="pipeline-card">
+            <header class="card-header">
+              <div class="card-title-group">
+                <h2 class="card-title">算法管线信号流</h2>
+                <span id="pipeline-stage-detail" class="meta-tag">点击节点查看模块算法参数</span>
+              </div>
+              <div class="pipeline-toggles" aria-label="仿真管线开关">
+                <label class="inline-check">
+                  <input type="checkbox" id="toggle-stitching" checked>
+                  <span>轨迹缝合</span>
+                </label>
+                <label class="inline-check">
+                  <input type="checkbox" id="toggle-cyclist-vru" checked>
+                  <span>骑行者 VRU</span>
+                </label>
+              </div>
+            </header>
+
+            <div class="pipeline-svg-wrap">
+              <svg id="pipeline-svg" viewBox="0 0 980 128" role="img" aria-label="视觉感知与双端预警算法管线">
+                <g class="pipeline-beams" fill="none">
+                  <path class="beam-path" data-segment="0" d="M 164 64 L 214 64"></path>
+                  <path class="beam-pulse" data-segment="0" d="M 164 64 L 214 64"></path>
+
+                  <path class="beam-path" data-segment="1" d="M 362 64 L 412 64"></path>
+                  <path class="beam-pulse" data-segment="1" d="M 362 64 L 412 64"></path>
+
+                  <path class="beam-path" data-segment="2" d="M 568 64 L 618 64"></path>
+                  <path class="beam-pulse" data-segment="2" d="M 568 64 L 618 64"></path>
+
+                  <path class="beam-path" data-segment="3" d="M 766 64 L 816 64"></path>
+                  <path class="beam-pulse" data-segment="3" d="M 766 64 L 816 64"></path>
+                </g>
+
+                <g class="pipeline-nodes">
+                  <g class="pipeline-node is-selected" data-stage="detect" tabindex="0" role="button" aria-label="YOLOv8 目标检测节点">
+                    <rect x="16" y="28" width="148" height="72" rx="8"></rect>
+                    <text x="90" y="57" text-anchor="middle" class="node-title" data-stage-label="detect">YOLOv8</text>
+                    <text x="90" y="79" text-anchor="middle" class="node-sub" data-stage-sub="detect">多类别目标检测</text>
+                  </g>
+
+                  <g class="pipeline-node" data-stage="track" tabindex="0" role="button" aria-label="ByteTrack 加 HSV 追踪节点">
+                    <rect x="214" y="28" width="148" height="72" rx="8"></rect>
+                    <text x="288" y="57" text-anchor="middle" class="node-title" data-stage-label="track">ByteTrack+HSV</text>
+                    <text x="288" y="79" text-anchor="middle" class="node-sub" data-stage-sub="track">轨迹关联与缝合</text>
+                  </g>
+
+                  <g class="pipeline-node" data-stage="motion" tabindex="0" role="button" aria-label="单应投影与 CTRV 运动学节点">
+                    <rect x="412" y="28" width="156" height="72" rx="8"></rect>
+                    <text x="490" y="57" text-anchor="middle" class="node-title" data-stage-label="motion">Homography/CTRV</text>
+                    <text x="490" y="79" text-anchor="middle" class="node-sub" data-stage-sub="motion">锚点偏置与测速</text>
+                  </g>
+
+                  <g class="pipeline-node" data-stage="conflict" tabindex="0" role="button" aria-label="OBB-SSM 冲突评估节点">
+                    <rect x="618" y="28" width="148" height="72" rx="8"></rect>
+                    <text x="692" y="57" text-anchor="middle" class="node-title" data-stage-label="conflict">OBB-SSM</text>
+                    <text x="692" y="79" text-anchor="middle" class="node-sub" data-stage-sub="conflict">TTC / PET + VRU</text>
+                  </g>
+
+                  <g class="pipeline-node" data-stage="alert" tabindex="0" role="button" aria-label="双端预警分发节点">
+                    <rect x="816" y="28" width="148" height="72" rx="8"></rect>
+                    <text x="890" y="57" text-anchor="middle" class="node-title" data-stage-label="alert">双端预警</text>
+                    <text x="890" y="79" text-anchor="middle" class="node-sub" data-stage-sub="alert">车端与路侧分流</text>
+                  </g>
+                </g>
+              </svg>
+            </div>
+          </article>
+        </section>
+
+        <!-- View 2: 双端预警镜像 -->
+        <section id="view-alerts" class="view-section" hidden aria-labelledby="view-title">
+          <div class="dual-terminals-grid">
+            <article id="driver-terminal" class="panel terminal-card beam-active" data-risk="0">
+              <header class="terminal-head">
+                <div>
+                  <p class="terminal-kicker mono">Driver Unit</p>
+                  <h2 class="card-title">车端驾驶舱预警终端</h2>
+                </div>
+                <span id="driver-risk-badge" class="risk-pill" data-risk="0">L0 正常</span>
+              </header>
+
+              <div class="terminal-screen">
+                <p id="driver-alert-message" class="terminal-primary-msg">当前道路通行平稳，无车端干预指令</p>
+                <p id="driver-alert-advice" class="terminal-advice">保持校园限速行驶并留意斑马线行人动态</p>
+              </div>
+
+              <dl class="terminal-metrics">
+                <div class="metric-cell">
+                  <dt>车辆编号</dt>
+                  <dd id="driver-veh-id" class="mono tabular">--</dd>
+                </div>
+                <div class="metric-cell">
+                  <dt>实时车速</dt>
+                  <dd id="driver-speed" class="mono tabular">--</dd>
+                </div>
+                <div class="metric-cell">
+                  <dt>碰撞时间 TTC</dt>
+                  <dd id="driver-ttc" class="mono tabular">--</dd>
+                </div>
+                <div class="metric-cell">
+                  <dt>当前 / 最小间距</dt>
+                  <dd id="driver-dist" class="mono tabular">--</dd>
+                </div>
+              </dl>
+
+              <div id="driver-queue-list" class="terminal-queue" aria-live="polite"></div>
+            </article>
+
+            <article id="pedestrian-terminal" class="panel terminal-card beam-active" data-risk="0">
+              <header class="terminal-head">
+                <div>
+                  <p class="terminal-kicker mono">Pedestrian Signboard</p>
+                  <h2 class="card-title">路侧行人 LED 警示屏</h2>
+                </div>
+                <span id="pedestrian-risk-badge" class="risk-pill" data-risk="0">L0 静默</span>
+              </header>
+
+              <div class="terminal-screen">
+                <p id="pedestrian-alert-message" class="terminal-primary-msg">当前无路侧协同避险触发</p>
+                <p id="pedestrian-alert-advice" class="terminal-advice">L1 单车超速仅提示驾驶员端，L2/L3 轨迹冲突时同步点亮路侧屏</p>
+              </div>
+
+              <dl class="terminal-metrics">
+                <div class="metric-cell">
+                  <dt>弱势对象</dt>
+                  <dd id="ped-target-id" class="mono tabular">--</dd>
+                </div>
+                <div class="metric-cell">
+                  <dt>来车速度</dt>
+                  <dd id="ped-veh-speed" class="mono tabular">--</dd>
+                </div>
+                <div class="metric-cell">
+                  <dt>碰撞时间 TTC</dt>
+                  <dd id="ped-ttc" class="mono tabular">--</dd>
+                </div>
+                <div class="metric-cell">
+                  <dt>相对距离</dt>
+                  <dd id="ped-dist" class="mono tabular">--</dd>
+                </div>
+              </dl>
+
+              <div id="pedestrian-queue-list" class="terminal-queue" aria-live="polite"></div>
+            </article>
+          </div>
+
+          <article class="panel alert-log-card">
+            <header class="card-header">
+              <div class="card-title-group">
+                <h2 class="card-title">实时双端预警流水</h2>
+                <span id="alert-log-count" class="meta-tag mono tabular">0 条记录</span>
+              </div>
+              <div class="log-controls">
+                <div class="segmented" role="group" aria-label="预警等级筛选">
+                  <button type="button" class="seg-btn is-active" data-log-filter="all">全部</button>
+                  <button type="button" class="seg-btn" data-log-filter="3">L3 紧急</button>
+                  <button type="button" class="seg-btn" data-log-filter="2">L2 注意</button>
+                  <button type="button" class="seg-btn" data-log-filter="1">L1 超速</button>
+                </div>
+                <button type="button" id="btn-clear-alert-log" class="btn btn-ghost">清空流水</button>
+              </div>
+            </header>
+
+            <div id="alert-log-list" class="alert-log-list">
+              <p class="empty-state">尚未记录到风险预警，运行仿真、回放或实时任务后将自动推送</p>
+            </div>
+          </article>
+        </section>
+
+        <!-- View 3: 历史档案与时间轴 -->
+        <section id="view-history" class="view-section" hidden aria-labelledby="view-title">
+          <div class="panel history-toolbar">
+            <div class="history-select-group">
+              <label for="history-run-select" class="field-label">历史分析记录</label>
+              <select id="history-run-select" class="form-control select-run"></select>
+              <button type="button" id="btn-refresh-runs" class="btn btn-secondary">刷新列表</button>
+            </div>
+            <button type="button" id="btn-history-replay" class="btn btn-primary">在监测台回放该记录</button>
+          </div>
+
+          <div class="summary-pills-grid">
+            <article class="panel summary-pill">
+              <span class="kpi-label">已处理帧数</span>
+              <strong id="hist-frames" class="summary-val tabular">--</strong>
+              <span id="hist-fps" class="kpi-meta tabular">-- FPS</span>
+            </article>
+            <article class="panel summary-pill">
+              <span class="kpi-label">最高观测车速</span>
+              <strong id="hist-max-speed" class="summary-val tabular">--</strong>
+              <span id="hist-speed-limit" class="kpi-meta tabular">限速 -- km/h</span>
+            </article>
+            <article class="panel summary-pill">
+              <span class="kpi-label">注意礼让 / 超速</span>
+              <strong id="hist-caution-count" class="summary-val tabular">--</strong>
+              <span id="hist-speeding-count" class="kpi-meta tabular">超速告警 --</span>
+            </article>
+            <article class="panel summary-pill">
+              <span class="kpi-label">严重冲突事件</span>
+              <strong id="hist-critical-count" class="summary-val tabular">--</strong>
+              <span id="hist-elapsed" class="kpi-meta tabular">耗时 -- s</span>
+            </article>
+          </div>
+
+          <article class="panel timeline-card">
+            <header class="card-header">
+              <div class="card-title-group">
+                <h2 class="card-title">车速与冲突风险时间轴</h2>
+                <span id="timeline-hover-info" class="meta-tag mono tabular">点击曲线节点可跳转至监测台对应帧</span>
+              </div>
+              <span id="history-source-label" class="meta-tag mono"></span>
+            </header>
+            <div class="timeline-stage">
+              <canvas id="speed-timeline-canvas" aria-label="历史运行车速与冲突风险时间轴"></canvas>
+            </div>
+          </article>
+
+          <article class="panel history-tables-card">
+            <header class="card-header">
+              <div class="card-title-group">
+                <h2 class="card-title" id="history-table-title">结构化数据明细</h2>
+                <span id="history-table-meta" class="meta-tag mono tabular">--</span>
+              </div>
+              <div class="segmented" role="tablist" aria-label="历史明细表切换">
+                <button type="button" id="tab-btn-conflicts" class="seg-btn is-active" role="tab" aria-selected="true" data-table-tab="conflicts">冲突风险明细</button>
+                <button type="button" id="tab-btn-events" class="seg-btn" role="tab" aria-selected="false" data-table-tab="events">聚合告警事件</button>
+                <button type="button" id="tab-btn-speeds" class="seg-btn" role="tab" aria-selected="false" data-table-tab="speeds">目标轨迹测速</button>
+              </div>
+            </header>
+
+            <div id="conflicts-table-region" tabindex="0" role="region" aria-labelledby="conflicts-table-heading" class="table-wrapper">
+              <h3 id="conflicts-table-heading" class="sr-only">冲突风险明细表</h3>
+              <table class="data-table conflicts-table">
+                <thead>
+                  <tr>
+                    <th scope="col">帧序 / 时间</th>
+                    <th scope="col">车辆 / 弱势方</th>
+                    <th scope="col">风险等级</th>
+                    <th scope="col">车速 (km/h)</th>
+                    <th scope="col">TTC / PET</th>
+                    <th scope="col">当前 / 最小间距</th>
+                    <th scope="col">评估说明</th>
+                  </tr>
+                </thead>
+                <tbody id="conflicts-tbody"></tbody>
+              </table>
+            </div>
+
+            <div id="events-table-region" tabindex="0" role="region" aria-labelledby="events-table-heading" class="table-wrapper" hidden>
+              <h3 id="events-table-heading" class="sr-only">聚合告警事件表</h3>
+              <table class="data-table events-table">
+                <thead>
+                  <tr>
+                    <th scope="col">事件编号</th>
+                    <th scope="col">类型 / 参与者</th>
+                    <th scope="col">起止时间窗</th>
+                    <th scope="col">峰值风险</th>
+                    <th scope="col">最小 TTC (s)</th>
+                    <th scope="col">MTTC / DRAC</th>
+                    <th scope="col">结束原因</th>
+                  </tr>
+                </thead>
+                <tbody id="events-tbody"></tbody>
+              </table>
+            </div>
+
+            <div id="speeds-table-region" tabindex="0" role="region" aria-labelledby="speeds-table-heading" class="table-wrapper" hidden>
+              <h3 id="speeds-table-heading" class="sr-only">目标轨迹测速表</h3>
+              <table class="data-table speeds-table">
+                <thead>
+                  <tr>
+                    <th scope="col">帧序 / 轨迹</th>
+                    <th scope="col">目标类别</th>
+                    <th scope="col">时间戳 (s)</th>
+                    <th scope="col">地面坐标 (m)</th>
+                    <th scope="col">瞬时车速 (km/h)</th>
+                    <th scope="col">超速标记</th>
+                    <th scope="col">风险与 TTC</th>
+                  </tr>
+                </thead>
+                <tbody id="speeds-tbody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- 新建分析任务对话框 -->
+  <dialog id="job-dialog" class="modal-dialog" closedby="any" aria-labelledby="job-dialog-title">
+    <header class="dialog-header">
+      <div>
+        <h1 id="job-dialog-title" class="dialog-title">新建实时检测任务</h1>
+        <p class="dialog-subtitle">配置视频源、标定平面与运动学模型并启动后台分析作业</p>
+      </div>
+      <button type="button" id="job-dialog-close" class="btn btn-icon" aria-label="关闭任务配置弹窗">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18 6L6 18"></path>
+          <path d="M6 6l12 12"></path>
+        </svg>
+      </button>
+    </header>
+
+    <form id="job-form" class="dialog-body">
+      <div id="job-dialog-error" class="form-error" role="alert" hidden></div>
+
+      <div class="form-section">
+        <span class="field-label">快捷本地样例视频</span>
+        <div id="preset-videos-list" class="preset-chips"></div>
+      </div>
+
+      <div class="form-grid">
+        <div class="form-field form-field-full">
+          <label class="field-label" for="job-source">视频输入源 (本地路径 / RTSP / 摄像头索引)</label>
+          <input id="job-source" name="source" type="text" class="form-control" required autofocus placeholder="例如 runs/tracking-fixtures/sample_01/sample_a.mp4 或 0">
+        </div>
+
+        <div class="form-field">
+          <label class="field-label" for="job-calib">标定配置文件</label>
+          <select id="job-calib" name="calib_path" class="form-control"></select>
+        </div>
+
+        <div class="form-field">
+          <label class="field-label" for="job-speed-limit">校园限速阈值 (km/h)</label>
+          <input id="job-speed-limit" name="speed_limit_kmh" type="number" class="form-control tabular" min="1" max="120" step="0.5" value="30" required>
+        </div>
+
+        <div class="form-field">
+          <label class="field-label" for="job-speed-model">速度运动学模型</label>
+          <select id="job-speed-model" name="speed_model" class="form-control">
+            <option value="ctrv" selected>CTRV (弯道恒转弯率卡尔曼)</option>
+            <option value="kalman">Kalman (恒速二维线性滤波)</option>
+            <option value="ema">EMA (滑动窗口指数平滑)</option>
+          </select>
+        </div>
+
+        <div class="form-field">
+          <label class="field-label" for="job-conflict-model">冲突风险评估模型</label>
+          <select id="job-conflict-model" name="conflict_model" class="form-control">
+            <option value="obb_ssm" selected>OBB-SSM (旋转包络 + MTTC/DRAC/PET)</option>
+            <option value="cvm_circle">CVM-Circle (恒速圆形包络)</option>
+          </select>
+        </div>
+
+        <div class="form-field">
+          <label class="field-label" for="job-max-frames">最大处理帧数 (可选)</label>
+          <input id="job-max-frames" name="max_frames" type="number" class="form-control tabular" min="1" step="1" placeholder="留空表示完整处理">
+        </div>
+      </div>
+
+      <fieldset class="checkbox-fieldset">
+        <legend class="field-label">管线增强选项</legend>
+        <div class="checkbox-grid">
+          <label class="check-row">
+            <input type="checkbox" id="job-demo" name="demo" checked>
+            <span>演示模式 (允许合成占位标定文件)</span>
+          </label>
+          <label class="check-row">
+            <input type="checkbox" id="job-stitching" name="enable_stitching" checked>
+            <span>启用遮挡后轨迹碎片缝合</span>
+          </label>
+          <label class="check-row">
+            <input type="checkbox" id="job-cyclist-vru" name="include_cyclist_vru" checked>
+            <span>纳入非机动车骑行者 VRU 冲突评估</span>
+          </label>
+          <label class="check-row">
+            <input type="checkbox" id="job-anchor-bias" name="compensate_anchor_bias" checked>
+            <span>启用 2D 锚点向几何中心偏置补偿</span>
+          </label>
+          <label class="check-row">
+            <input type="checkbox" id="job-drop-stale" name="live_drop_stale_frames">
+            <span>实时流低延迟模式 (自动丢弃积压旧帧)</span>
+          </label>
+        </div>
+      </fieldset>
+
+      <footer class="dialog-footer">
+        <button type="button" id="job-dialog-cancel" class="btn btn-secondary">取消</button>
+        <button type="submit" id="job-dialog-submit" class="btn btn-primary">启动后台检测</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- 移动端导航抽屉对话框 -->
+  <dialog id="mobile-nav-dialog" class="drawer-dialog" closedby="any" aria-labelledby="mobile-nav-title">
+    <header class="dialog-header">
+      <h1 id="mobile-nav-title" class="dialog-title">导航菜单</h1>
+      <button type="button" id="mobile-nav-close" class="btn btn-icon" aria-label="关闭导航菜单">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M18 6L6 18"></path>
+          <path d="M6 6l12 12"></path>
+        </svg>
+      </button>
+    </header>
+    <nav class="mobile-nav-list" aria-label="移动端视图切换">
+      <button type="button" class="mobile-nav-item" data-view="monitor" autofocus>实时监测台</button>
+      <button type="button" class="mobile-nav-item" data-view="alerts">双端预警镜像</button>
+      <button type="button" class="mobile-nav-item" data-view="history">历史档案与时间轴</button>
+    </nav>
+    <div class="mobile-nav-actions">
+      <button type="button" id="mobile-new-job-btn" class="btn btn-primary btn-block">新建实时检测任务</button>
+      <button type="button" id="mobile-theme-btn" class="btn btn-secondary btn-block">切换明暗主题</button>
+    </div>
+  </dialog>
+</body>
+</html>
