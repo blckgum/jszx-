@@ -1046,39 +1046,46 @@
     }
 
     function integrateCtrvState(tSec) {
-        function phaseParams(tau) {
-            if (tau < 0.50) {
-                return { v: 5.4, a: 0.0, omega: 0.28 };
+        var psiTarget = Math.PI * 0.5;
+        function phaseParams(tau, curPsi) {
+            if (tau < 0.55) {
+                return { v: 5.4, a: 0.0, omega: 0.25 };
             }
-            if (tau < 2.10) {
-                var a1 = -5.4 / 1.60;
-                var v1 = Math.max(0.0, 5.4 + a1 * (tau - 0.50));
-                return { v: v1, a: a1, omega: 0.28 * (v1 / 5.4) };
+            if (tau < 1.95) {
+                var a1 = -5.4 / 1.40;
+                var v1 = Math.max(0.0, 5.4 + a1 * (tau - 0.55));
+                return { v: v1, a: a1, omega: 0.25 * (v1 / 5.4) };
             }
-            if (tau < 4.95) {
+            if (tau < 4.75) {
                 return { v: 0.0, a: 0.0, omega: 0.0 };
             }
-            if (tau < 7.60) {
-                var v2 = 2.2 * (tau - 4.95);
-                return { v: v2, a: 2.2, omega: 0.14 * Math.min(1.0, v2 / 3.0) };
-            }
-            return { v: 5.83, a: 0.0, omega: 0.14 };
+            var v2 = tau < 7.20 ? 2.2 * (tau - 4.75) : 5.39;
+            var a2 = tau < 7.20 ? 2.2 : 0.0;
+            var err = curPsi - psiTarget;
+            var omega2 = (v2 > 0.05 && err > 0.002)
+                ? -Math.min(0.36, err * 1.15) * Math.min(1.0, v2 / 1.8)
+                : 0.0;
+            return { v: v2, a: a2, omega: omega2 };
         }
 
-        var x = 1.60;
-        var y = -0.60;
-        var psi = Math.PI * 0.5 + 0.08;
-        var steps = Math.max(1, Math.ceil(tSec / 0.025));
+        var x = 1.25;
+        var y = -2.25;
+        var psi = Math.PI * 0.5 + 0.03;
+        var steps = Math.max(1, Math.ceil(tSec / 0.02));
         var dtStep = tSec > 0 ? (tSec / steps) : 0;
         for (var i = 0; i < steps; i += 1) {
-            var tauMid = (i + 0.5) * dtStep;
-            var pMid = phaseParams(tauMid);
-            var psiMid = psi + pMid.omega * (0.5 * dtStep);
+            var tau = i * dtStep;
+            var p1 = phaseParams(tau, psi);
+            var psiMid = psi + p1.omega * (0.5 * dtStep);
+            var pMid = phaseParams(tau + 0.5 * dtStep, psiMid);
             x += pMid.v * Math.cos(psiMid) * dtStep;
             y += pMid.v * Math.sin(psiMid) * dtStep;
             psi += pMid.omega * dtStep;
+            if (tau >= 4.75 && psi < psiTarget) {
+                psi = psiTarget;
+            }
         }
-        var end = phaseParams(tSec);
+        var end = phaseParams(tSec, psi);
         return { x: x, y: y, psi: psi, v: end.v, a: end.a, omega: end.omega };
     }
 
@@ -1224,7 +1231,8 @@
                 radiusM: 0.40
             });
         } else if (scenarioId === "ctrv_curve_yield") {
-            // Scenario 3: Turning vehicle with exact CTRV numerical integration (dx/dt=v cos psi, dy/dt=v sin psi, dpsi/dt=omega)
+            // Scenario 3: S-curve CTRV yield trajectory with lane counter-steer and safe crosswalk clearance
+            parkingZones = [];
             var ctrv = integrateCtrvState(t);
 
             vehicles.push({
@@ -1234,8 +1242,8 @@
                 y: ctrv.y,
                 vx: Math.cos(ctrv.psi) * ctrv.v,
                 vy: Math.sin(ctrv.psi) * ctrv.v,
-                ax: 0,
-                ay: ctrv.a,
+                ax: Math.cos(ctrv.psi) * ctrv.a,
+                ay: Math.sin(ctrv.psi) * ctrv.a,
                 accelMs2: ctrv.a,
                 headingRad: ctrv.psi,
                 yawRate: ctrv.omega,
@@ -1245,26 +1253,26 @@
                 inParkingZone: false
             });
 
-            // Pedestrian P-04 crosses right-to-left into the curved CTRV turn path at y=8.40m
+            // Pedestrian P-04 crosses centered on zebra crosswalk (y=8.05m) onto left sidewalk (x=-2.9485m)
             var pedX, pedVx;
-            if (t < 5.10) {
-                pedVx = -0.95;
-                pedX = 1.95 + pedVx * t;
-            } else if (t < 5.40) {
-                var pu = t - 5.10;
-                var pAx = 0.95 / 0.30;
-                pedVx = -0.95 + pAx * pu;
-                pedX = 1.95 - 0.95 * 5.10 - 0.95 * pu + 0.5 * pAx * pu * pu;
+            if (t < 4.42) {
+                pedVx = -1.05;
+                pedX = 1.85 + pedVx * t;
+            } else if (t < 4.72) {
+                var pu = t - 4.42;
+                var pAx = 1.05 / 0.30;
+                pedVx = -1.05 + pAx * pu;
+                pedX = 1.85 - 1.05 * 4.42 - 1.05 * pu + 0.5 * pAx * pu * pu;
             } else {
                 pedVx = 0.0;
-                pedX = 1.95 - 0.95 * 5.10 - 0.5 * 0.95 * 0.30;
+                pedX = 1.85 - 1.05 * 4.42 - 0.5 * 1.05 * 0.30;
             }
             vrus.push({
                 trackId: 4,
                 kind: "pedestrian",
                 category: "pedestrian",
                 x: pedX,
-                y: 8.40,
+                y: 8.05,
                 vx: pedVx,
                 vy: 0,
                 radiusM: 0.42
