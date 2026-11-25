@@ -213,10 +213,7 @@ p {
   outline-offset: 2px;
 }
 
-.btn:focus:not(:focus-visible),
-.form-control:focus:not(:focus-visible),
-.select-compact:focus:not(:focus-visible),
-.scrubber-input:focus:not(:focus-visible) {
+:focus:not(:focus-visible) {
   outline: none;
 }
 
@@ -1086,21 +1083,56 @@ select.form-control:hover {
 
 .pipeline-node {
   cursor: pointer;
+  outline: none;
 }
 
-.pipeline-node rect {
+.pipeline-node:focus,
+.pipeline-node:focus-visible {
+  outline: none;
+}
+
+.pipeline-node .node-box,
+.pipeline-node > rect:not(.node-focus-ring) {
   fill: var(--bg-raised);
   stroke: var(--border-hairline);
   stroke-width: 1;
   transition: stroke 160ms var(--ease-out), fill 160ms var(--ease-out);
 }
 
-.pipeline-node:hover rect {
+.pipeline-node:hover .node-box,
+.pipeline-node:hover > rect:not(.node-focus-ring) {
   stroke: var(--border-strong);
 }
 
-.pipeline-node.is-selected rect {
+.pipeline-node.is-selected .node-box,
+.pipeline-node.is-selected > rect:not(.node-focus-ring) {
   stroke: var(--accent);
+  stroke-width: 1.5;
+}
+
+@supports (color: color-mix(in srgb, red, blue)) {
+  .pipeline-node.is-selected .node-box,
+  .pipeline-node.is-selected > rect:not(.node-focus-ring) {
+    fill: color-mix(in srgb, var(--accent) 8%, var(--bg-raised));
+  }
+}
+
+.pipeline-node .node-focus-ring {
+  fill: none;
+  stroke: var(--focus-ring);
+  stroke-width: 2;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms var(--ease-out);
+}
+
+.pipeline-node:focus-visible .node-focus-ring {
+  opacity: 1;
+}
+
+.pipeline-node text {
+  user-select: none;
+  pointer-events: none;
 }
 
 .node-title {
@@ -2362,6 +2394,17 @@ input.form-control:not([type="range"]):user-invalid {
   .seg-btn[aria-selected="true"] {
     outline: 2px solid Highlight;
     outline-offset: -2px;
+  }
+
+  .pipeline-node.is-selected .node-box,
+  .pipeline-node.is-selected > rect:not(.node-focus-ring) {
+    stroke: Highlight;
+    stroke-width: 2;
+  }
+
+  .pipeline-node:focus-visible .node-focus-ring {
+    stroke: Highlight;
+    opacity: 1;
   }
 
   .terminal-card[data-risk="1"],

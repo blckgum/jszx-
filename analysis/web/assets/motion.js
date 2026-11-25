@@ -756,6 +756,7 @@
                 var g = document.createElementNS(ns, "g");
                 g.setAttribute("data-stage", nodes[n].id);
                 var rect = document.createElementNS(ns, "rect");
+                rect.setAttribute("class", "node-box");
                 rect.setAttribute("x", String(nodes[n].x - 68));
                 rect.setAttribute("y", "32");
                 rect.setAttribute("width", "136");
@@ -859,7 +860,7 @@
         }
 
         // Update optional SVG alert indicator elements if present without overriding .is-selected CSS
-        var alertBadge = this._svg.querySelector("[data-stage='alert'] rect, [data-node='alert'] rect");
+        var alertBadge = this._svg.querySelector("[data-stage='alert'] rect.node-box, [data-stage='alert'] rect:not(.node-focus-ring), [data-node='alert'] rect:not(.node-focus-ring)");
         if (alertBadge) {
             alertBadge.style.stroke = this._riskLevel >= 2 ? alertColor : "";
         }

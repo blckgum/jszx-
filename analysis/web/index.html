@@ -316,32 +316,37 @@
                 </g>
 
                 <g class="pipeline-nodes">
-                  <g class="pipeline-node is-selected" data-stage="detect" tabindex="0" role="button" aria-label="YOLOv8 目标检测节点">
-                    <rect x="16" y="28" width="148" height="72" rx="8"></rect>
+                  <g class="pipeline-node is-selected" data-stage="detect" tabindex="0" role="button" aria-pressed="true" aria-label="YOLOv8 目标检测节点">
+                    <rect class="node-box" x="16" y="28" width="148" height="72" rx="8"></rect>
+                    <rect class="node-focus-ring" x="13" y="25" width="154" height="78" rx="10" aria-hidden="true"></rect>
                     <text x="90" y="57" text-anchor="middle" class="node-title" data-stage-label="detect">YOLOv8</text>
                     <text x="90" y="79" text-anchor="middle" class="node-sub" data-stage-sub="detect">多类别目标检测</text>
                   </g>
 
-                  <g class="pipeline-node" data-stage="track" tabindex="0" role="button" aria-label="ByteTrack 加 HSV 追踪节点">
-                    <rect x="214" y="28" width="148" height="72" rx="8"></rect>
+                  <g class="pipeline-node" data-stage="track" tabindex="0" role="button" aria-pressed="false" aria-label="ByteTrack 加 HSV 追踪节点">
+                    <rect class="node-box" x="214" y="28" width="148" height="72" rx="8"></rect>
+                    <rect class="node-focus-ring" x="211" y="25" width="154" height="78" rx="10" aria-hidden="true"></rect>
                     <text x="288" y="57" text-anchor="middle" class="node-title" data-stage-label="track">ByteTrack+HSV</text>
                     <text x="288" y="79" text-anchor="middle" class="node-sub" data-stage-sub="track">轨迹关联与缝合</text>
                   </g>
 
-                  <g class="pipeline-node" data-stage="motion" tabindex="0" role="button" aria-label="单应投影与 CTRV 运动学节点">
-                    <rect x="412" y="28" width="156" height="72" rx="8"></rect>
+                  <g class="pipeline-node" data-stage="motion" tabindex="0" role="button" aria-pressed="false" aria-label="单应投影与 CTRV 运动学节点">
+                    <rect class="node-box" x="412" y="28" width="156" height="72" rx="8"></rect>
+                    <rect class="node-focus-ring" x="409" y="25" width="162" height="78" rx="10" aria-hidden="true"></rect>
                     <text x="490" y="57" text-anchor="middle" class="node-title" data-stage-label="motion">Homography/CTRV</text>
                     <text x="490" y="79" text-anchor="middle" class="node-sub" data-stage-sub="motion">锚点偏置与测速</text>
                   </g>
 
-                  <g class="pipeline-node" data-stage="conflict" tabindex="0" role="button" aria-label="OBB-SSM 冲突评估节点">
-                    <rect x="618" y="28" width="148" height="72" rx="8"></rect>
+                  <g class="pipeline-node" data-stage="conflict" tabindex="0" role="button" aria-pressed="false" aria-label="OBB-SSM 冲突评估节点">
+                    <rect class="node-box" x="618" y="28" width="148" height="72" rx="8"></rect>
+                    <rect class="node-focus-ring" x="615" y="25" width="154" height="78" rx="10" aria-hidden="true"></rect>
                     <text x="692" y="57" text-anchor="middle" class="node-title" data-stage-label="conflict">OBB-SSM</text>
                     <text x="692" y="79" text-anchor="middle" class="node-sub" data-stage-sub="conflict">TTC / PET + VRU</text>
                   </g>
 
-                  <g class="pipeline-node" data-stage="alert" tabindex="0" role="button" aria-label="双端预警分发节点">
-                    <rect x="816" y="28" width="148" height="72" rx="8"></rect>
+                  <g class="pipeline-node" data-stage="alert" tabindex="0" role="button" aria-pressed="false" aria-label="双端预警分发节点">
+                    <rect class="node-box" x="816" y="28" width="148" height="72" rx="8"></rect>
+                    <rect class="node-focus-ring" x="813" y="25" width="154" height="78" rx="10" aria-hidden="true"></rect>
                     <text x="890" y="57" text-anchor="middle" class="node-title" data-stage-label="alert">双端预警</text>
                     <text x="890" y="79" text-anchor="middle" class="node-sub" data-stage-sub="alert">车端与路侧分流</text>
                   </g>

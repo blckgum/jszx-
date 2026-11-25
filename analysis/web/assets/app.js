@@ -45,12 +45,52 @@
     3: "L3 紧急避险"
   };
 
+  function getPipelineStageDetail(stage) {
+    var cfg = state && state.pipelineConfig ? state.pipelineConfig : {};
+    if (stage === "detect") {
+      return PIPELINE_STAGE_INFO.detect;
+    }
+    if (stage === "track") {
+      return cfg.stitching === false
+        ? "ByteTrack: 仅启用跨帧运动与 IoU 轨迹关联（未启用 HSV 外观缝合）"
+        : PIPELINE_STAGE_INFO.track;
+    }
+    if (stage === "motion") {
+      var sm = String(cfg.speedModel || "ctrv").toLowerCase();
+      if (sm === "kalman") {
+        return "单应 / Kalman: 地面逆透视映射、车辆锚点偏置补偿与二维恒速卡尔曼滤波";
+      }
+      if (sm === "ema") {
+        return "单应 / EMA: 地面逆透视映射、车辆锚点偏置补偿与滑动窗口指数平滑";
+      }
+      return PIPELINE_STAGE_INFO.motion;
+    }
+    if (stage === "conflict") {
+      var cm = String(cfg.conflictModel || "obb_ssm").toLowerCase();
+      var vruSuffix = cfg.cyclistVru === false ? "（已关闭骑行者 VRU 评估）" : "（含非机动车骑行者 VRU）";
+      if (cm === "cvm_circle") {
+        return "CVM-Circle: 恒速外推与圆形包络近似测距，计算 TTC 与最小间距 " + vruSuffix;
+      }
+      return "OBB-SSM: 旋转有向包围盒分离轴测距，计算 TTC、MTTC、DRAC 与 PET " + vruSuffix;
+    }
+    if (stage === "alert") {
+      return PIPELINE_STAGE_INFO.alert;
+    }
+    return "模块运行中";
+  }
+
+  function updatePipelineStageDetail() {
+    if (!dom.pipelineStageDetail) return;
+    dom.pipelineStageDetail.textContent = getPipelineStageDetail(state.selectedPipelineStage || "detect");
+  }
+
   var state = {
     theme: "dark",
     activeView: "monitor",
     mode: "simulation", // "simulation" | "replay" | "live"
     scenario: "crosswalk_braking",
     paused: false,
+    selectedPipelineStage: "detect",
     pipelineConfig: {
       speedModel: "ctrv",
       conflictModel: "obb_ssm",
@@ -551,7 +591,18 @@
     dom.viewSubtitle.textContent = meta.subtitle;
     document.title = meta.title + " | CampusMotion";
 
-    if (viewId === "history") {
+    if (viewId === "monitor") {
+      window.requestAnimationFrame(function () {
+        if (widgets.roadTwin && typeof widgets.roadTwin.refreshTheme === "function") {
+          widgets.roadTwin.refreshTheme();
+        }
+        if (state.mode === "simulation" && widgets.simCamera && typeof widgets.simCamera.refreshTheme === "function") {
+          widgets.simCamera.refreshTheme();
+        } else if (state.mode === "replay" && widgets.replayCamera && typeof widgets.replayCamera.refreshTheme === "function") {
+          widgets.replayCamera.refreshTheme();
+        }
+      });
+    } else if (viewId === "history") {
       if (!state.runs.length) {
         loadRunsList();
       } else if (widgets.speedChart && typeof widgets.speedChart.refreshTheme === "function") {
@@ -692,6 +743,7 @@
 
   function applyPipelineConfigChange() {
     updateAlgorithmBadges();
+    updatePipelineStageDetail();
     if (widgets.pipeline && typeof widgets.pipeline.setConfig === "function") {
       widgets.pipeline.setConfig(state.pipelineConfig);
     }
@@ -3590,10 +3642,12 @@
     document.querySelectorAll(".pipeline-node").forEach(function (node) {
       function activateNode() {
         document.querySelectorAll(".pipeline-node").forEach(function (n) {
-          n.classList.toggle("is-selected", n === node);
+          var selected = n === node;
+          n.classList.toggle("is-selected", selected);
+          n.setAttribute("aria-pressed", selected ? "true" : "false");
         });
-        var stage = node.getAttribute("data-stage");
-        dom.pipelineStageDetail.textContent = PIPELINE_STAGE_INFO[stage] || "模块运行中";
+        state.selectedPipelineStage = node.getAttribute("data-stage") || "detect";
+        updatePipelineStageDetail();
       }
       node.addEventListener("click", activateNode);
       node.addEventListener("keydown", function (ev) {
@@ -3815,7 +3869,7 @@
     setMonitorMode("simulation");
     switchStudioTab("calib");
     setCalibTool("points");
-    dom.pipelineStageDetail.textContent = PIPELINE_STAGE_INFO.detect;
+    updatePipelineStageDetail();
     loadHealth();
     loadSystemInfo();
     loadRunsList();
