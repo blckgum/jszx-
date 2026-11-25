@@ -2444,6 +2444,49 @@ input.form-control:not([type="range"]):user-invalid {
 }
 
 /* Responsive Breakpoints */
+@media (min-width: 1121px) {
+  .monitor-grid {
+    grid-template-columns: minmax(0, 1.08fr) minmax(456px, 1fr);
+    grid-template-rows: auto minmax(260px, 1fr) auto;
+  }
+
+  .monitor-card {
+    display: grid;
+    grid-row: span 3;
+    grid-template-rows: subgrid;
+    row-gap: 0;
+  }
+
+  .monitor-card > .card-header {
+    gap: var(--space-2);
+    align-content: center;
+    align-items: center;
+  }
+
+  .viewport-stage,
+  .twin-stage {
+    height: auto;
+    min-height: 260px;
+    align-self: stretch;
+  }
+
+  .viewport-media-wrap {
+    height: auto;
+    min-height: 100%;
+  }
+
+  #scenario-select {
+    min-inline-size: 110px;
+  }
+
+  #twin-mode-label {
+    max-inline-size: 148px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
 @media (max-width: 1120px) {
   .kpi-grid,
   .summary-pills-grid {

@@ -1498,6 +1498,150 @@ class TestPipelineCtrvAnchorAndLiveDropIntegration(unittest.TestCase):
             )
             svc.stop_job(j2["job_id"], wait_timeout_s=2.0)
 
+    def test_reused_output_dir_cleans_stale_media_and_timeline_covers_full_run(self):
+        from analysis.service import create_fastapi_app, create_http_server
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cal = RoadCalibrator(
+                [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)], 6.0, 15.0
+            )
+            vid = root / "src.mp4"
+            writer = cv2.VideoWriter(str(vid), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (128, 96))
+            self.assertTrue(writer.isOpened())
+            for idx in range(5):
+                frame = np.full((96, 128, 3), 20 + idx * 30, dtype=np.uint8)
+                writer.write(frame)
+            writer.release()
+
+            tracks_sparse = root / "sparse.jsonl"
+            tracks_sparse.write_text(
+                "\n".join(
+                    json.dumps({
+                        "schema_version": 1,
+                        "session_id": "s-1",
+                        "source": str(vid),
+                        "frame_index": f_idx,
+                        "timestamp_s": f_idx * 0.1,
+                        "timestamp_source": "video_pts",
+                        "width": 128,
+                        "height": 96,
+                        "tracks": [{
+                            "track_id": 1,
+                            "class_id": 2,
+                            "class_name": "car",
+                            "category": "vehicle",
+                            "confidence": 0.9,
+                            "bbox_xyxy": [40.0, 40.0, 60.0, 70.0],
+                            "anchor_xy": [50.0, 70.0],
+                        }],
+                    })
+                    for f_idx in (0, 2, 4)
+                ) + "\n",
+                encoding="utf-8",
+            )
+            tracks_only = root / "tracks_only.jsonl"
+            tracks_only.write_text(
+                "\n".join(
+                    json.dumps({
+                        "schema_version": 1,
+                        "session_id": "s-2",
+                        "source": "offline",
+                        "frame_index": f_idx,
+                        "timestamp_s": f_idx * 0.1,
+                        "timestamp_source": "video_pts",
+                        "width": 128,
+                        "height": 96,
+                        "tracks": [{
+                            "track_id": 9,
+                            "class_id": 2,
+                            "class_name": "car",
+                            "category": "vehicle",
+                            "confidence": 0.9,
+                            "bbox_xyxy": [42.0, 42.0, 62.0, 72.0],
+                            "anchor_xy": [52.0, 72.0],
+                        }],
+                    })
+                    for f_idx in (0, 1)
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            runs_root = root / "runs"
+            reused = runs_root / "reused-dir"
+            pipe = ConflictPerceptionPipeline(calibrator=cal)
+            s1 = pipe.process_tracks(tracks_sparse, reused, video_path=vid)
+            self.assertIsNotNone(s1["annotated_output"])
+            self.assertIsNotNone(s1["video_frame_map"])
+
+            svc = AnalysisService(runs_root=runs_root)
+            sum1 = svc.get_run_summary("reused-dir")
+            self.assertEqual(sum1["video_frame_indices"], [0, 2, 4])
+
+            # 复用同一 output_dir 运行纯轨迹分析后，必须清理旧视频和旧映射，服务接口也必须拒绝返回旧媒体
+            s2 = pipe.process_tracks(tracks_only, reused, video_path=None)
+            self.assertIsNone(s2["annotated_output"])
+            self.assertIsNone(s2["video_frame_map"])
+            self.assertFalse((reused / "annotated_conflict.mp4").exists())
+            self.assertFalse((reused / "video_frame_map.json").exists())
+            sum2 = svc.get_run_summary("reused-dir")
+            self.assertFalse(sum2["has_video"])
+            self.assertFalse(sum2["has_video_frame_map"])
+            with self.assertRaises(FileNotFoundError):
+                svc.get_run_frame_jpeg("reused-dir", frame_index=2)
+
+            # 即便磁盘上意外残留旧文件，summary 显式声明 annotated_output: null 时仍应屏蔽
+            (reused / "annotated_conflict.mp4").write_bytes(b"stale")
+            self.assertFalse(svc.get_run_summary("reused-dir")["has_video"])
+            with self.assertRaises(FileNotFoundError):
+                svc.get_run_video_path("reused-dir")
+            with self.assertRaises(FileNotFoundError):
+                svc.resolve_run_export_file("reused-dir", "annotated_conflict.mp4")
+
+            # 501 帧 x 85 目标全量 /timeline 测试（覆盖 stdlib HTTP 与 FastAPI）
+            dense_dir = runs_root / "dense-501"
+            dense_dir.mkdir(parents=True, exist_ok=True)
+            (dense_dir / "summary.json").write_text(
+                json.dumps({"frames_processed": 501, "speed_limit_kmh": 30.0}),
+                encoding="utf-8",
+            )
+            with (dense_dir / "speeds.csv").open("w", encoding="utf-8", newline="") as f_csv:
+                w = csv.writer(f_csv)
+                w.writerow(["frame_idx", "timestamp_s", "track_id", "category", "x_m", "y_m", "speed_kmh", "risk_level", "ttc_s"])
+                for fi in range(501):
+                    for oi in range(85):
+                        spd = 42.0 if fi == 499 and oi == 0 else 12.0
+                        risk = "LEVEL_3_CRITICAL" if fi == 499 and oi == 0 else "LEVEL_0_SAFE"
+                        ttc = "1.1" if fi == 499 and oi == 0 else ""
+                        w.writerow([fi, round(fi * 0.1, 3), oi + 1, "car", 1.0, 2.0, spd, risk, ttc])
+
+            server = create_http_server(svc, host="127.0.0.1", port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                with urlopen(f"http://127.0.0.1:{port}/api/runs/dense-501/timeline?max_points=2000", timeout=5.0) as resp:
+                    tl = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(tl["total_frames"], 501)
+                self.assertEqual(tl["point_count"], 501)
+                self.assertEqual(tl["points"][-1]["frame_index"], 500)
+                p499 = next(p for p in tl["points"] if p["frame_index"] == 499)
+                self.assertAlmostEqual(p499["speed_kmh"], 42.0, places=2)
+                self.assertEqual(p499["risk_level"], 3)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+            import importlib.util
+            if importlib.util.find_spec("fastapi") is not None:
+                fastapi_app = create_fastapi_app(svc)
+                self.assertIsNotNone(fastapi_app)
+                routes = {r.path for r in fastapi_app.routes}
+                self.assertIn("/api/runs/{run_id}/timeline", routes)
+            else:
+                src_text = Path(inspect.getfile(create_fastapi_app)).read_text(encoding="utf-8")
+                self.assertIn('@app.get("/api/runs/{run_id}/timeline")', src_text)
+
 
 if __name__ == "__main__":
     unittest.main()

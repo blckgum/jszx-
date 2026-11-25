@@ -209,20 +209,29 @@ class VideoClock:
         self.force_fps = force_fps
         self.previous = -1.0
         self.previous_frame_index = -1
+        self.last_raw_pts = None
 
     def timestamp(self, frame_index: int, milliseconds: float):
         if frame_index <= self.previous_frame_index:
             raise ValueError("视频时间戳不递增；检查输入或经确认后用 --fps 指定固定帧率")
-        timestamp = milliseconds / 1000.0
-        kind = "video_pts"
-        if (self.force_fps or not math.isfinite(timestamp) or timestamp < 0
-                or timestamp <= self.previous):
+        raw_ts = milliseconds / 1000.0
+        has_valid_raw = (not self.force_fps) and math.isfinite(raw_ts) and raw_ts >= 0.0
+        if has_valid_raw and raw_ts > self.previous:
+            timestamp = raw_ts
+            kind = "video_pts"
+        elif has_valid_raw and self.last_raw_pts is not None and raw_ts > self.last_raw_pts:
+            # 原始 PTS 恢复递增但仍落后于此前估算时钟，按真实帧间差推进单调时间，避免丢失变帧率间隔。
+            timestamp = self.previous + (raw_ts - self.last_raw_pts)
+            kind = "fps_estimate"
+        else:
             kind = "fps_estimate"
             if self.force_fps or self.previous < 0:
                 timestamp = frame_index / self.fps
             else:
                 step = (frame_index - self.previous_frame_index) / self.fps
                 timestamp = max(frame_index / self.fps, self.previous + step)
+        if has_valid_raw and (self.last_raw_pts is None or raw_ts >= self.last_raw_pts):
+            self.last_raw_pts = raw_ts
         if timestamp <= self.previous:
             raise ValueError("视频时间戳不递增；检查输入或经确认后用 --fps 指定固定帧率")
         self.previous = timestamp

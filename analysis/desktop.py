@@ -367,57 +367,64 @@ def run_desktop(
 
     logger, file_handler = _create_logger(log_path)
     lock_path = data_dir / "instance.lock"
+    service = None
+    server = None
+    server_thread: Optional[threading.Thread] = None
+    bound_port: Optional[int] = None
+    instance_written = False
+    browser_proc: Optional[subprocess.Popen] = None
+    browser_exit_code: Optional[int] = None
+    fatal_error = False
     try:
-        with _startup_lock(lock_path):
-            existing_url = _check_existing_instance(instance_path, logger)
-            if existing_url is not None:
-                logger.info("Existing CampusMotion instance alive at %s", existing_url)
-                if not no_open:
-                    _open_url(
-                        existing_url,
-                        app_data_dir=data_dir,
-                        browser_only=browser_only,
-                        logger=logger,
-                    )
-                return 0
-
-            shutdown_event = threading.Event()
-            service = AnalysisService(
-                runs_root=runs_root,
-                default_calib=default_calib,
-                desktop_mode=True,
-                allow_shutdown=True,
-                shutdown_callback=shutdown_event.set,
-            )
-            server = _bind_server_with_port_scan(service, host, port)
-            bound_host, bound_port = server.server_address[:2]
-            display_host = "127.0.0.1" if bound_host in ("0.0.0.0", "::", "") else bound_host
-            url = f"http://{display_host}:{bound_port}/"
-
-            server_thread = threading.Thread(
-                target=server.serve_forever,
-                name="CampusMotionDesktopHTTP",
-                daemon=True,
-            )
-            server_thread.start()
-
-            ready_deadline = time.monotonic() + 3.0
-            while time.monotonic() < ready_deadline:
-                if _is_health_ok(url, timeout_s=0.3):
-                    break
-                time.sleep(0.025)
-
-            _write_instance_file(
-                instance_path,
-                pid=os.getpid(),
-                host=display_host,
-                port=int(bound_port),
-                url=url,
-            )
-            logger.info("CampusMotion desktop server listening at %s", url)
-
-        browser_proc: Optional[subprocess.Popen] = None
         try:
+            with _startup_lock(lock_path):
+                existing_url = _check_existing_instance(instance_path, logger)
+                if existing_url is not None:
+                    logger.info("Existing CampusMotion instance alive at %s", existing_url)
+                    if not no_open:
+                        _open_url(
+                            existing_url,
+                            app_data_dir=data_dir,
+                            browser_only=browser_only,
+                            logger=logger,
+                        )
+                    return 0
+
+                shutdown_event = threading.Event()
+                service = AnalysisService(
+                    runs_root=runs_root,
+                    default_calib=default_calib,
+                    desktop_mode=True,
+                    allow_shutdown=True,
+                    shutdown_callback=shutdown_event.set,
+                )
+                server = _bind_server_with_port_scan(service, host, port)
+                bound_host, bound_port = server.server_address[:2]
+                display_host = "127.0.0.1" if bound_host in ("0.0.0.0", "::", "") else bound_host
+                url = f"http://{display_host}:{bound_port}/"
+
+                server_thread = threading.Thread(
+                    target=server.serve_forever,
+                    name="CampusMotionDesktopHTTP",
+                    daemon=True,
+                )
+                server_thread.start()
+
+                ready_deadline = time.monotonic() + 3.0
+                while time.monotonic() < ready_deadline:
+                    if _is_health_ok(url, timeout_s=0.3):
+                        break
+                    time.sleep(0.025)
+
+                _write_instance_file(
+                    instance_path,
+                    pid=os.getpid(),
+                    host=display_host,
+                    port=int(bound_port),
+                    url=url,
+                )
+                instance_written = True
+                logger.info("CampusMotion desktop server listening at %s", url)
 
             if not no_open:
                 browser_proc = _open_url(
@@ -430,14 +437,26 @@ def run_desktop(
             try:
                 while not shutdown_event.is_set():
                     if browser_proc is not None and browser_proc.poll() is not None:
-                        logger.info(
-                            "Browser app process exited with return code %s",
-                            browser_proc.returncode,
-                        )
+                        browser_exit_code = int(browser_proc.returncode)
+                        if browser_exit_code != 0:
+                            logger.error(
+                                "Browser app process exited abnormally with return code %s (0x%x)",
+                                browser_exit_code,
+                                browser_exit_code & 0xFFFFFFFF,
+                            )
+                        else:
+                            logger.info(
+                                "Browser app process exited with return code %s",
+                                browser_exit_code,
+                            )
                         break
                     shutdown_event.wait(timeout=0.25)
             except KeyboardInterrupt:
                 logger.info("Received KeyboardInterrupt; shutting down desktop host.")
+        except Exception as exc:
+            fatal_error = True
+            logger.exception("Desktop host encountered fatal error: %s", exc)
+            raise
         finally:
             if browser_proc is not None and browser_proc.poll() is None:
                 try:
@@ -445,26 +464,36 @@ def run_desktop(
                     browser_proc.wait(timeout=2.0)
                 except Exception:
                     pass
-            try:
-                service.stop_active_jobs(wait_timeout_s=2.0)
-            except Exception as exc:
-                logger.warning("Error stopping active jobs: %s", exc)
-            try:
-                server.shutdown()
-            except Exception:
-                pass
-            try:
-                server.server_close()
-            except Exception:
-                pass
-            _cleanup_own_instance_file(
-                instance_path, pid=os.getpid(), port=int(bound_port)
-            )
-            logger.info("CampusMotion desktop host stopped cleanly.")
+            if service is not None:
+                try:
+                    service.stop_active_jobs(wait_timeout_s=2.0)
+                except Exception as exc:
+                    logger.warning("Error stopping active jobs: %s", exc)
+            if server is not None:
+                if server_thread is not None and server_thread.is_alive():
+                    try:
+                        server.shutdown()
+                    except Exception:
+                        pass
+                    try:
+                        server_thread.join(timeout=2.0)
+                    except Exception:
+                        pass
+                try:
+                    server.server_close()
+                except Exception:
+                    pass
+            if instance_written and bound_port is not None:
+                _cleanup_own_instance_file(
+                    instance_path, pid=os.getpid(), port=int(bound_port)
+                )
+            if server is not None and not fatal_error and (
+                browser_exit_code is None or browser_exit_code == 0
+            ):
+                logger.info("CampusMotion desktop host stopped cleanly.")
+        if browser_exit_code is not None and browser_exit_code != 0:
+            return browser_exit_code if 1 <= browser_exit_code <= 255 else 1
         return 0
-    except Exception as exc:
-        logger.exception("Desktop host encountered fatal error: %s", exc)
-        raise
     finally:
         logger.removeHandler(file_handler)
         file_handler.close()

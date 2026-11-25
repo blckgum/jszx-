@@ -591,6 +591,8 @@ def evaluate_mot(
     id_switches = 0
     fragmentations = 0
     last_matched_pred: dict[int, int] = {}
+    prev_frame_matched_pred: dict[int, int] = {}
+    prev_f_idx: Optional[int] = None
     ever_tracked: dict[int, bool] = {}
     was_tracked: dict[int, bool] = {}
     gt_matched_frames: Counter[int] = Counter()
@@ -599,16 +601,45 @@ def evaluate_mot(
     idf1_pair_counts: Counter[tuple[int, int]] = Counter()
 
     eps = 1e-12
-    for _, g_ids, p_ids, iou_mat in frame_cache:
+    for f_idx, g_ids, p_ids, iou_mat in frame_cache:
         valid = iou_mat >= (thresh - eps)
         if valid.any():
             nz_rows, nz_cols = np.nonzero(valid)
             for r_i, c_i in zip(nz_rows.tolist(), nz_cols.tolist()):
                 idf1_pair_counts[(g_ids[r_i], p_ids[c_i])] += 1
 
-        # CLEAR 边权 = (min(N, M) + 1) + IoU，确保绝对优先最大化匹配对基数，再在同基数下选最大 IoU 总和
-        card_bonus = float(min(len(g_ids), len(p_ids)) + 1)
-        clear_pairs = _solve_max_weight_assignment(card_bonus + iou_mat, valid, use_lap=_use_lap)
+        if prev_f_idx is None or f_idx != prev_f_idx + 1:
+            prev_frame_matched_pred.clear()
+
+        # 按 TrackEval CLEAR 规则优先延续上一相邻帧通过门限的配对，其余目标再最大化基数与 IoU 总和
+        clear_pairs: list[tuple[int, int]] = []
+        used_rows: set[int] = set()
+        used_cols: set[int] = set()
+        pred_col_by_id = {pid: c_i for c_i, pid in enumerate(p_ids)}
+        for r_i, gid in enumerate(g_ids):
+            prev_pid = prev_frame_matched_pred.get(gid)
+            if prev_pid is None:
+                continue
+            c_i = pred_col_by_id.get(prev_pid)
+            if c_i is not None and bool(valid[r_i, c_i]) and c_i not in used_cols:
+                clear_pairs.append((r_i, c_i))
+                used_rows.add(r_i)
+                used_cols.add(c_i)
+
+        rem_rows = [r_i for r_i in range(len(g_ids)) if r_i not in used_rows]
+        rem_cols = [c_i for c_i in range(len(p_ids)) if c_i not in used_cols]
+        if rem_rows and rem_cols:
+            sub_iou = iou_mat[np.ix_(rem_rows, rem_cols)]
+            sub_valid = valid[np.ix_(rem_rows, rem_cols)]
+            card_bonus = float(min(len(rem_rows), len(rem_cols)) + 1)
+            for sr, sc in _solve_max_weight_assignment(
+                card_bonus + sub_iou, sub_valid, use_lap=_use_lap
+            ):
+                clear_pairs.append((rem_rows[sr], rem_cols[sc]))
+
+        prev_frame_matched_pred = {g_ids[r_i]: p_ids[c_i] for r_i, c_i in clear_pairs}
+        prev_f_idx = f_idx
+
         matched_gt_set: set[int] = set()
         for r_i, c_i in clear_pairs:
             gid = g_ids[r_i]

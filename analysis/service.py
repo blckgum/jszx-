@@ -705,6 +705,7 @@ class AnalysisService:
                 continue
             if not isinstance(summary, dict):
                 continue
+            video_disabled = self._summary_disables_video(summary)
             items.append((
                 mtime,
                 {
@@ -717,11 +718,41 @@ class AnalysisService:
                     "max_observed_speed_kmh": summary.get("max_observed_speed_kmh"),
                     "total_alert_events": summary.get("total_alert_events", 0),
                     "total_critical_conflicts": summary.get("total_critical_conflicts", 0),
-                    "has_video": (entry / "annotated_conflict.mp4").is_file(),
+                    "has_video": (not video_disabled) and (entry / "annotated_conflict.mp4").is_file(),
                 },
             ))
         items.sort(key=lambda pair: (pair[0], pair[1]["run_id"]), reverse=True)
         return [item for _, item in items]
+
+    @staticmethod
+    def _read_optional_summary(run_dir: Path) -> Optional[dict]:
+        """安全读取运行目录 summary.json（不存在或解析失败时返回 None）。"""
+        summary_path = run_dir / "summary.json"
+        if not summary_path.is_file():
+            return None
+        try:
+            data = load_json_strict(summary_path)
+        except (SchemaValidationError, OSError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _summary_disables_video(summary: Optional[dict]) -> bool:
+        """仅当 summary 显式声明 annotated_output 为 null 时视为无输出视频。"""
+        return (
+            isinstance(summary, dict)
+            and "annotated_output" in summary
+            and summary["annotated_output"] is None
+        )
+
+    @staticmethod
+    def _summary_disables_frame_map(summary: Optional[dict]) -> bool:
+        """仅当 summary 显式声明 video_frame_map 为 null 时视为无帧映射。"""
+        return (
+            isinstance(summary, dict)
+            and "video_frame_map" in summary
+            and summary["video_frame_map"] is None
+        )
 
     def get_run_summary(self, run_id: str) -> dict:
         """严格读取指定运行目录的 summary.json。"""
@@ -732,15 +763,18 @@ class AnalysisService:
         data = load_json_strict(summary_path)
         if not isinstance(data, dict):
             raise SchemaValidationError("summary.json 顶层必须是 JSON 对象")
-        frame_map = self._load_video_frame_map(run_dir)
+        video_disabled = self._summary_disables_video(data)
+        map_disabled = video_disabled or self._summary_disables_frame_map(data)
+        frame_map = None if map_disabled else self._load_video_frame_map(run_dir)
         out = {
             "run_id": run_id,
-            "has_video": (run_dir / "annotated_conflict.mp4").is_file(),
+            "has_video": (not video_disabled) and (run_dir / "annotated_conflict.mp4").is_file(),
             "has_video_frame_map": frame_map is not None,
             **data,
         }
         if frame_map is not None:
             out["video_frame_count"] = len(frame_map)
+            out["video_frame_indices"] = frame_map
         return out
 
     @staticmethod
@@ -917,9 +951,179 @@ class AnalysisService:
             run_id, limit=limit, frame_start=frame_start, frame_end=frame_end
         )["conflicts"]
 
+    @staticmethod
+    def _parse_risk_int(val: Any) -> int:
+        if type(val) is int:
+            return val if 0 <= val <= 3 else 0
+        raw = str(val or "").strip().upper()
+        if raw in ("3", "LEVEL_3_CRITICAL"):
+            return 3
+        if raw in ("2", "LEVEL_2_CAUTION"):
+            return 2
+        if raw in ("1", "LEVEL_1_SPEEDING"):
+            return 1
+        return 0
+
+    def get_run_timeline(self, run_id: str, *, max_points: int = 2000) -> dict:
+        """流式聚合完整运行的逐帧峰值车速、最小 TTC 与最高风险序列（供全量时间轴图表渲染）。"""
+        if type(max_points) is not int or max_points < 10 or max_points > 20000:
+            raise ValueError("max_points 必须是 [10, 20000] 区间整数")
+        run_dir = self._resolve_run_dir(run_id)
+        by_frame: Dict[int, Dict[str, Any]] = {}
+        has_vehicle_rows = False
+
+        csv_path = run_dir / "speeds.csv"
+        if csv_path.is_file():
+            with csv_path.open("r", encoding="utf-8", newline="") as stream:
+                reader = csv.DictReader(stream)
+                for raw_row in reader:
+                    try:
+                        f_idx = int(raw_row.get("frame_idx", -1))
+                    except (TypeError, ValueError):
+                        continue
+                    if f_idx < 0:
+                        continue
+                    try:
+                        spd = float(raw_row.get("speed_kmh") or 0.0)
+                    except (TypeError, ValueError):
+                        spd = 0.0
+                    if not math.isfinite(spd):
+                        spd = 0.0
+                    try:
+                        ts_val = float(raw_row.get("timestamp_s") or "")
+                    except (TypeError, ValueError):
+                        ts_val = f_idx * 0.1
+                    if not math.isfinite(ts_val):
+                        ts_val = f_idx * 0.1
+                    ttc_val: Optional[float] = None
+                    raw_ttc = raw_row.get("ttc_s", "")
+                    if raw_ttc not in ("", None):
+                        try:
+                            cand_ttc = float(raw_ttc)
+                            if math.isfinite(cand_ttc):
+                                ttc_val = cand_ttc
+                        except (TypeError, ValueError):
+                            pass
+                    risk = self._parse_risk_int(raw_row.get("risk_level"))
+                    cat_low = str(raw_row.get("category") or "").strip().lower()
+                    is_ped = cat_low in ("pedestrian", "person")
+                    if cat_low and not is_ped:
+                        has_vehicle_rows = True
+
+                    entry = by_frame.get(f_idx)
+                    if entry is None:
+                        entry = {
+                            "frame_index": f_idx,
+                            "timestamp_s": ts_val,
+                            "max_veh_speed": 0.0 if is_ped else spd,
+                            "max_any_speed": spd,
+                            "ttc_s": ttc_val,
+                            "risk_level": risk,
+                        }
+                        by_frame[f_idx] = entry
+                    else:
+                        if not is_ped and spd > entry["max_veh_speed"]:
+                            entry["max_veh_speed"] = spd
+                        if spd > entry["max_any_speed"]:
+                            entry["max_any_speed"] = spd
+                        if risk > entry["risk_level"]:
+                            entry["risk_level"] = risk
+                        if ttc_val is not None and (entry["ttc_s"] is None or ttc_val < entry["ttc_s"]):
+                            entry["ttc_s"] = ttc_val
+
+        jsonl_path = run_dir / "conflicts.jsonl"
+        if jsonl_path.is_file():
+            for rec in load_jsonl_strict(jsonl_path):
+                if not isinstance(rec, dict):
+                    continue
+                f_idx = rec.get("frame_index")
+                if type(f_idx) is not int or f_idx < 0:
+                    continue
+                a = rec.get("assessment") if isinstance(rec.get("assessment"), dict) else rec
+                if not isinstance(a, dict):
+                    continue
+                raw_spd = a.get("veh_speed_kmh", 0.0)
+                spd = float(raw_spd) if isinstance(raw_spd, (int, float)) and type(raw_spd) is not bool and math.isfinite(raw_spd) else 0.0
+                raw_ttc = a.get("ttc_seconds")
+                ttc_val = float(raw_ttc) if isinstance(raw_ttc, (int, float)) and type(raw_ttc) is not bool and math.isfinite(raw_ttc) else None
+                risk = self._parse_risk_int(a.get("risk_level"))
+                raw_ts = rec.get("timestamp_s")
+                ts_val = float(raw_ts) if isinstance(raw_ts, (int, float)) and type(raw_ts) is not bool and math.isfinite(raw_ts) else f_idx * 0.1
+
+                entry = by_frame.get(f_idx)
+                if entry is None:
+                    by_frame[f_idx] = {
+                        "frame_index": f_idx,
+                        "timestamp_s": ts_val,
+                        "max_veh_speed": spd,
+                        "max_any_speed": spd,
+                        "ttc_s": ttc_val,
+                        "risk_level": risk,
+                    }
+                else:
+                    if spd > entry["max_veh_speed"]:
+                        entry["max_veh_speed"] = spd
+                    if spd > entry["max_any_speed"]:
+                        entry["max_any_speed"] = spd
+                    if risk > entry["risk_level"]:
+                        entry["risk_level"] = risk
+                    if ttc_val is not None and (entry["ttc_s"] is None or ttc_val < entry["ttc_s"]):
+                        entry["ttc_s"] = ttc_val
+
+        sorted_frames = [by_frame[k] for k in sorted(by_frame)]
+        full_points = [
+            {
+                "frame_index": item["frame_index"],
+                "timestamp_s": round(item["timestamp_s"], 3),
+                "speed_kmh": round(item["max_veh_speed"] if has_vehicle_rows else item["max_any_speed"], 2),
+                "ttc_s": round(item["ttc_s"], 3) if item["ttc_s"] is not None else None,
+                "risk_level": item["risk_level"],
+            }
+            for item in sorted_frames
+        ]
+
+        total_frames = len(full_points)
+        downsampled = total_frames > max_points
+        if not downsampled:
+            out_points = full_points
+        else:
+            out_points = []
+            for bi in range(max_points):
+                lo = (bi * total_frames) // max_points
+                hi = ((bi + 1) * total_frames) // max_points
+                if hi <= lo:
+                    continue
+                bucket = full_points[lo:hi]
+                rep = max(
+                    bucket,
+                    key=lambda p: (
+                        p["risk_level"],
+                        -(p["ttc_s"] if p["ttc_s"] is not None else 9999.0),
+                        p["speed_kmh"],
+                    ),
+                )
+                ttcs = [p["ttc_s"] for p in bucket if p["ttc_s"] is not None]
+                out_points.append({
+                    "frame_index": rep["frame_index"],
+                    "timestamp_s": rep["timestamp_s"],
+                    "speed_kmh": max(p["speed_kmh"] for p in bucket),
+                    "ttc_s": min(ttcs) if ttcs else None,
+                    "risk_level": max(p["risk_level"] for p in bucket),
+                })
+
+        return {
+            "run_id": run_id,
+            "total_frames": total_frames,
+            "point_count": len(out_points),
+            "downsampled": downsampled,
+            "points": out_points,
+        }
+
     def get_run_video_path(self, run_id: str) -> Path:
         """校验并返回指定运行目录中标注输出视频 annotated_conflict.mp4 的安全路径。"""
         run_dir = self._resolve_run_dir(run_id)
+        if self._summary_disables_video(self._read_optional_summary(run_dir)):
+            raise FileNotFoundError(f"运行摘要声明无标注视频: {run_id}")
         video_path = (run_dir / "annotated_conflict.mp4").resolve()
         if video_path == run_dir or not video_path.is_relative_to(run_dir):
             raise ValueError(f"非法的视频路径（越出运行目录）: {run_id}")
@@ -932,7 +1136,10 @@ class AnalysisService:
         if type(frame_index) is not int or frame_index < 0:
             raise ValueError("frame_index 必须是非负整数")
         run_dir = self._resolve_run_dir(run_id)
-        frame_map = self._load_video_frame_map(run_dir)
+        summary = self._read_optional_summary(run_dir)
+        if self._summary_disables_video(summary):
+            raise FileNotFoundError(f"运行摘要声明无标注视频: {run_id}")
+        frame_map = None if self._summary_disables_frame_map(summary) else self._load_video_frame_map(run_dir)
         target_video_pos = frame_index
         if frame_map is not None:
             pos = bisect_left(frame_map, frame_index)
@@ -1598,6 +1805,10 @@ class AnalysisService:
         if media_type is None:
             raise ValueError(f"不允许导出的文件名: {filename}")
         run_dir = self._resolve_run_dir(run_id)
+        if clean_name == "annotated_conflict.mp4" and self._summary_disables_video(
+            self._read_optional_summary(run_dir)
+        ):
+            raise FileNotFoundError(f"运行摘要声明无标注视频: {run_id}")
         target = (run_dir / clean_name).resolve()
         if target == run_dir or not target.is_relative_to(run_dir):
             raise ValueError(f"非法的导出文件路径: {filename}")
@@ -2156,6 +2367,14 @@ def create_http_server(
                             ),
                         )
                         return
+                    if sub == "timeline":
+                        max_points = self._parse_int_query(query, "max_points", 2000)
+                        assert max_points is not None
+                        self._send_json(
+                            HTTPStatus.OK,
+                            service.get_run_timeline(run_id, max_points=max_points),
+                        )
+                        return
                     if sub == "frame":
                         frame_index = self._parse_int_query(query, "index", 0)
                         assert frame_index is not None
@@ -2601,6 +2820,13 @@ def create_fastapi_app(service: Optional[AnalysisService] = None):
                     frame_end=frame_end,
                 )
             )
+        except Exception as exc:
+            _raise_http(exc)
+
+    @app.get("/api/runs/{run_id}/timeline")
+    def run_timeline(run_id: str, max_points: int = 2000):
+        try:
+            return _json_response(svc.get_run_timeline(run_id, max_points=max_points))
         except Exception as exc:
             _raise_http(exc)
 

@@ -574,6 +574,49 @@ class TestConflictAnalyzer(unittest.TestCase):
         self.assertAlmostEqual(res_16.ttc_seconds, 3.25, delta=1e-4)
         self.assertAlmostEqual(res_16.min_distance_m, 0.0, delta=1e-4)
 
+    def test_cvm_already_overlapping_envelope_same_speed_diverging_and_lateral(self):
+        veh = SpeedReading(
+            track_id=1, category="vehicle", x_m=0.0, y_m=0.0,
+            vx_ms=4.0, vy_ms=0.0, speed_ms=4.0, speed_kmh=14.4,
+            is_speeding=False, heading_deg=0.0, is_reliable=True,
+        )
+        # 间距 2.0m <= 默认安全半径和 3.0m：同速、轻度远离与横向擦身均应触发 TTC=0.0 L3
+        for label, px, py, pvx in (
+            ("same_speed", 2.0, 0.0, 4.0),
+            ("diverging", 2.0, 0.0, 5.0),
+            ("lateral_pass", 0.0, 2.0, 0.0),
+        ):
+            with self.subTest(case=label):
+                ped = SpeedReading(
+                    track_id=2, category="pedestrian", x_m=px, y_m=py,
+                    vx_ms=pvx, vy_ms=0.0, speed_ms=abs(pvx), speed_kmh=abs(pvx) * 3.6,
+                    is_speeding=False, heading_deg=0.0, is_reliable=True,
+                )
+                res = self.analyzer.evaluate_pair(veh, ped)
+                self.assertIsNotNone(res)
+                self.assertEqual(res.risk_level, RiskLevel.LEVEL_3_CRITICAL)
+                self.assertAlmostEqual(res.ttc_seconds, 0.0, delta=1e-6)
+                self.assertAlmostEqual(res.min_distance_m, 2.0, delta=1e-6)
+
+        # 未重叠但同速平行（距离 4.0m > 3.0m）不得误报；可靠静止车辆仍豁免
+        ped_outside = SpeedReading(
+            track_id=3, category="pedestrian", x_m=4.0, y_m=0.0,
+            vx_ms=4.0, vy_ms=0.0, speed_ms=4.0, speed_kmh=14.4,
+            is_speeding=False, heading_deg=0.0, is_reliable=True,
+        )
+        self.assertIsNone(self.analyzer.evaluate_pair(veh, ped_outside))
+        parked = SpeedReading(
+            track_id=4, category="vehicle", x_m=0.0, y_m=0.0,
+            vx_ms=0.0, vy_ms=0.0, speed_ms=0.0, speed_kmh=0.0,
+            is_speeding=False, heading_deg=0.0, is_reliable=True, is_stationary=True,
+        )
+        ped_near = SpeedReading(
+            track_id=5, category="pedestrian", x_m=2.0, y_m=0.0,
+            vx_ms=0.0, vy_ms=0.0, speed_ms=0.0, speed_kmh=0.0,
+            is_speeding=False, heading_deg=0.0, is_reliable=True,
+        )
+        self.assertIsNone(self.analyzer.evaluate_pair(parked, ped_near))
+
     def test_analyzer_uses_own_speed_limit(self):
         # analyzer 用自身 speed_limit_kmh 重判而非信任 reading.is_speeding：
         # 独立使用且两侧限速不一致时，以 analyzer 契约为准

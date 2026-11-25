@@ -133,10 +133,14 @@
       currentIndex: 0,
       playing: false,
       timerId: null,
+      playRafId: null,
+      playAnchorPerfMs: null,
+      playAnchorMediaMs: null,
       videoRafId: null,
       useJpegFallback: false,
       noVideo: false,
       hasVideoFrameMap: false,
+      videoFrameSet: null,
       isFixture: false,
       data: null
     },
@@ -1110,14 +1114,57 @@
     applyPipelineConfigChange();
   }
 
+  function nowPerfMs() {
+    if (typeof performance !== "undefined" && typeof performance.now === "function") {
+      return performance.now();
+    }
+    return Date.now();
+  }
+
+  function replayFrameHasVideo(idx) {
+    if (state.replay.noVideo) return false;
+    if (state.replay.videoFrameSet) {
+      return state.replay.videoFrameSet.has(idx);
+    }
+    return true;
+  }
+
+  function getReplayFrameTimeMs(dataset, idx) {
+    if (!dataset) return idx * 40;
+    var rows = dataset.speedsByFrame && dataset.speedsByFrame[idx];
+    if (rows && rows.length) {
+      var ts = parseFloat(rows[0].timestamp_s);
+      if (Number.isFinite(ts)) return ts * 1000;
+    }
+    var cfs = dataset.conflictsByFrame && dataset.conflictsByFrame[idx];
+    if (cfs && cfs.length && typeof cfs[0].timestamp_s === "number" && Number.isFinite(cfs[0].timestamp_s)) {
+      return cfs[0].timestamp_s * 1000;
+    }
+    return idx * (dataset.nominalFrameMs || 40);
+  }
+
+  function resetReplayClockAnchor(idx) {
+    state.replay.playAnchorPerfMs = nowPerfMs();
+    state.replay.playAnchorMediaMs = getReplayFrameTimeMs(state.replay.data, idx);
+  }
+
   function stopReplayPlayback() {
     state.replay.playing = false;
+    state.replay.playAnchorPerfMs = null;
     if (state.replay.timerId !== null) {
       window.clearTimeout(state.replay.timerId);
       state.replay.timerId = null;
     }
+    if (state.replay.playRafId !== null) {
+      if (typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(state.replay.playRafId);
+      }
+      state.replay.playRafId = null;
+    }
     if (state.replay.videoRafId !== null) {
-      window.cancelAnimationFrame(state.replay.videoRafId);
+      if (typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(state.replay.videoRafId);
+      }
       state.replay.videoRafId = null;
     }
     if (dom.replayVideo && !dom.replayVideo.paused) {
@@ -1244,11 +1291,11 @@
     var nominalFrameMs = 40;
     if (dtSamples.length > 0) {
       dtSamples.sort(function (a, b) { return a - b; });
-      nominalFrameMs = Math.round(dtSamples[Math.floor(dtSamples.length / 2)] * 1000);
+      nominalFrameMs = dtSamples[Math.floor(dtSamples.length / 2)] * 1000;
     } else if (summary && summary.configuration && typeof summary.configuration.fps === "number" && summary.configuration.fps > 0) {
-      nominalFrameMs = Math.round(1000 / summary.configuration.fps);
+      nominalFrameMs = 1000 / summary.configuration.fps;
     }
-    nominalFrameMs = Math.max(25, Math.min(500, nominalFrameMs));
+    nominalFrameMs = Math.max(5, Math.min(500, nominalFrameMs));
 
     var totalFrames = Math.max(
       (summary && typeof summary.frames_processed === "number" ? summary.frames_processed : 0),
@@ -1522,21 +1569,44 @@
     }
 
     var base = "/api/runs/" + encodeURIComponent(dataset.runId);
-    var promise = Promise.all([
-      fetchJson(base + "/speeds?frame_start=" + chunkStart + "&frame_end=" + chunkEnd + "&limit=20000"),
-      fetchJson(base + "/conflicts?frame_start=" + chunkStart + "&frame_end=" + chunkEnd + "&limit=20000")
-    ])
-      .then(function (results) {
+    var promise = (function fetchSubRange(reqStart, reqEnd) {
+      return Promise.all([
+        fetchJson(base + "/speeds?frame_start=" + reqStart + "&frame_end=" + reqEnd + "&limit=20000"),
+        fetchJson(base + "/conflicts?frame_start=" + reqStart + "&frame_end=" + reqEnd + "&limit=20000")
+      ]).then(function (results) {
         if (state.replay.data !== dataset) return;
-        for (var fi = chunkStart; fi <= chunkEnd; fi += 1) {
+        var spRes = results[0] || {};
+        var cfRes = results[1] || {};
+        var spRows = spRes.rows || [];
+        var cfRows = cfRes.conflicts || [];
+        var spTrunc = Boolean(spRes.truncated);
+        var cfTrunc = Boolean(cfRes.truncated);
+
+        var maxSpFrame = reqStart - 1;
+        spRows.forEach(function (row) {
+          var idx = parseInt(row.frame_idx, 10);
+          if (Number.isFinite(idx) && idx > maxSpFrame) maxSpFrame = idx;
+        });
+        var maxCfFrame = reqStart - 1;
+        cfRows.forEach(function (rec) {
+          var idx = typeof rec.frame_index === "number" ? rec.frame_index : parseInt(rec.frame_index, 10);
+          if (Number.isFinite(idx) && idx > maxCfFrame) maxCfFrame = idx;
+        });
+
+        var completeEnd = reqEnd;
+        if (spTrunc) completeEnd = Math.min(completeEnd, maxSpFrame - 1);
+        if (cfTrunc) completeEnd = Math.min(completeEnd, maxCfFrame - 1);
+        // 单帧即超出单页上限时不再向前拆半帧，保留当前帧并防止死循环
+        var hitSingleFrameCap = (spTrunc || cfTrunc) && completeEnd < reqStart;
+        if (hitSingleFrameCap) completeEnd = reqStart;
+
+        for (var fi = reqStart; fi <= completeEnd; fi += 1) {
           delete dataset.speedsByFrame[fi];
           delete dataset.conflictsByFrame[fi];
         }
-        var spRows = (results[0] && results[0].rows) || [];
-        var cfRows = (results[1] && results[1].conflicts) || [];
         spRows.forEach(function (row) {
           var idx = parseInt(row.frame_idx, 10);
-          if (!Number.isFinite(idx)) return;
+          if (!Number.isFinite(idx) || idx < reqStart || idx > completeEnd) return;
           if (!dataset.speedsByFrame[idx]) dataset.speedsByFrame[idx] = [];
           dataset.speedsByFrame[idx].push(row);
           var rx = parseFloat(row.x_m);
@@ -1552,23 +1622,36 @@
         });
         cfRows.forEach(function (rec) {
           var idx = typeof rec.frame_index === "number" ? rec.frame_index : parseInt(rec.frame_index, 10);
-          if (!Number.isFinite(idx)) return;
+          if (!Number.isFinite(idx) || idx < reqStart || idx > completeEnd) return;
           if (!dataset.conflictsByFrame[idx]) dataset.conflictsByFrame[idx] = [];
           dataset.conflictsByFrame[idx].push(rec);
         });
-        dataset.loadedRanges = mergeLoadedRange(dataset.loadedRanges, chunkStart, chunkEnd);
+        dataset.loadedRanges = mergeLoadedRange(dataset.loadedRanges, reqStart, completeEnd);
         dom.twinModeLabel.textContent =
           "x[" + dataset.bounds.xMin + "," + dataset.bounds.xMax + "] y[" + dataset.bounds.yMin + "," + dataset.bounds.yMax + "]";
 
         if (reqToken === state.replayReqToken && state.mode === "replay" && state.replay.runId === dataset.runId) {
-          if (state.replay.currentIndex >= chunkStart && state.replay.currentIndex <= chunkEnd) {
+          if (state.replay.currentIndex >= reqStart && state.replay.currentIndex <= completeEnd) {
             renderReplayFrame(state.replay.currentIndex);
           }
-          if (state.replay.playing && state.replay.useJpegFallback && state.replay.timerId === null) {
+          if (
+            state.replay.playing &&
+            state.replay.useJpegFallback &&
+            state.replay.playRafId === null &&
+            state.replay.timerId === null &&
+            isReplayFrameLoaded(dataset, state.replay.currentIndex)
+          ) {
+            resetReplayClockAnchor(state.replay.currentIndex);
             scheduleNextReplayTick();
           }
         }
-      })
+
+        if ((spTrunc || cfTrunc) && completeEnd < reqEnd && !hitSingleFrameCap) {
+          return fetchSubRange(completeEnd + 1, reqEnd);
+        }
+        return null;
+      });
+    })(chunkStart, chunkEnd)
       .catch(function (err) {
         if (reqToken === state.replayReqToken && state.mode === "replay" && state.replay.runId === dataset.runId) {
           dom.replayMediaCaption.textContent = "加载帧区间失败: " + err.message;
@@ -1600,7 +1683,7 @@
       if (cNext.length && typeof cNext[0].timestamp_s === "number") tNext = cNext[0].timestamp_s;
     }
     if (Number.isFinite(tCur) && Number.isFinite(tNext) && tNext > tCur) {
-      return Math.max(25, Math.min(1000, Math.round((tNext - tCur) * 1000)));
+      return Math.max(5, Math.min(1000, (tNext - tCur) * 1000));
     }
     return fallbackMs;
   }
@@ -1632,23 +1715,26 @@
     }
 
     var framePayload = buildReplayFramePayload(dataset, idx);
+    var frameHasVideo = replayFrameHasVideo(idx);
 
     dom.replayFrameLabel.textContent =
       idx + " / " + maxIdx + " (" + formatNumber(framePayload.timestampS, 1, "0.0") + "s)";
     dom.replayMediaCaption.textContent =
       dataset.runId + " · 帧 #" + idx + " · " + riskText(framePayload.riskLevel) +
       (state.replay.isFixture ? " · 测试固件(非实拍)" : "") +
-      (state.replay.noVideo ? " · 纯轨迹重构（无标注 MP4）" : "");
+      (state.replay.noVideo ? " · 纯轨迹重构（无标注 MP4）" : (!frameHasVideo ? " · 当前帧无视频画面（轨迹重构）" : ""));
 
     if (dom.replayFrameImg && (state.replay.useJpegFallback || !state.replay.playing)) {
-      if (state.replay.noVideo) {
+      if (!frameHasVideo) {
         dom.replayFrameImg.hidden = true;
+        if (dom.replayFrameImg.dataset) delete dom.replayFrameImg.dataset.frameIndex;
         dom.replayVideo.hidden = true;
         if (dom.replaySimCanvas) dom.replaySimCanvas.hidden = false;
       } else {
         if (dom.replaySimCanvas) dom.replaySimCanvas.hidden = true;
         dom.replayFrameImg.hidden = false;
         dom.replayVideo.hidden = true;
+        if (dom.replayFrameImg.dataset) dom.replayFrameImg.dataset.frameIndex = String(idx);
         dom.replayFrameImg.src =
           "/api/runs/" + encodeURIComponent(dataset.runId) + "/frame?index=" + idx;
       }
@@ -1657,10 +1743,10 @@
     if (widgets.roadTwin) {
       widgets.roadTwin.setReplayFrame(framePayload);
     }
-    if (state.replay.noVideo && widgets.replayCamera && widgets.roadTwin && typeof widgets.roadTwin.getCurrentRenderState === "function") {
+    if (!frameHasVideo && widgets.replayCamera && widgets.roadTwin && typeof widgets.roadTwin.getCurrentRenderState === "function") {
       var camState = Object.assign({}, widgets.roadTwin.getCurrentRenderState(), {
-        cameraLabel: "TRACKS-ONLY · 3D 轨迹重构（无标注 MP4）",
-        cameraShortLabel: "TRACKS-ONLY · 3D 重构"
+        cameraLabel: state.replay.noVideo ? "TRACKS-ONLY · 3D 轨迹重构（无标注 MP4）" : "SPARSE FRAME · 3D 轨迹重构",
+        cameraShortLabel: state.replay.noVideo ? "TRACKS-ONLY · 3D 重构" : "SPARSE · 3D 重构"
       });
       widgets.replayCamera.refreshTheme();
       widgets.replayCamera.renderState(camState);
@@ -1698,32 +1784,75 @@
   function scheduleNextReplayTick() {
     if (!state.replay.playing || !state.replay.data) {
       state.replay.timerId = null;
+      state.replay.playRafId = null;
       return;
     }
-    var dataset = state.replay.data;
-    var delayMs = nextFrameDeltaMs(dataset, state.replay.currentIndex);
-    state.replay.timerId = window.setTimeout(function () {
+    if (state.replay.playAnchorPerfMs === null) {
+      resetReplayClockAnchor(state.replay.currentIndex);
+    }
+
+    function onClockTick() {
+      state.replay.playRafId = null;
       state.replay.timerId = null;
       if (!state.replay.playing || !state.replay.data) return;
-      if (!state.replay.noVideo && dom.replayFrameImg && !dom.replayFrameImg.complete) {
-        state.replay.timerId = window.setTimeout(function () {
-          state.replay.timerId = null;
-          scheduleNextReplayTick();
-        }, 40);
+      var dataset = state.replay.data;
+
+      if (
+        replayFrameHasVideo(state.replay.currentIndex) &&
+        dom.replayFrameImg &&
+        !dom.replayFrameImg.hidden &&
+        !dom.replayFrameImg.complete
+      ) {
+        resetReplayClockAnchor(state.replay.currentIndex);
+        scheduleNextReplayTick();
         return;
       }
-      var maxIdx = Math.max(0, state.replay.data.totalFrames - 1);
-      var nextIdx = state.replay.currentIndex + 1;
-      if (nextIdx > maxIdx) nextIdx = 0;
-      if (!isReplayFrameLoaded(state.replay.data, nextIdx)) {
+
+      var now = nowPerfMs();
+      var maxIdx = Math.max(0, dataset.totalFrames - 1);
+      var targetMediaMs = state.replay.playAnchorMediaMs + Math.max(0, now - state.replay.playAnchorPerfMs);
+      var curIdx = state.replay.currentIndex;
+      var nextIdx = curIdx;
+
+      if (curIdx >= maxIdx) {
+        var wrapThreshold = getReplayFrameTimeMs(dataset, maxIdx) + nextFrameDeltaMs(dataset, maxIdx);
+        if (targetMediaMs >= wrapThreshold) {
+          nextIdx = 0;
+          resetReplayClockAnchor(0);
+        }
+      } else {
+        while (nextIdx < maxIdx) {
+          if (!isReplayFrameLoaded(dataset, nextIdx + 1)) {
+            nextIdx += 1;
+            break;
+          }
+          if (getReplayFrameTimeMs(dataset, nextIdx + 1) <= targetMediaMs + 0.5) {
+            nextIdx += 1;
+          } else {
+            break;
+          }
+        }
+      }
+
+      if (nextIdx !== curIdx) {
+        if (!isReplayFrameLoaded(dataset, nextIdx)) {
+          state.replay.playAnchorPerfMs = null;
+          renderReplayFrame(nextIdx);
+          return;
+        }
         renderReplayFrame(nextIdx);
-        return;
       }
-      renderReplayFrame(nextIdx);
       if (state.replay.playing) {
         scheduleNextReplayTick();
       }
-    }, delayMs);
+    }
+
+    if (typeof window.requestAnimationFrame === "function") {
+      state.replay.playRafId = window.requestAnimationFrame(onClockTick);
+    } else {
+      var delayMs = nextFrameDeltaMs(state.replay.data, state.replay.currentIndex);
+      state.replay.timerId = window.setTimeout(onClockTick, Math.max(4, Math.round(delayMs)));
+    }
   }
 
   function syncVideoReplayFrameLoop() {
@@ -1782,9 +1911,11 @@
 
   function startJpegReplayLoop() {
     state.replay.useJpegFallback = true;
+    var frameHasVideo = replayFrameHasVideo(state.replay.currentIndex);
     if (dom.replayVideo) dom.replayVideo.hidden = true;
-    if (dom.replayFrameImg) dom.replayFrameImg.hidden = Boolean(state.replay.noVideo);
-    if (dom.replaySimCanvas) dom.replaySimCanvas.hidden = !state.replay.noVideo;
+    if (dom.replayFrameImg) dom.replayFrameImg.hidden = !frameHasVideo;
+    if (dom.replaySimCanvas) dom.replaySimCanvas.hidden = frameHasVideo;
+    resetReplayClockAnchor(state.replay.currentIndex);
     scheduleNextReplayTick();
   }
 
@@ -1798,6 +1929,7 @@
     state.replay.useJpegFallback = true;
     state.replay.noVideo = false;
     state.replay.hasVideoFrameMap = false;
+    state.replay.videoFrameSet = null;
     state.replay.isFixture = false;
     if (dom.replaySimCanvas) {
       dom.replaySimCanvas.hidden = true;
@@ -1810,25 +1942,31 @@
     }
     if (dom.replayFrameImg) {
       dom.replayFrameImg.hidden = false;
+      if (dom.replayFrameImg.dataset) delete dom.replayFrameImg.dataset.frameIndex;
       dom.replayFrameImg.onerror = function () {
         if (state.mode !== "replay" || state.replay.runId !== runId || state.replay.noVideo) return;
-        state.replay.noVideo = true;
+        var failedIdx = dom.replayFrameImg.dataset ? dom.replayFrameImg.dataset.frameIndex : "";
+        if (failedIdx && failedIdx !== String(state.replay.currentIndex)) return;
+        if (!state.replay.hasVideoFrameMap) {
+          state.replay.noVideo = true;
+        }
         dom.replayFrameImg.hidden = true;
         dom.replayFrameImg.removeAttribute("src");
         if (dom.replaySimCanvas) {
           dom.replaySimCanvas.hidden = false;
           if (widgets.replayCamera && widgets.roadTwin && typeof widgets.roadTwin.getCurrentRenderState === "function") {
             var camState = Object.assign({}, widgets.roadTwin.getCurrentRenderState(), {
-              cameraLabel: "TRACKS-ONLY · 3D 轨迹重构（无标注 MP4）",
-              cameraShortLabel: "TRACKS-ONLY · 3D 重构"
+              cameraLabel: state.replay.hasVideoFrameMap ? "SPARSE FRAME · 3D 轨迹重构" : "TRACKS-ONLY · 3D 轨迹重构（无标注 MP4）",
+              cameraShortLabel: state.replay.hasVideoFrameMap ? "SPARSE · 3D 重构" : "TRACKS-ONLY · 3D 重构"
             });
             widgets.replayCamera.refreshTheme();
             widgets.replayCamera.renderState(camState);
           }
         }
         if (state.replay.data) {
-          dom.replayMediaCaption.textContent =
-            runId + " · 纯轨迹重构（无标注 MP4）";
+          dom.replayMediaCaption.textContent = state.replay.hasVideoFrameMap
+            ? runId + " · 帧 #" + state.replay.currentIndex + " · 当前帧无视频画面（轨迹重构）"
+            : runId + " · 纯轨迹重构（无标注 MP4）";
         }
       };
     }
@@ -1851,6 +1989,9 @@
         state.replay.isFixture = srcVid.indexOf("tracking-fixtures") >= 0 || /sample_[ab]\.mp4/i.test(srcVid);
         state.replay.noVideo = summaryObj.has_video === false;
         state.replay.hasVideoFrameMap = Boolean(summaryObj.has_video_frame_map);
+        state.replay.videoFrameSet = Array.isArray(summaryObj.video_frame_indices)
+          ? new Set(summaryObj.video_frame_indices)
+          : null;
         state.replay.data = dataset;
         state.replay.framesCount = dataset.totalFrames;
         applyPipelineConfigChange();
@@ -2475,13 +2616,16 @@
       fetchJson("/api/runs/" + encodeURIComponent(runId) + "/summary"),
       fetchJson("/api/runs/" + encodeURIComponent(runId) + "/events"),
       fetchJson("/api/runs/" + encodeURIComponent(runId) + "/conflicts?limit=5000"),
-      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/speeds?limit=5000")
+      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/speeds?limit=5000"),
+      fetchJson("/api/runs/" + encodeURIComponent(runId) + "/timeline?max_points=2000").catch(function () { return null; })
     ])
       .then(function (results) {
         if (reqToken !== state.historyReqToken || state.selectedRunId !== runId) {
           return;
         }
         var dataset = buildRunDataset(runId, results[0], results[1], results[2], results[3]);
+        var tl = results[4];
+        dataset.timelinePoints = (tl && Array.isArray(tl.points) && tl.points.length > 0) ? tl.points : null;
         state.historyData = dataset;
         syncHistoryReplayButton(runId, results[0]);
         renderHistorySummary(dataset);
@@ -2511,6 +2655,23 @@
 
   function renderHistoryTimeline(dataset) {
     if (!widgets.speedChart) return;
+    var limit = (dataset.summary && typeof dataset.summary.speed_limit_kmh === "number")
+      ? dataset.summary.speed_limit_kmh
+      : 30;
+    if (Array.isArray(dataset.timelinePoints) && dataset.timelinePoints.length > 0) {
+      var fullSeries = dataset.timelinePoints.map(function (pt) {
+        return {
+          frameIndex: pt.frame_index,
+          t: typeof pt.timestamp_s === "number" ? pt.timestamp_s : pt.frame_index * 0.1,
+          speedKmh: typeof pt.speed_kmh === "number" ? pt.speed_kmh : 0,
+          ttcS: typeof pt.ttc_s === "number" ? pt.ttc_s : null,
+          riskLevel: parseRiskLevel(pt.risk_level)
+        };
+      });
+      widgets.speedChart.setData(fullSeries, limit);
+      return;
+    }
+
     var byFrame = {};
     var hasVehicleRows = dataset.speedRows.some(function (row) {
       var catLow = String(row.category || "").toLowerCase();
@@ -2565,9 +2726,6 @@
       .map(function (k) { return byFrame[k]; })
       .sort(function (a, b) { return a.frameIndex - b.frameIndex; });
 
-    var limit = (dataset.summary && typeof dataset.summary.speed_limit_kmh === "number")
-      ? dataset.summary.speed_limit_kmh
-      : 30;
     widgets.speedChart.setData(points, limit);
   }
 
@@ -4302,6 +4460,11 @@
     }
 
     document.addEventListener("keydown", handleGlobalKeydown);
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible" && state.replay.playing && state.replay.data) {
+        resetReplayClockAnchor(state.replay.currentIndex);
+      }
+    });
   }
 
   function init() {
@@ -4330,6 +4493,8 @@
     window.__CampusMotionAppTestHook = {
       state: state,
       dom: dom,
+      widgets: widgets,
+      initDomRefs: initDomRefs,
       getActivePipelineConfig: getActivePipelineConfig,
       updateAlgorithmBadges: updateAlgorithmBadges,
       setMonitorMode: setMonitorMode,
@@ -4339,6 +4504,12 @@
       buildReplayFramePayload: buildReplayFramePayload,
       renderReplayFrame: renderReplayFrame,
       enterReplayMode: enterReplayMode,
+      startReplayPlayback: startReplayPlayback,
+      stopReplayPlayback: stopReplayPlayback,
+      nextFrameDeltaMs: nextFrameDeltaMs,
+      replayFrameHasVideo: replayFrameHasVideo,
+      loadHistoryRunDetail: loadHistoryRunDetail,
+      renderHistoryTimeline: renderHistoryTimeline,
       enterLiveJobMode: enterLiveJobMode,
       pollLiveJobState: pollLiveJobState,
       stopLiveJobPolling: stopLiveJobPolling,

@@ -220,21 +220,29 @@ def detect(args) -> Path:
                 if not math.isfinite(fps) or fps <= 0:
                     raise ValueError("视频缺少有效 FPS，请使用 --fps 显式指定。")
                 previous_timestamp = -1.0
+                last_raw_pts = None
                 while args.max_frames is None or count < args.max_frames:
                     ok, frame = capture.read()
                     if not ok:
                         break
                     # 读取解码器给出的当前帧时间位置，毫秒除以 1000 转成秒。
-                    # 时间戳应递增；用帧数/FPS 兜底时明确标记其为估计值。
-                    # 对可变帧率视频，这种估计可能不够准确，不能直接当作测速真值。
-                    pts = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                    timestamp_source = "video_pts"
-                    if args.fps is not None or not math.isfinite(pts) or pts < 0 or pts <= previous_timestamp:
+                    # 时间戳应递增；用帧数/FPS 兜底时明确标记其为估计值，并在原始 PTS 恢复递增后保留真实 VFR 间隔。
+                    raw_pts = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                    has_valid_raw = (args.fps is None) and math.isfinite(raw_pts) and raw_pts >= 0.0
+                    if has_valid_raw and raw_pts > previous_timestamp:
+                        pts = raw_pts
+                        timestamp_source = "video_pts"
+                    elif has_valid_raw and last_raw_pts is not None and raw_pts > last_raw_pts:
+                        pts = previous_timestamp + (raw_pts - last_raw_pts)
+                        timestamp_source = "fps_estimate"
+                    else:
                         timestamp_source = "fps_estimate"
                         if args.fps is not None or previous_timestamp < 0:
                             pts = count / fps
                         else:
                             pts = max(count / fps, previous_timestamp + (1.0 / fps))
+                    if has_valid_raw and (last_raw_pts is None or raw_pts >= last_raw_pts):
+                        last_raw_pts = raw_pts
                     if pts <= previous_timestamp:
                         raise ValueError("视频时间戳不连续，请检查视频或用 --fps 指定固定帧率。")
                     previous_timestamp = pts

@@ -1179,6 +1179,76 @@ class TestStandaloneDesktopHost(unittest.TestCase):
                 with self.assertRaises(OSError):
                     desktop_mod._bind_server_with_port_scan(service, "127.0.0.1", occupied_port)
 
+    def test_desktop_startup_cleans_http_server_on_publish_failure_and_propagates_browser_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calib_file = root / "calib.yaml"
+            RoadCalibrator(
+                [(200.0, 120.0), (600.0, 120.0), (760.0, 520.0), (40.0, 520.0)],
+                8.0,
+                24.0,
+            ).to_yaml(calib_file)
+            runs_dir = root / "runs"
+
+            # 1) 注入 _write_instance_file OSError，校验已绑定 HTTP 线程和端口被立即回收
+            app_dir_1 = root / "app1"
+            captured = {}
+            orig_bind = desktop_mod._bind_server_with_port_scan
+
+            def _capture_bind(*args, **kwargs):
+                srv = orig_bind(*args, **kwargs)
+                captured["port"] = srv.server_address[1]
+                return srv
+
+            with mock.patch("analysis.desktop._bind_server_with_port_scan", side_effect=_capture_bind), \
+                    mock.patch("analysis.desktop._write_instance_file", side_effect=OSError("injected publish error")):
+                with self.assertRaisesRegex(OSError, "injected publish error"):
+                    desktop_mod.run_desktop(
+                        host="127.0.0.1",
+                        port=0,
+                        runs_root=runs_dir,
+                        default_calib=calib_file,
+                        app_data_dir=app_dir_1,
+                        no_open=True,
+                    )
+            self.assertIn("port", captured)
+            with self.assertRaises(OSError):
+                urlopen(f"http://127.0.0.1:{captured['port']}/api/health", timeout=0.5)
+
+            # 2) Edge --app 异常退出返回 2147483651 时，run_desktop 返回非零退出码而非 0
+            class _CrashProc:
+                def __init__(self):
+                    self.calls = 0
+                    self.returncode = 2147483651
+
+                def poll(self):
+                    self.calls += 1
+                    return 2147483651 if self.calls >= 2 else None
+
+                def terminate(self):
+                    return None
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+            app_dir_2 = root / "app2"
+            fake_edge = root / "msedge.exe"
+            fake_edge.write_bytes(b"edge")
+            with mock.patch("analysis.desktop.find_chromium_app_binary", return_value=fake_edge), \
+                    mock.patch("analysis.desktop.subprocess.Popen", return_value=_CrashProc()):
+                rc = desktop_mod.run_desktop(
+                    host="127.0.0.1",
+                    port=0,
+                    runs_root=runs_dir,
+                    default_calib=calib_file,
+                    app_data_dir=app_dir_2,
+                )
+            self.assertNotEqual(rc, 0)
+            self.assertEqual(rc, 1)
+            log_text = (app_dir_2 / "desktop.log").read_text(encoding="utf-8")
+            self.assertIn("2147483651", log_text)
+            self.assertNotIn("stopped cleanly", log_text)
+
     def test_desktop_startup_lock_serializes_concurrent_checks(self):
         import threading
         import time as time_mod
@@ -1664,7 +1734,10 @@ for (const nid of [
   "sim-controls", "replay-controls", "live-controls", "scenario-select",
   "viewport-mode-badge", "sidebar-mode-text", "sidebar-target-text", "btn-twin-pause",
   "pipeline-stage-detail", "driver-alert-banner", "driver-alert-list",
-  "ped-alert-banner", "ped-alert-list", "alert-log-list", "alert-log-count"
+  "ped-alert-banner", "ped-alert-list", "alert-log-list", "alert-log-count",
+  "btn-replay-toggle", "hist-frames", "hist-fps", "hist-max-speed", "hist-speed-limit",
+  "hist-caution-count", "hist-speeding-count", "hist-critical-count", "hist-elapsed",
+  "history-source-label", "btn-history-replay", "history-charts-card"
 ]) {
   getEl(nid);
 }
@@ -1674,8 +1747,13 @@ byId["calib-name"].value = "campus";
 
 let fetchRoutes = {};
 const fetchCalls = [];
+let simPerfMs = 0;
+let rafQueue = [];
+let rafSeq = 0;
+let latestSpeedChart = null;
 const sandbox = {
   console,
+  performance: { now: () => simPerfMs },
   document: {
     readyState: "loading",
     documentElement: makeNode("html"),
@@ -1688,8 +1766,8 @@ const sandbox = {
   },
   localStorage: { getItem: () => null, setItem: () => {} },
   navigator: {},
-  requestAnimationFrame: (fn) => { fn(); return 1; },
-  cancelAnimationFrame: () => {},
+  requestAnimationFrame: (fn) => { const id = ++rafSeq; rafQueue.push({ id, fn }); return id; },
+  cancelAnimationFrame: (id) => { rafQueue = rafQueue.filter((item) => item.id !== id); },
   setTimeout: () => 1,
   clearTimeout: () => {},
   setInterval: () => 1,
@@ -1710,10 +1788,16 @@ const sandbox = {
       this.setScenario = () => {};
       this.setPaused = () => {};
       this.setReplayFrame = (f) => { this.frames.push(f); };
+      this.getCurrentRenderState = () => ({ bounds: {}, vehicles: [], vrus: [], conflicts: [] });
       this.refreshTheme = () => {};
     },
     SimulatedCameraCanvas: function () { this.renderState = () => {}; this.refreshTheme = () => {}; },
-    SpeedTimelineChart: function () { this.setData = () => {}; this.setActiveFrame = () => {}; },
+    SpeedTimelineChart: function () {
+      this.lastPoints = [];
+      latestSpeedChart = this;
+      this.setData = (pts) => { this.lastPoints = pts; };
+      this.setActiveFrame = () => {};
+    },
     CalibrationCanvas: function () {
       this.getState = () => ({
         imagePoints: [[0,0],[100,0],[100,100],[0,100]],
@@ -1730,6 +1814,17 @@ vm.runInNewContext(fs.readFileSync(process.env.APP_JS_PATH, "utf8"), sandbox);
 
 const hook = sandbox.window.__CampusMotionAppTestHook;
 if (!hook) throw new Error("Missing __CampusMotionAppTestHook");
+
+hook.initDomRefs();
+const widgets = hook.widgets;
+widgets.kpiMaxSpeed = new sandbox.CampusMotion.RollingCounter();
+widgets.kpiMinTtc = new sandbox.CampusMotion.RollingCounter();
+widgets.kpiActiveAlerts = new sandbox.CampusMotion.RollingCounter();
+widgets.kpiFrames = new sandbox.CampusMotion.RollingCounter();
+widgets.pipeline = new sandbox.CampusMotion.AnimatedSignalPipeline();
+widgets.roadTwin = new sandbox.CampusMotion.CampusRoadTwinCanvas();
+widgets.replayCamera = new sandbox.CampusMotion.SimulatedCameraCanvas();
+widgets.speedChart = new sandbox.CampusMotion.SpeedTimelineChart();
 
 // 初始化引用 dom 并设置轻量 widgets
 const dom = hook.dom;
@@ -1893,6 +1988,149 @@ async function runChecks() {
   }
   if (!sBtn || sBtn.tagName !== "BUTTON" || !sBtn.className.includes("table-jump-btn")) {
     throw new Error("Missing .table-jump-btn in speeds table");
+  }
+
+  // 6) 单回放区间超 20,000 行截断后自动续分页并保留第 499 帧完整数据
+  dom.replaySimCanvas = byId["replay-sim-canvas"];
+  dom.btnReplayToggle = byId["btn-replay-toggle"];
+  dom.histFrames = byId["hist-frames"];
+  dom.histFps = byId["hist-fps"];
+  dom.histMaxSpeed = byId["hist-max-speed"];
+  dom.histSpeedLimit = byId["hist-speed-limit"];
+  dom.histCautionCount = byId["hist-caution-count"];
+  dom.histSpeedingCount = byId["hist-speeding-count"];
+  dom.histCriticalCount = byId["hist-critical-count"];
+  dom.histElapsed = byId["hist-elapsed"];
+  dom.historySourceLabel = byId["history-source-label"];
+  dom.historyReplayBtn = byId["btn-history-replay"];
+  dom.historyChartsCard = byId["history-charts-card"];
+
+  const dsTrunc = hook.buildRunDataset(
+    "run-dense",
+    { frames_processed: 501, has_video: false },
+    { events: [] },
+    { conflicts: [], total_count: 5000, truncated: true },
+    { rows: [{ frame_idx: "0", timestamp_s: "0.0", track_id: "1", category: "vehicle", object_kind: "car", x_m: "1.0", y_m: "2.0", speed_kmh: "15.0", risk_level: "LEVEL_0_SAFE" }], total_rows: 42585, truncated: true }
+  );
+  hook.state.replay.runId = "run-dense";
+  hook.state.replay.data = dsTrunc;
+  fetchRoutes["/api/runs/run-dense/speeds?frame_start=250&frame_end=499&limit=20000"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      truncated: true,
+      rows: [
+        { frame_idx: "250", timestamp_s: "25.0", track_id: "1", category: "vehicle", x_m: "1.0", y_m: "2.0", speed_kmh: "15.0", risk_level: "LEVEL_0_SAFE" },
+        { frame_idx: "485", timestamp_s: "48.5", track_id: "1", category: "vehicle", x_m: "1.0", y_m: "2.0", speed_kmh: "15.0", risk_level: "LEVEL_0_SAFE" }
+      ]
+    }))
+  });
+  fetchRoutes["/api/runs/run-dense/conflicts?frame_start=250&frame_end=499&limit=20000"] = () => Promise.resolve({
+    ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ truncated: false, conflicts: [] }))
+  });
+  fetchRoutes["/api/runs/run-dense/speeds?frame_start=485&frame_end=499&limit=20000"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      truncated: false,
+      rows: [{ frame_idx: "499", timestamp_s: "49.9", track_id: "77", category: "vehicle", object_kind: "car", x_m: "2.0", y_m: "8.0", speed_kmh: "38.0", risk_level: "LEVEL_3_CRITICAL" }]
+    }))
+  });
+  fetchRoutes["/api/runs/run-dense/conflicts?frame_start=485&frame_end=499&limit=20000"] = () => Promise.resolve({
+    ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ truncated: false, conflicts: [] }))
+  });
+  await hook.ensureReplayFrameWindow(dsTrunc, 499, hook.state.replayReqToken);
+  if (!hook.isReplayFrameLoaded(dsTrunc, 499)) {
+    throw new Error("Expected frame 499 loaded after continuation pagination");
+  }
+  const f499 = hook.buildReplayFramePayload(dsTrunc, 499);
+  if (f499.vehicles.length !== 1 || f499.vehicles[0].trackId !== 77) {
+    throw new Error("Expected frame 499 vehicle #77 after continuation, got: " + JSON.stringify(f499));
+  }
+
+  // 7) 稀疏视频遇单帧 404 后不永久 lock noVideo，后续合法帧 2 恢复显示 JPEG
+  fetchRoutes["/api/runs/run-sparse/summary"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      frames_processed: 5, has_video: true, has_video_frame_map: true, video_frame_indices: [0, 2, 4]
+    }))
+  });
+  fetchRoutes["/api/runs/run-sparse/events"] = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ events: [] })) });
+  fetchRoutes["/api/runs/run-sparse/conflicts?limit=5000"] = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ conflicts: [] })) });
+  fetchRoutes["/api/runs/run-sparse/speeds?limit=5000"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      rows: [0, 1, 2].map((i) => ({ frame_idx: String(i), timestamp_s: String(i * 0.1), track_id: "1", category: "vehicle", x_m: "0", y_m: "2", speed_kmh: "10", risk_level: "LEVEL_0_SAFE" }))
+    }))
+  });
+  await hook.enterReplayMode("run-sparse", 0);
+  hook.renderReplayFrame(1);
+  if (!dom.replayFrameImg.hidden || dom.replaySimCanvas.hidden || hook.state.replay.noVideo) {
+    throw new Error("Sparse gap frame 1 should fall back to 3D canvas without mutating noVideo");
+  }
+  hook.renderReplayFrame(2);
+  if (dom.replayFrameImg.hidden || !String(dom.replayFrameImg.src || "").includes("index=2")) {
+    throw new Error("Sparse valid frame 2 did not restore JPEG: " + dom.replayFrameImg.src);
+  }
+  dom.replayFrameImg.dataset.frameIndex = "2";
+  dom.replayFrameImg.onerror();
+  if (hook.state.replay.noVideo) {
+    throw new Error("onerror in hasVideoFrameMap mode must not permanently set noVideo=true");
+  }
+
+  // 8) 60 FPS 纯轨迹回放按真实时间差和墙钟 rAF 推进 (>=42 帧 / 750ms)
+  const rows60 = [];
+  for (let i = 0; i < 60; i += 1) {
+    rows60.push({ frame_idx: String(i), timestamp_s: (i / 60).toFixed(5), track_id: "1", category: "vehicle", x_m: "0", y_m: String(i * 0.2), speed_kmh: "20", risk_level: "LEVEL_0_SAFE" });
+  }
+  const ds60 = hook.buildRunDataset("run-60", { frames_processed: 60, has_video: false }, { events: [] }, { conflicts: [] }, { rows: rows60, total_rows: 60, truncated: false });
+  if (ds60.nominalFrameMs >= 20 || hook.nextFrameDeltaMs(ds60, 0) >= 20) {
+    throw new Error("Expected ~16.67ms frame spacing, got nominal=" + ds60.nominalFrameMs + " delta=" + hook.nextFrameDeltaMs(ds60, 0));
+  }
+  hook.state.mode = "replay";
+  hook.state.replay.runId = "run-60";
+  hook.state.replay.data = ds60;
+  hook.state.replay.noVideo = true;
+  hook.state.replay.hasVideoFrameMap = false;
+  hook.state.replay.videoFrameSet = null;
+  hook.state.replay.currentIndex = 0;
+  simPerfMs = 0;
+  rafQueue = [];
+  hook.startReplayPlayback();
+  for (let ms = 16; ms <= 752; ms += 16) {
+    simPerfMs = ms;
+    const pending = rafQueue.splice(0, rafQueue.length);
+    for (const item of pending) item.fn();
+  }
+  hook.stopReplayPlayback();
+  if (hook.state.replay.currentIndex < 42) {
+    throw new Error("Expected >=42 frames at 60 FPS over 750ms, got frame=" + hook.state.replay.currentIndex);
+  }
+
+  // 9) 历史时间轴优先调用 /timeline 完整序列，不受前 5,000 行截断限制
+  fetchRoutes["/api/runs/run-501/summary"] = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ frames_processed: 501, speed_limit_kmh: 30 })) });
+  fetchRoutes["/api/runs/run-501/events"] = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ events: [] })) });
+  fetchRoutes["/api/runs/run-501/conflicts?limit=5000"] = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ conflicts: [] })) });
+  fetchRoutes["/api/runs/run-501/speeds?limit=5000"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      rows: [{ frame_idx: "0", timestamp_s: "0.0", track_id: "1", category: "vehicle", speed_kmh: "10" }],
+      total_rows: 42585, truncated: true
+    }))
+  });
+  fetchRoutes["/api/runs/run-501/timeline?max_points=2000"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      total_frames: 501,
+      points: [
+        { frame_index: 0, timestamp_s: 0.0, speed_kmh: 10.0, ttc_s: null, risk_level: 0 },
+        { frame_index: 500, timestamp_s: 50.0, speed_kmh: 45.0, ttc_s: 0.9, risk_level: 3 }
+      ]
+    }))
+  });
+  hook.state.historyReqToken = 0;
+  hook.state.selectedRunId = "run-501";
+  await hook.loadHistoryRunDetail("run-501");
+  if (!latestSpeedChart || latestSpeedChart.lastPoints.length !== 2 || latestSpeedChart.lastPoints[1].frameIndex !== 500) {
+    throw new Error("Expected history timeline to use full /timeline response, got: " + JSON.stringify(latestSpeedChart && latestSpeedChart.lastPoints));
   }
   console.log("APP_JS_CONTRACTS_OK");
 }

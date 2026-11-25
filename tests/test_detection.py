@@ -98,7 +98,7 @@ class DetectionContractTests(unittest.TestCase):
             vid = root / "vfr.mp4"
             vid.write_bytes(b"stub")
             out_dir = root / "out"
-            pts_seq = [0.0, 40.0, 120.0, 120.0]
+            pts_seq = [0.0, 40.0, 120.0, 120.0, 160.0, 185.0, 210.0]
             state = {"idx": -1}
 
             fake_cap = mock.Mock()
@@ -145,9 +145,12 @@ class DetectionContractTests(unittest.TestCase):
                 for line in (out_dir / "detections.jsonl").read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            self.assertEqual(len(lines), 4)
+            self.assertEqual(len(lines), 7)
             self.assertAlmostEqual(lines[3]["timestamp_s"], 0.16, places=6)
             self.assertEqual(lines[3]["timestamp_source"], "fps_estimate")
+            self.assertAlmostEqual(lines[4]["timestamp_s"], 0.20, places=6)
+            self.assertAlmostEqual(lines[5]["timestamp_s"], 0.225, places=6)
+            self.assertAlmostEqual(lines[6]["timestamp_s"], 0.25, places=6)
 
 
 if __name__ == "__main__":

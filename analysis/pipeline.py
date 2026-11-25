@@ -1109,6 +1109,8 @@ class ConflictPerceptionPipeline:
             resources.callback(writer.release)
             if not writer.isOpened():
                 raise RuntimeError(f"无法创建渲染输出视频，请检查编码器与路径: {out_video_path}")
+            # 稠密视频运行不得继承同目录遗留的稀疏帧映射。
+            (out_dir / "video_frame_map.json").unlink(missing_ok=True)
 
             jsonl_file = resources.enter_context(open(jsonl_path, "w", encoding="utf-8"))
             events_file = resources.enter_context(open(events_path, "w", encoding="utf-8"))
@@ -1490,6 +1492,10 @@ class ConflictPerceptionPipeline:
                 json.dumps(configuration, ensure_ascii=False, indent=2, allow_nan=False),
                 encoding="utf-8",
             )
+            if video_src is None:
+                # 复用 output_dir 运行纯轨迹分析时清理旧视频与帧映射，避免跨运行污染。
+                out_video_path.unlink(missing_ok=True)
+                (out_dir / "video_frame_map.json").unlink(missing_ok=True)
 
             jsonl_file = resources.enter_context(open(jsonl_path, "w", encoding="utf-8"))
             events_file = resources.enter_context(open(events_path, "w", encoding="utf-8"))
@@ -1653,6 +1659,11 @@ class ConflictPerceptionPipeline:
                         ),
                         encoding="utf-8",
                     )
+                except Exception:
+                    pass
+            else:
+                try:
+                    frame_map_path.unlink(missing_ok=True)
                 except Exception:
                     pass
             if loop_state in ("interrupt", "exception"):

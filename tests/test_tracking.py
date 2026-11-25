@@ -65,6 +65,13 @@ class TrackingContractTests(unittest.TestCase):
         ts3, kind3 = vfr_clock.timestamp(3, 120.0)
         self.assertEqual(kind3, "fps_estimate")
         self.assertAlmostEqual(ts3, 0.16, places=6)
+        # 原始 PTS 恢复严格递增后（160, 185, 210ms），保留真实 VFR 间隔 40ms / 25ms / 25ms
+        ts4, _ = vfr_clock.timestamp(4, 160.0)
+        ts5, _ = vfr_clock.timestamp(5, 185.0)
+        ts6, _ = vfr_clock.timestamp(6, 210.0)
+        self.assertAlmostEqual(ts4, 0.20, places=6)
+        self.assertAlmostEqual(ts5, 0.225, places=6)
+        self.assertAlmostEqual(ts6, 0.25, places=6)
 
         override = VideoClock(5, force_fps=True)
         self.assertEqual(override.timestamp(0, 100), (0.0, "fps_estimate"))

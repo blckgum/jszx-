@@ -112,6 +112,42 @@ class TestMotEval(unittest.TestCase):
                 self.assertEqual((res["tp"], res["fp"], res["fn"]), (5, 0, 0))
                 self.assertAlmostEqual(res["mota"], 1.0, places=6)
 
+    def test_clear_mot_preserves_valid_previous_frame_identity_matches(self):
+        # 首帧严格对齐：GT1=P1(x=0..10), GT2=P2(x=2..12)
+        # 次帧两目标靠近交叉：原身份 IoU=(8/12)=0.667 > 0.5，交叉 IoU=1.0；CLEAR 应延续原配对实现 IDSW=0, MOTA=1.0
+        gt = {
+            0: [
+                {"track_id": 1, "bbox_xyxy": [0.0, 0.0, 10.0, 10.0]},
+                {"track_id": 2, "bbox_xyxy": [2.0, 0.0, 12.0, 10.0]},
+            ],
+            1: [
+                {"track_id": 1, "bbox_xyxy": [0.0, 0.0, 10.0, 10.0]},
+                {"track_id": 2, "bbox_xyxy": [2.0, 0.0, 12.0, 10.0]},
+            ],
+        }
+        pred = {
+            0: [
+                {"track_id": 1, "bbox_xyxy": [0.0, 0.0, 10.0, 10.0]},
+                {"track_id": 2, "bbox_xyxy": [2.0, 0.0, 12.0, 10.0]},
+            ],
+            1: [
+                {"track_id": 1, "bbox_xyxy": [2.0, 0.0, 12.0, 10.0]},
+                {"track_id": 2, "bbox_xyxy": [0.0, 0.0, 10.0, 10.0]},
+            ],
+        }
+        for use_lap in (True, False):
+            with self.subTest(use_lap=use_lap):
+                res = evaluate_mot(gt, pred, iou_threshold=0.5, _use_lap=use_lap)
+                self.assertEqual((res["tp"], res["fp"], res["fn"]), (4, 0, 0))
+                self.assertEqual(res["id_switches"], 0)
+                self.assertAlmostEqual(res["mota"], 1.0, places=6)
+
+        # 非连续帧间隔（跳帧 0 -> 2）不得把 t-2 旧匹配锁作上一相邻帧延续
+        gt_gap = {0: gt[0], 2: gt[1]}
+        pred_gap = {0: pred[0], 2: pred[1]}
+        res_gap = evaluate_mot(gt_gap, pred_gap, iou_threshold=0.5, _use_lap=False)
+        self.assertEqual(res_gap["id_switches"], 2)
+
     def test_single_id_switch_penalizes_idsw_idf1_and_hota(self):
         # 单条 10 帧真值轨迹：前 6 帧分配 ID=1，后 4 帧发生 1 次 ID 切换变为 ID=2（框完全重合）
         gt = {f: [{"track_id": 1, "bbox_xyxy": [0.0, 0.0, 20.0, 20.0]}] for f in range(10)}
