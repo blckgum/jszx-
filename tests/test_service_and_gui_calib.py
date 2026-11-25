@@ -725,6 +725,20 @@ class TestAnalysisServiceAndBackend(unittest.TestCase):
             calib_paths = {c["path"] for c in presets["calibs"]}
             self.assertEqual(calib_paths, {str(calib_yaml.resolve()), str(alt_calib_yml.resolve())})
 
+            # 项目 data/demo_videos 下的真实示例视频与配套标定也应被 list_presets 发现（且 is_fixture=False）
+            demo_dir = root / "data" / "demo_videos"
+            demo_dir.mkdir(parents=True, exist_ok=True)
+            demo_mp4 = demo_dir / "real_crosswalk.mp4"
+            demo_mp4.write_bytes(b"real-demo")
+            demo_calib = demo_dir / "calib_real.yaml"
+            demo_calib.write_text(calib_yaml.read_text(encoding="utf-8"), encoding="utf-8")
+            with mock.patch("pathlib.Path.cwd", return_value=root):
+                presets_with_demo = svc.list_presets()
+            demo_videos = [v for v in presets_with_demo["videos"] if v["path"] == str(demo_mp4.resolve())]
+            self.assertEqual(len(demo_videos), 1)
+            self.assertFalse(demo_videos[0]["is_fixture"])
+            self.assertIn(str(demo_calib.resolve()), {c["path"] for c in presets_with_demo["calibs"]})
+
             server = create_http_server(svc, host="127.0.0.1", port=0)
             port = server.server_address[1]
             srv_thread = threading.Thread(target=server.serve_forever, daemon=True)

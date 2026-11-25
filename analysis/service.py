@@ -1181,7 +1181,9 @@ class AnalysisService:
 
         video_dirs = (
             self.runs_root.parent / "tracking-fixtures",
+            self.runs_root.parent / "demo_videos",
             cwd_resolved / "runs" / "tracking-fixtures",
+            cwd_resolved / "data" / "demo_videos",
         )
         seen_videos: Dict[Path, dict] = {}
         for vdir in video_dirs:
@@ -1206,9 +1208,14 @@ class AnalysisService:
                         "is_fixture": is_fixture,
                     }
 
-        calib_dir = self.default_calib.parent
+        calib_dirs = [self.default_calib.parent]
+        demo_calib_dir = self.default_calib.parent.parent / "data" / "demo_videos"
+        if demo_calib_dir.is_dir() and demo_calib_dir.resolve() != self.default_calib.parent.resolve():
+            calib_dirs.append(demo_calib_dir)
         seen_calibs: Dict[Path, dict] = {}
-        if calib_dir.is_dir():
+        for calib_dir in calib_dirs:
+            if not calib_dir.is_dir():
+                continue
             for entry in calib_dir.rglob("*"):
                 try:
                     rel_parts = entry.relative_to(calib_dir).parts
