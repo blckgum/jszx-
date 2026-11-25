@@ -2132,6 +2132,92 @@ async function runChecks() {
   if (!latestSpeedChart || latestSpeedChart.lastPoints.length !== 2 || latestSpeedChart.lastPoints[1].frameIndex !== 500) {
     throw new Error("Expected history timeline to use full /timeline response, got: " + JSON.stringify(latestSpeedChart && latestSpeedChart.lastPoints));
   }
+
+  // 10) 播放记录 A 中切换到记录 B，必须立即停表并复位为 "播放回放"
+  fetchRoutes["/api/runs/run-B/summary"] = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ frames_processed: 5, has_video: false })) });
+  fetchRoutes["/api/runs/run-B/events"] = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ events: [] })) });
+  fetchRoutes["/api/runs/run-B/conflicts?limit=5000"] = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ conflicts: [] })) });
+  fetchRoutes["/api/runs/run-B/speeds?limit=5000"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      rows: [0, 1].map((i) => ({ frame_idx: String(i), timestamp_s: String(i * 0.1), track_id: "1", category: "vehicle", speed_kmh: "12" }))
+    }))
+  });
+  hook.state.mode = "replay";
+  hook.state.replay.runId = "run-60";
+  hook.state.replay.data = ds60;
+  hook.startReplayPlayback();
+  await hook.enterReplayMode("run-B", 0);
+  if (hook.state.replay.playing || dom.btnReplayToggle.textContent !== "播放回放" || hook.state.replay.playRafId !== null) {
+    throw new Error("Switching replay while playing did not reset play state: playing=" + hook.state.replay.playing + " text=" + dom.btnReplayToggle.textContent);
+  }
+
+  // 11) 标定提帧竞态与换源清点防护
+  let clearPtsCalls = 0;
+  hook.widgets.calibCanvas = {
+    getState: () => ({ imagePoints: [[10,10],[100,10],[100,100],[10,100]], parkingZonesImage: [], currentParkingDraft: [] }),
+    loadImage: (src) => { hook.widgets.calibCanvas._lastSrc = src; },
+    clearPoints: () => { clearPtsCalls += 1; },
+    clearParkingZones: () => {}
+  };
+  let resolveCamA;
+  fetchRoutes["/api/calibration/frame"] = () => new Promise((r) => { resolveCamA = r; });
+  dom.calibSource.value = "camA.mp4";
+  dom.calibFrameIndex.value = "0";
+  const extA = hook.extractCalibrationFrame();
+  resolveCamA({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ width: 1920, height: 1080, frame_index: 0, frame_count: 100, fps: 25, image_data_url: "data:image/png;base64,CAM_A" })) });
+  await extA;
+  let resolveCamAStale;
+  fetchRoutes["/api/calibration/frame"] = () => new Promise((r) => { resolveCamAStale = r; });
+  dom.calibFrameIndex.value = "10";
+  const extA2 = hook.extractCalibrationFrame();
+  dom.calibSource.value = "camB.mp4";
+  dom.calibFrameIndex.value = "0";
+  // 模拟切换输入源触发的逻辑重校并使未决请求失效
+  hook.state.calibExtractReqId += 1;
+  dom.btnCalibExtract.disabled = false;
+  resolveCamAStale({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ width: 1920, height: 1080, frame_index: 10, frame_count: 100, fps: 25, image_data_url: "data:image/png;base64,STALE_A" })) });
+  await extA2;
+  if (hook.widgets.calibCanvas._lastSrc !== "data:image/png;base64,CAM_A" || dom.btnCalibExtract.disabled) {
+    throw new Error("Stale camA frame mutated camB state or left button disabled");
+  }
+  fetchRoutes["/api/calibration/frame"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({ width: 1920, height: 1080, frame_index: 0, frame_count: 100, fps: 25, image_data_url: "data:image/png;base64,CAM_B" }))
+  });
+  await hook.extractCalibrationFrame();
+  if (clearPtsCalls < 1) {
+    throw new Error("Expected clearPoints when loading camB of same resolution after camA");
+  }
+
+  // 12) 单帧超 20,000 行截断时标记 cappedFrames 并继续加载第 1 帧及后续区间
+  const dsCap = hook.buildRunDataset("run-cap", { frames_processed: 5, has_video: false }, { events: [] }, { conflicts: [] }, { rows: [], total_rows: 30000, truncated: true });
+  fetchRoutes["/api/runs/run-cap/speeds?frame_start=0&frame_end=4&limit=20000"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      truncated: true,
+      rows: [{ frame_idx: "0", timestamp_s: "0.0", track_id: "1", category: "vehicle", x_m: "1", y_m: "2", speed_kmh: "12" }]
+    }))
+  });
+  fetchRoutes["/api/runs/run-cap/conflicts?frame_start=0&frame_end=4&limit=20000"] = () => Promise.resolve({
+    ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ truncated: false, conflicts: [] }))
+  });
+  fetchRoutes["/api/runs/run-cap/speeds?frame_start=1&frame_end=4&limit=20000"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      truncated: false,
+      rows: [{ frame_idx: "1", timestamp_s: "0.1", track_id: "2", category: "vehicle", x_m: "2", y_m: "4", speed_kmh: "20" }]
+    }))
+  });
+  fetchRoutes["/api/runs/run-cap/conflicts?frame_start=1&frame_end=4&limit=20000"] = () => Promise.resolve({
+    ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ truncated: false, conflicts: [] }))
+  });
+  hook.state.replay.runId = "run-cap";
+  hook.state.replay.data = dsCap;
+  await hook.ensureReplayFrameWindow(dsCap, 0, hook.state.replayReqToken);
+  if (!hook.isReplayFrameLoaded(dsCap, 1) || !(dsCap.cappedFrames && dsCap.cappedFrames[0])) {
+    throw new Error("Expected capped frame 0 not to block frame 1 loading");
+  }
   console.log("APP_JS_CONTRACTS_OK");
 }
 

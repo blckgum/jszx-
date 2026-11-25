@@ -1656,6 +1656,60 @@ class TestPipelineCtrvAnchorAndLiveDropIntegration(unittest.TestCase):
                 src_text = Path(inspect.getfile(create_fastapi_app)).read_text(encoding="utf-8")
                 self.assertIn('@app.get("/api/runs/{run_id}/timeline")', src_text)
 
+            # 1) 稀疏视频写入 video_frame_map.json 失败时，运行必须失败、Schema 校验报错，且 /frame 拒绝按原始下标错位返回
+            broken_dir = runs_root / "sparse-broken-map"
+            orig_write = Path.write_text
+
+            def _fail_map_write(self_path, *args, **kwargs):
+                if self_path.name == "video_frame_map.json":
+                    raise OSError("injected disk error on frame map")
+                return orig_write(self_path, *args, **kwargs)
+
+            with mock.patch.object(Path, "write_text", new=_fail_map_write):
+                with self.assertRaisesRegex(OSError, "injected disk error"):
+                    pipe.process_tracks(tracks_sparse, broken_dir, video_path=vid)
+            self.assertFalse((broken_dir / "video_frame_map.json").exists())
+            broken_summary = svc.get_run_summary("sparse-broken-map")
+            self.assertEqual(broken_summary["status"], "failed")
+            self.assertTrue(broken_summary.get("video_frame_map_missing"))
+            with self.assertRaises(FileNotFoundError):
+                svc.get_run_frame_jpeg("sparse-broken-map", frame_index=2)
+
+            # 即使摘要状态被手工篡改为 ok，只要声明了 video_frame_map 且文件缺失，validate_run 必须报错
+            tamper_sum = load_json_strict(broken_dir / "summary.json")
+            tamper_sum["status"] = "ok"
+            tamper_sum["stop_reason"] = "eof"
+            tamper_sum["total_alert_events"] = 0
+            tamper_sum["total_speeding_alerts"] = 0
+            tamper_sum["total_caution_events"] = 0
+            tamper_sum["total_critical_conflicts"] = 0
+            (broken_dir / "summary.json").write_text(json.dumps(tamper_sum), encoding="utf-8")
+            with self.assertRaises(SchemaValidationError):
+                validate_run(broken_dir)
+
+            # 2) 4,001 帧超限降采样到 2,000 点时，F0(100 km/h L1) 与 F1(5 km/h L3 TTC=0.5s) 不得跨帧拼点
+            dense_4k = runs_root / "dense-4001"
+            dense_4k.mkdir(parents=True, exist_ok=True)
+            (dense_4k / "summary.json").write_text(
+                json.dumps({"frames_processed": 4001, "speed_limit_kmh": 30.0}),
+                encoding="utf-8",
+            )
+            with (dense_4k / "speeds.csv").open("w", encoding="utf-8", newline="") as f4k:
+                w4k = csv.writer(f4k)
+                w4k.writerow(["frame_idx", "timestamp_s", "track_id", "category", "x_m", "y_m", "speed_kmh", "risk_level", "ttc_s"])
+                w4k.writerow([0, 0.0, 1, "car", 1.0, 2.0, 100.0, "LEVEL_1_SPEEDING", ""])
+                w4k.writerow([1, 0.1, 2, "car", 1.0, 3.0, 5.0, "LEVEL_3_CRITICAL", "0.5"])
+                for fi in range(2, 4001):
+                    w4k.writerow([fi, round(fi * 0.1, 3), 3, "car", 1.0, 4.0, 10.0, "LEVEL_0_SAFE", ""])
+            tl_4k = svc.get_run_timeline("dense-4001", max_points=2000)
+            self.assertTrue(tl_4k["downsampled"])
+            self.assertLessEqual(tl_4k["point_count"], 2000)
+            by_idx_4k = {p["frame_index"]: p for p in tl_4k["points"]}
+            self.assertIn(0, by_idx_4k)
+            self.assertIn(1, by_idx_4k)
+            self.assertEqual((by_idx_4k[0]["speed_kmh"], by_idx_4k[0]["risk_level"]), (100.0, 1))
+            self.assertEqual((by_idx_4k[1]["speed_kmh"], by_idx_4k[1]["risk_level"], by_idx_4k[1]["ttc_s"]), (5.0, 3, 0.5))
+
 
 if __name__ == "__main__":
     unittest.main()

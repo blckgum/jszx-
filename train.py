@@ -274,6 +274,9 @@ def main() -> None:
 
     # ---------- 恢复训练（可选） ----------
     start_epoch = 1
+    best_val_acc = 0.0          # 历史最佳验证准确率
+    best_epoch = 0
+    epochs_no_improve = 0       # 连续多少轮没进步（用于早停）
     if args.resume:
         resume_path = Path(args.resume)
         if resume_path.exists():
@@ -283,8 +286,24 @@ def main() -> None:
             ckpt = torch.load(resume_path, map_location=device, weights_only=False)
             model.load_state_dict(ckpt["model_state"])
             optimizer.load_state_dict(ckpt["optimizer_state"])
+            if scheduler is not None and ckpt.get("scheduler_state") is not None:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
             start_epoch = ckpt.get("epoch", 0) + 1
-            print(f"从第 {start_epoch} 轮继续")
+            epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
+            if config.BEST_MODEL_PATH.exists():
+                best_val_acc = float(ckpt.get("best_val_acc", ckpt.get("val_acc", 0.0)))
+                best_epoch = int(ckpt.get("best_epoch", ckpt.get("epoch", 0)))
+                try:
+                    best_ckpt = torch.load(config.BEST_MODEL_PATH, map_location=device, weights_only=False)
+                    if best_ckpt.get("model_name") in (None, args.model):
+                        disk_acc = float(best_ckpt.get("val_acc", 0.0))
+                        disk_epoch = int(best_ckpt.get("epoch", 0))
+                        if disk_acc >= best_val_acc:
+                            best_val_acc = disk_acc
+                            best_epoch = disk_epoch
+                except Exception:
+                    pass
+            print(f"从第 {start_epoch} 轮继续 (历史最佳 {best_val_acc:.2f}% @ 第 {best_epoch} 轮)")
         else:
             print(f"[警告] 找不到检查点 {resume_path}，从头开始训练")
 
@@ -295,9 +314,6 @@ def main() -> None:
     # ---------- 开始训练 ----------
     banner("开始训练")
 
-    best_val_acc = 0.0          # 历史最佳验证准确率
-    best_epoch = 0
-    epochs_no_improve = 0       # 连续多少轮没进步（用于早停）
     history: dict[str, list] = {
         "train_loss": [], "train_acc": [],
         "val_loss": [], "val_acc": [],
@@ -390,7 +406,11 @@ def main() -> None:
                 "model_name": args.model,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
                 "val_acc": val_acc,
+                "best_val_acc": best_val_acc,
+                "best_epoch": best_epoch,
+                "epochs_no_improve": epochs_no_improve,
                 "class_names": class_names,
             },
             config.LAST_MODEL_PATH,

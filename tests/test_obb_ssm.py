@@ -643,6 +643,42 @@ class TestOBBSSMConflictAnalyzer(unittest.TestCase):
         self.assertEqual(res_cutin.min_distance_m, 0.0)
         self.assertIn("净距=0.00m", res_cutin.risk_desc)
 
+    def test_obb_accel_entry_respects_rounded_corner_envelope(self):
+        import sys
+        from analysis.ssm import compute_obb_accel_entry_time
+
+        # 车 (0,0) v=(5,0), 行人局部 (3.0, 1.6) v=(5,0): 距圆角扩展包络 (r=0.4) 尚余约 0.095m，
+        # 仅给行人施加远离方向微小加速度不得被外接直角盒误判为 t=0 碰撞
+        car = _mk_reading(1, "vehicle", 0.0, 0.0, 5.0, 0.0, object_kind="car", heading_deg=0.0)
+        for ax, ay in ((0.0, 0.0), (0.05, 0.0), (0.0, 0.05)):
+            ped = _mk_reading(
+                2, "pedestrian", 3.0, 1.6, 5.0, 0.0,
+                object_kind="pedestrian", ax_ms2=ax, ay_ms2=ay,
+            )
+            self.assertIsNone(self.obb.evaluate_pair(car, ped))
+
+        # 从圆角斜外侧以匀加速相切触碰圆角，应精确求出切点时刻且不引入 scipy
+        r_corner = 0.5
+        t_tan = compute_obb_accel_entry_time(
+            (4.0, 2.0 + r_corner / math.sqrt(2.0) + 0.5),
+            (0.0, -1.0),
+            (0.0, 0.0),
+            (4.5, 2.5),
+            3.0,
+            corner_radius_m=r_corner,
+        )
+        t_miss = compute_obb_accel_entry_time(
+            (4.0 + r_corner / math.sqrt(2.0) + 0.01, 2.5),
+            (-0.1, 0.1),
+            (0.0, 0.2),
+            (4.5, 2.5),
+            3.0,
+            corner_radius_m=r_corner,
+        )
+        self.assertIsNotNone(t_tan)
+        self.assertIsNone(t_miss)
+        self.assertNotIn("scipy", sys.modules)
+
     def test_stationary_vehicle_preserves_valid_heading_and_skips_nan_heading(self):
         # 1. 静止/刚起步公交车 (v=0) 朝北 heading_deg=90，侧方 4.5m 行人向车移动：
         # 保留 90 度车头朝向后按车侧半宽 1.975m 计算 TTC=(4.5-1.975)/1.0=2.525s (CAUTION)，

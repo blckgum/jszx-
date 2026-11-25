@@ -152,6 +152,68 @@ class DetectionContractTests(unittest.TestCase):
             self.assertAlmostEqual(lines[5]["timestamp_s"], 0.225, places=6)
             self.assertAlmostEqual(lines[6]["timestamp_s"], 0.25, places=6)
 
+    def test_detect_aborts_on_mid_stream_resolution_change_without_writing_mismatched_record(self):
+        import types
+        from unittest import mock
+        import cv2
+        import numpy as np
+        from detection import core as det_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vid = root / "res_switch.mp4"
+            vid.write_bytes(b"stub")
+            out_dir = root / "out"
+            frames = [
+                np.zeros((64, 64, 3), dtype=np.uint8),
+                np.zeros((96, 128, 3), dtype=np.uint8),
+                np.zeros((64, 64, 3), dtype=np.uint8),
+            ]
+            idx_state = {"idx": -1}
+
+            fake_cap = mock.Mock()
+            fake_cap.isOpened.return_value = True
+
+            def _read():
+                idx_state["idx"] += 1
+                i = idx_state["idx"]
+                if i < len(frames):
+                    return True, frames[i]
+                return False, None
+
+            fake_cap.read.side_effect = _read
+            fake_cap.get.side_effect = lambda prop: 25.0 if prop == cv2.CAP_PROP_FPS else idx_state["idx"] * 40.0
+            fake_writer = mock.Mock()
+            fake_writer.isOpened.return_value = True
+
+            class _EmptyBoxes:
+                def __len__(self):
+                    return 0
+
+                def __iter__(self):
+                    return iter(())
+
+            fake_model = mock.Mock()
+            fake_model.names = {0: "person", 2: "car"}
+            fake_model.predict.return_value = [types.SimpleNamespace(boxes=_EmptyBoxes())]
+
+            args = types.SimpleNamespace(
+                source=str(vid), weights="unused.pt", tracker="bytetrack.yaml",
+                output=str(out_dir), classes=["person", "car"], conf=0.25, iou=0.7,
+                imgsz=640, device=None, max_frames=None, fps=None, show=False,
+            )
+            with mock.patch("detection.core.select_classes", return_value=[0, 2]), \
+                    mock.patch("cv2.VideoCapture", return_value=fake_cap), \
+                    mock.patch("cv2.VideoWriter", return_value=fake_writer), \
+                    mock.patch("detection.core.load_model", return_value=fake_model):
+                with self.assertRaisesRegex(ValueError, "第 1 帧分辨率变化"):
+                    det_core.detect(args)
+
+            written_rows = [
+                line for line in (out_dir / "detections.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()
+            ]
+            self.assertEqual(len(written_rows), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -221,10 +221,20 @@ def detect(args) -> Path:
                     raise ValueError("视频缺少有效 FPS，请使用 --fps 显式指定。")
                 previous_timestamp = -1.0
                 last_raw_pts = None
+                expected_size = None
                 while args.max_frames is None or count < args.max_frames:
                     ok, frame = capture.read()
                     if not ok:
                         break
+                    height, width = frame.shape[:2]
+                    if expected_size is None:
+                        if width <= 0 or height <= 0:
+                            raise ValueError("输入视频首帧分辨率无效")
+                        expected_size = (width, height)
+                    elif (width, height) != expected_size:
+                        raise ValueError(
+                            f"视频第 {count} 帧分辨率变化: 期望 {expected_size[0]}x{expected_size[1]}，实际 {width}x{height}"
+                        )
                     # 读取解码器给出的当前帧时间位置，毫秒除以 1000 转成秒。
                     # 时间戳应递增；用帧数/FPS 兜底时明确标记其为估计值，并在原始 PTS 恢复递增后保留真实 VFR 间隔。
                     raw_pts = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
@@ -249,9 +259,8 @@ def detect(args) -> Path:
                     if writer is None:
                         # NumPy shape 的顺序是高、宽；VideoWriter 的尺寸参数是宽、高。
                         # 在读到第一帧后再创建输出，使用实际解码尺寸。
-                        height, width = frame.shape[:2]
                         writer = cv2.VideoWriter(str(output / "annotated.mp4"),
-                                                 cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+                                                 cv2.VideoWriter_fourcc(*"mp4v"), fps, expected_size)
                         if not writer.isOpened():
                             raise RuntimeError("无法创建 MP4，请检查 OpenCV 的视频编码支持。")
                     # process 同时导出这一帧的检测数据，并返回画好检测框的图像。

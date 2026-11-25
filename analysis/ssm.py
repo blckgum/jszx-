@@ -466,14 +466,54 @@ def _intersect_interval_lists(
     return result
 
 
+def _solve_cubic_real_roots(c3: float, c2: float, c1: float, c0: float) -> list[float]:
+    """纯 Python 求解三次实系数方程 c3*t^3 + c2*t^2 + c1*t + c0 = 0 的全部实根。"""
+    scale = max(1.0, abs(c3), abs(c2), abs(c1), abs(c0))
+    if abs(c3) <= 1e-15 * scale:
+        if abs(c2) <= 1e-15 * scale:
+            if abs(c1) <= 1e-15 * scale:
+                return []
+            return [-c0 / c1]
+        disc2 = c1 * c1 - 4.0 * c2 * c0
+        if disc2 < -1e-12 * max(1.0, c1 * c1, abs(4.0 * c2 * c0)):
+            return []
+        if disc2 <= 0.0:
+            return [-c1 / (2.0 * c2)]
+        sq = math.sqrt(disc2)
+        return [(-c1 - sq) / (2.0 * c2), (-c1 + sq) / (2.0 * c2)]
+
+    b = c2 / c3
+    c = c1 / c3
+    d = c0 / c3
+    p = c - (b * b) / 3.0
+    q = (2.0 * b * b * b) / 27.0 - (b * c) / 3.0 + d
+    disc3 = 0.25 * q * q + (p * p * p) / 27.0
+    shift = -b / 3.0
+    if disc3 > 1e-18 * max(1.0, abs(q) * abs(q), abs(p) ** 3):
+        sd = math.sqrt(disc3)
+        return [math.cbrt(-0.5 * q + sd) + math.cbrt(-0.5 * q - sd) + shift]
+    if abs(p) <= 1e-18:
+        return [shift - math.cbrt(q)]
+    r_trig = 2.0 * math.sqrt(max(0.0, -p / 3.0))
+    if r_trig <= 1e-18:
+        return [shift]
+    cos_arg = max(-1.0, min(1.0, (3.0 * q) / (p * r_trig)))
+    theta = math.acos(cos_arg)
+    return [
+        r_trig * math.cos((theta - 2.0 * math.pi * k) / 3.0) + shift
+        for k in (0, 1, 2)
+    ]
+
+
 def compute_obb_accel_entry_time(
     local_pos_xy: Sequence[float],
     local_vel_xy: Sequence[float],
     local_acc_xy: Sequence[float],
     half_extents_xy: Sequence[float],
     horizon_s: float,
+    corner_radius_m: float = 0.0,
 ) -> Optional[float]:
-    """在 [0, horizon_s] 内闭合解析求解二阶相对轨迹进入 [-hx, hx] x [-hy, hy] 的最早时刻。"""
+    """在 [0, horizon_s] 内闭合解析求解二阶相对轨迹进入圆角扩展 OBB 的最早时刻。"""
     px, py = _validate_vec2(local_pos_xy, "local_pos_xy")
     vx, vy = _validate_vec2(local_vel_xy, "local_vel_xy")
     ax, ay = _validate_vec2(local_acc_xy, "local_acc_xy")
@@ -481,8 +521,12 @@ def compute_obb_accel_entry_time(
     hx = _validate_non_negative_float(hx_raw, "half_extents_xy[0]")
     hy = _validate_non_negative_float(hy_raw, "half_extents_xy[1]")
     horizon = _validate_positive_float(horizon_s, "horizon_s")
+    r_val = _validate_non_negative_float(corner_radius_m, "corner_radius_m")
+    if r_val > min(hx, hy) + 1e-12:
+        raise ValueError("corner_radius_m 不能超过半长/半宽")
+    r_eff = min(r_val, hx, hy)
 
-    # 分别求解 X/Y 轴二次不等式 |p + v*t + 0.5*a*t^2| <= h 在 [0, horizon] 内的区间并集（各至多两段）。
+    # 先求解外接直角盒 [-hx, hx] x [-hy, hy] 的可行时间区间作为粗筛选与总上界。
     x_lower = _solve_quadratic_nonneg(0.5 * ax, vx, px + hx, 0.0, horizon)
     x_upper = _solve_quadratic_nonneg(-0.5 * ax, -vx, hx - px, 0.0, horizon)
     x_intervals = _intersect_interval_lists(x_lower, x_upper)
@@ -495,11 +539,96 @@ def compute_obb_accel_entry_time(
     if not y_intervals:
         return None
 
-    # 求 X/Y 区间集合交集，返回最早侵入时刻。
-    xy_intervals = _intersect_interval_lists(x_intervals, y_intervals)
-    if not xy_intervals:
+    outer_intervals = _intersect_interval_lists(x_intervals, y_intervals)
+    if not outer_intervals:
         return None
-    return xy_intervals[0][0] + 0.0
+    if r_eff <= 1e-12:
+        return outer_intervals[0][0] + 0.0
+
+    # 圆角包络可分解为两块内接正交矩形（直边区域）与四个圆角圆盘的并集。
+    hx_core = max(0.0, hx - r_eff)
+    hy_core = max(0.0, hy - r_eff)
+    best_t: Optional[float] = None
+
+    yc_lo = _solve_quadratic_nonneg(0.5 * ay, vy, py + hy_core, 0.0, horizon)
+    yc_hi = _solve_quadratic_nonneg(-0.5 * ay, -vy, hy_core - py, 0.0, horizon)
+    yc_ivs = _intersect_interval_lists(yc_lo, yc_hi)
+    if yc_ivs:
+        slab_x = _intersect_interval_lists(x_intervals, yc_ivs)
+        if slab_x:
+            best_t = slab_x[0][0] + 0.0
+
+    xc_lo = _solve_quadratic_nonneg(0.5 * ax, vx, px + hx_core, 0.0, horizon)
+    xc_hi = _solve_quadratic_nonneg(-0.5 * ax, -vx, hx_core - px, 0.0, horizon)
+    xc_ivs = _intersect_interval_lists(xc_lo, xc_hi)
+    if xc_ivs:
+        slab_y = _intersect_interval_lists(xc_ivs, y_intervals)
+        if slab_y:
+            t_sy = slab_y[0][0] + 0.0
+            if best_t is None or t_sy < best_t:
+                best_t = t_sy
+
+    # 若外接盒首入时刻早于直边区命中时刻，再在外接可行区间内检查四个圆角圆盘的精确首次切入/进入时刻。
+    if best_t is None or outer_intervals[0][0] < best_t:
+        r_sq = r_eff * r_eff
+        tol = 1e-11 * max(1.0, r_sq)
+        for cx in (-hx_core, hx_core):
+            for cy in (-hy_core, hy_core):
+                dx0 = px - cx
+                dy0 = py - cy
+                c3 = 0.5 * (ax * ax + ay * ay)
+                c2 = 1.5 * (vx * ax + vy * ay)
+                c1 = (vx * vx + vy * vy) + (dx0 * ax + dy0 * ay)
+                c0 = dx0 * vx + dy0 * vy
+                crit_roots = _solve_cubic_real_roots(c3, c2, c1, c0)
+
+                def _corner_f(t_val: float) -> float:
+                    ddx = dx0 + vx * t_val + 0.5 * ax * t_val * t_val
+                    ddy = dy0 + vy * t_val + 0.5 * ay * t_val * t_val
+                    return (ddx * ddx + ddy * ddy) - r_sq
+
+                for lo, hi in outer_intervals:
+                    cap_hi = hi if best_t is None else min(hi, best_t)
+                    if lo > cap_hi + 1e-12:
+                        break
+                    splits = [lo]
+                    for rt in crit_roots:
+                        if lo < rt < cap_hi:
+                            splits.append(rt)
+                    splits.append(cap_hi)
+                    splits.sort()
+                    dedup: list[float] = []
+                    for pt in splits:
+                        if not dedup or pt - dedup[-1] > 1e-12:
+                            dedup.append(pt)
+                    hit_corner = False
+                    for si in range(len(dedup)):
+                        u = dedup[si]
+                        if _corner_f(u) <= tol:
+                            t_hit = u + 0.0
+                            if best_t is None or t_hit < best_t:
+                                best_t = t_hit
+                            hit_corner = True
+                            break
+                        if si + 1 < len(dedup):
+                            v = dedup[si + 1]
+                            if _corner_f(v) <= tol:
+                                a_sub, b_sub = u, v
+                                for _ in range(56):
+                                    mid = 0.5 * (a_sub + b_sub)
+                                    if _corner_f(mid) <= tol:
+                                        b_sub = mid
+                                    else:
+                                        a_sub = mid
+                                t_hit = b_sub + 0.0
+                                if best_t is None or t_hit < best_t:
+                                    best_t = t_hit
+                                hit_corner = True
+                                break
+                    if hit_corner:
+                        break
+
+    return None if best_t is None else best_t + 0.0
 
 
 def compute_mttc(

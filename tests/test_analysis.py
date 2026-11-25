@@ -617,6 +617,27 @@ class TestConflictAnalyzer(unittest.TestCase):
         )
         self.assertIsNone(self.analyzer.evaluate_pair(parked, ped_near))
 
+    def test_cvm_near_miss_caution_leaves_ttc_none(self):
+        from analysis.ablation import run_conflict_ablation
+
+        # 汽车 (0,0) vx=4 与静止行人 (8,4)：最小心距 4m > 3m 属于不接触擦肩预警，TTC 必须为 None
+        veh = SpeedReading(
+            track_id=1, category="vehicle", x_m=0.0, y_m=0.0,
+            vx_ms=4.0, vy_ms=0.0, speed_ms=4.0, speed_kmh=14.4,
+            is_speeding=False, heading_deg=0.0, is_reliable=True,
+        )
+        ped = SpeedReading(
+            track_id=2, category="pedestrian", x_m=8.0, y_m=4.0,
+            vx_ms=0.0, vy_ms=0.0, speed_ms=0.0, speed_kmh=0.0,
+            is_speeding=False, heading_deg=0.0, is_reliable=True,
+        )
+        res = self.analyzer.evaluate_pair(veh, ped)
+        self.assertIsNotNone(res)
+        self.assertEqual(res.risk_level, RiskLevel.LEVEL_2_CAUTION)
+        self.assertAlmostEqual(res.min_distance_m, 4.0, places=5)
+        self.assertIsNone(res.ttc_seconds)
+        self.assertIsInstance(run_conflict_ablation(), list)
+
     def test_analyzer_uses_own_speed_limit(self):
         # analyzer 用自身 speed_limit_kmh 重判而非信任 reading.is_speeding：
         # 独立使用且两侧限速不一致时，以 analyzer 契约为准

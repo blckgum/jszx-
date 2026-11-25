@@ -104,7 +104,7 @@ def run_conflict_ablation(
         rows.append({
             "ttc_critical_s": critical,
             "horizon_s": horizon,
-            "ttc_s": round(result.ttc_seconds, 6) if result else None,
+            "ttc_s": round(result.ttc_seconds, 6) if (result is not None and result.ttc_seconds is not None) else None,
             "min_distance_m": round(result.min_distance_m, 6) if result else None,
             "risk_level": result.risk_level.name if result else RiskLevel.LEVEL_0_SAFE.name,
         })

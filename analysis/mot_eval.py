@@ -714,7 +714,7 @@ def evaluate_mot(
     else:
         idf1 = idp = idr = 1.0
 
-    # 3. HOTA / DetA / AssA：Luiten et al. 19 档阈值 (0.05..0.95)
+    # 3. HOTA / DetA / AssA：严格遵循 TrackEval (Luiten et al.) 两遍式流程
     deta_list: list[float] = []
     assa_list: list[float] = []
     hota_list: list[float] = []
@@ -723,56 +723,73 @@ def evaluate_mot(
         assa_list = [1.0] * len(HOTA_ALPHAS)
         hota_list = [1.0] * len(HOTA_ALPHAS)
     else:
-        for alpha in HOTA_ALPHAS:
-            potential_counts: Counter[tuple[int, int]] = Counter()
-            for _, g_ids, p_ids, iou_mat in frame_cache:
-                if iou_mat.size == 0:
-                    continue
-                valid_a = iou_mat >= (alpha - eps)
-                if valid_a.any():
-                    nz_r, nz_c = np.nonzero(valid_a)
-                    for r_i, c_i in zip(nz_r.tolist(), nz_c.tolist()):
-                        potential_counts[(g_ids[r_i], p_ids[c_i])] += 1
+        # Pass 1：全局累加归一化软相似度，计算唯一全局关联先验 GAS
+        potential_counts: dict[tuple[int, int], float] = {}
+        for _, g_ids, p_ids, iou_mat in frame_cache:
+            if iou_mat.size == 0:
+                continue
+            row_sum = iou_mat.sum(axis=1, keepdims=True)
+            col_sum = iou_mat.sum(axis=0, keepdims=True)
+            denom_mat = row_sum + col_sum - iou_mat
+            safe_denom = np.where(denom_mat > eps, denom_mat, 1.0)
+            sim_iou = np.where(denom_mat > eps, iou_mat / safe_denom, 0.0)
+            nz_r, nz_c = np.nonzero(sim_iou > 0.0)
+            for r_i, c_i in zip(nz_r.tolist(), nz_c.tolist()):
+                pair = (g_ids[r_i], p_ids[c_i])
+                potential_counts[pair] = potential_counts.get(pair, 0.0) + float(sim_iou[r_i, c_i])
 
-            # 全球对齐关联先验：potential / (|GT_g| + |Pred_p| - potential)
-            gas: dict[tuple[int, int], float] = {}
-            for pair, pm in potential_counts.items():
-                denom = gt_track_len[pair[0]] + pred_track_len[pair[1]] - pm
-                gas[pair] = (pm / denom) if denom > 0 else 0.0
+        gas: dict[tuple[int, int], float] = {}
+        for pair, pm in potential_counts.items():
+            denom_g = gt_track_len[pair[0]] + pred_track_len[pair[1]] - pm
+            gas[pair] = (pm / denom_g) if denom_g > eps else 0.0
 
-            tp_a = 0
-            fp_a = 0
-            fn_a = 0
-            tpa_counts: Counter[tuple[int, int]] = Counter()
+        # Pass 2：每帧仅执行一次匈牙利匹配（按 GAS * IoU），随后按 19 档阈值筛选配对统计 TP/FP/FN/TPA
+        tp_by_a = [0] * len(HOTA_ALPHAS)
+        fp_by_a = [0] * len(HOTA_ALPHAS)
+        fn_by_a = [0] * len(HOTA_ALPHAS)
+        tpa_by_a: list[Counter[tuple[int, int]]] = [Counter() for _ in HOTA_ALPHAS]
 
-            for _, g_ids, p_ids, iou_mat in frame_cache:
-                n_g = len(g_ids)
-                n_p = len(p_ids)
-                valid_a = iou_mat >= (alpha - eps)
-                if valid_a.any():
-                    score_mat = np.zeros((n_g, n_p), dtype=np.float64)
-                    nz_r, nz_c = np.nonzero(valid_a)
-                    for r_i, c_i in zip(nz_r.tolist(), nz_c.tolist()):
-                        score_mat[r_i, c_i] = gas[(g_ids[r_i], p_ids[c_i])] * float(iou_mat[r_i, c_i])
-                    matched_a = _solve_max_weight_assignment(score_mat, valid_a, use_lap=_use_lap)
-                else:
-                    matched_a = []
+        for _, g_ids, p_ids, iou_mat in frame_cache:
+            n_g = len(g_ids)
+            n_p = len(p_ids)
+            if iou_mat.size > 0:
+                score_mat = np.zeros((n_g, n_p), dtype=np.float64)
+                nz_r, nz_c = np.nonzero(iou_mat > 0.0)
+                for r_i, c_i in zip(nz_r.tolist(), nz_c.tolist()):
+                    score_mat[r_i, c_i] = (
+                        gas.get((g_ids[r_i], p_ids[c_i]), 0.0) * float(iou_mat[r_i, c_i])
+                    )
+                matched_frame = _solve_max_weight_assignment(
+                    score_mat, score_mat > 0.0, use_lap=_use_lap
+                )
+            else:
+                matched_frame = []
 
+            for a_idx, alpha in enumerate(HOTA_ALPHAS):
+                matched_a = [
+                    (r_i, c_i)
+                    for r_i, c_i in matched_frame
+                    if float(iou_mat[r_i, c_i]) >= (alpha - eps)
+                ]
                 for r_i, c_i in matched_a:
-                    tpa_counts[(g_ids[r_i], p_ids[c_i])] += 1
+                    tpa_by_a[a_idx][(g_ids[r_i], p_ids[c_i])] += 1
                 n_m = len(matched_a)
-                tp_a += n_m
-                fp_a += n_p - n_m
-                fn_a += n_g - n_m
+                tp_by_a[a_idx] += n_m
+                fp_by_a[a_idx] += n_p - n_m
+                fn_by_a[a_idx] += n_g - n_m
 
+        for a_idx in range(len(HOTA_ALPHAS)):
+            tp_a = tp_by_a[a_idx]
+            fp_a = fp_by_a[a_idx]
+            fn_a = fn_by_a[a_idx]
             det_denom = tp_a + fp_a + fn_a
             det_a = (tp_a / det_denom) if det_denom > 0 else 1.0
             if tp_a > 0:
                 ass_sum = 0.0
-                for (gid, pid), c_tpa in tpa_counts.items():
-                    denom = gt_track_len[gid] + pred_track_len[pid] - c_tpa
-                    if denom > 0:
-                        ass_sum += c_tpa * (c_tpa / denom)
+                for (gid, pid), c_tpa in tpa_by_a[a_idx].items():
+                    denom_a = gt_track_len[gid] + pred_track_len[pid] - c_tpa
+                    if denom_a > 0:
+                        ass_sum += c_tpa * (c_tpa / denom_a)
                 ass_a = ass_sum / tp_a
             else:
                 ass_a = 0.0

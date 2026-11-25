@@ -754,6 +754,11 @@ class AnalysisService:
             and summary["video_frame_map"] is None
         )
 
+    @staticmethod
+    def _summary_requires_frame_map(summary: Optional[dict]) -> bool:
+        """摘要显式声明非空 video_frame_map 时，必须严格按稀疏帧映射取图。"""
+        return isinstance(summary, dict) and summary.get("video_frame_map") is not None
+
     def get_run_summary(self, run_id: str) -> dict:
         """严格读取指定运行目录的 summary.json。"""
         run_dir = self._resolve_run_dir(run_id)
@@ -765,13 +770,24 @@ class AnalysisService:
             raise SchemaValidationError("summary.json 顶层必须是 JSON 对象")
         video_disabled = self._summary_disables_video(data)
         map_disabled = video_disabled or self._summary_disables_frame_map(data)
-        frame_map = None if map_disabled else self._load_video_frame_map(run_dir)
+        frame_map_required = (not map_disabled) and self._summary_requires_frame_map(data)
+        frame_map_missing = False
+        if map_disabled:
+            frame_map = None
+        else:
+            try:
+                frame_map = self._load_video_frame_map(run_dir, required=frame_map_required)
+            except FileNotFoundError:
+                frame_map = None
+                frame_map_missing = True
         out = {
             "run_id": run_id,
             "has_video": (not video_disabled) and (run_dir / "annotated_conflict.mp4").is_file(),
             "has_video_frame_map": frame_map is not None,
             **data,
         }
+        if frame_map_missing:
+            out["video_frame_map_missing"] = True
         if frame_map is not None:
             out["video_frame_count"] = len(frame_map)
             out["video_frame_indices"] = frame_map
@@ -790,9 +806,11 @@ class AnalysisService:
         return frame_start, frame_end
 
     @staticmethod
-    def _load_video_frame_map(run_dir: Path) -> Optional[List[int]]:
+    def _load_video_frame_map(run_dir: Path, *, required: bool = False) -> Optional[List[int]]:
         map_path = run_dir / "video_frame_map.json"
         if not map_path.is_file():
+            if required:
+                raise FileNotFoundError(f"运行摘要声明了 video_frame_map，但缺少文件: {run_dir.name}")
             return None
         payload = load_json_strict(map_path)
         if not isinstance(payload, dict):
@@ -1087,14 +1105,16 @@ class AnalysisService:
         if not downsampled:
             out_points = full_points
         else:
+            # 每桶分别保留最高风险代表帧与最高车速代表帧，保证每个可点击数据点严格对应同一真实源帧。
             out_points = []
-            for bi in range(max_points):
-                lo = (bi * total_frames) // max_points
-                hi = ((bi + 1) * total_frames) // max_points
+            n_buckets = max(1, max_points // 2)
+            for bi in range(n_buckets):
+                lo = (bi * total_frames) // n_buckets
+                hi = ((bi + 1) * total_frames) // n_buckets
                 if hi <= lo:
                     continue
                 bucket = full_points[lo:hi]
-                rep = max(
+                risk_rep = max(
                     bucket,
                     key=lambda p: (
                         p["risk_level"],
@@ -1102,14 +1122,22 @@ class AnalysisService:
                         p["speed_kmh"],
                     ),
                 )
-                ttcs = [p["ttc_s"] for p in bucket if p["ttc_s"] is not None]
-                out_points.append({
-                    "frame_index": rep["frame_index"],
-                    "timestamp_s": rep["timestamp_s"],
-                    "speed_kmh": max(p["speed_kmh"] for p in bucket),
-                    "ttc_s": min(ttcs) if ttcs else None,
-                    "risk_level": max(p["risk_level"] for p in bucket),
-                })
+                speed_rep = max(
+                    bucket,
+                    key=lambda p: (
+                        p["speed_kmh"],
+                        p["risk_level"],
+                        -(p["ttc_s"] if p["ttc_s"] is not None else 9999.0),
+                    ),
+                )
+                if risk_rep["frame_index"] == speed_rep["frame_index"]:
+                    out_points.append(dict(risk_rep))
+                elif risk_rep["frame_index"] < speed_rep["frame_index"]:
+                    out_points.append(dict(risk_rep))
+                    out_points.append(dict(speed_rep))
+                else:
+                    out_points.append(dict(speed_rep))
+                    out_points.append(dict(risk_rep))
 
         return {
             "run_id": run_id,
@@ -1139,7 +1167,12 @@ class AnalysisService:
         summary = self._read_optional_summary(run_dir)
         if self._summary_disables_video(summary):
             raise FileNotFoundError(f"运行摘要声明无标注视频: {run_id}")
-        frame_map = None if self._summary_disables_frame_map(summary) else self._load_video_frame_map(run_dir)
+        map_required = (not self._summary_disables_frame_map(summary)) and self._summary_requires_frame_map(summary)
+        frame_map = (
+            None
+            if self._summary_disables_frame_map(summary)
+            else self._load_video_frame_map(run_dir, required=map_required)
+        )
         target_video_pos = frame_index
         if frame_map is not None:
             pos = bisect_left(frame_map, frame_index)

@@ -1659,8 +1659,16 @@ class ConflictPerceptionPipeline:
                         ),
                         encoding="utf-8",
                     )
-                except Exception:
-                    pass
+                except BaseException as exc:
+                    try:
+                        frame_map_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    if close_exc is None:
+                        close_exc = exc
+                    if not main_loop_failed:
+                        loop_state = "exception"
+                        loop_error = f"{type(exc).__name__}: {exc}"
             else:
                 try:
                     frame_map_path.unlink(missing_ok=True)

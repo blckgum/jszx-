@@ -148,6 +148,27 @@ class TestMotEval(unittest.TestCase):
         res_gap = evaluate_mot(gt_gap, pred_gap, iou_threshold=0.5, _use_lap=False)
         self.assertEqual(res_gap["id_switches"], 2)
 
+    def test_hota_matches_trackeval_reference_on_ambiguous_frame(self):
+        # 4 个 10x10 框存在歧义重叠，核对 TrackEval 两遍式 HOTA/DetA/AssA 数值
+        gt = {
+            0: [
+                {"track_id": 1, "bbox_xyxy": [10.0, 0.0, 20.0, 10.0]},
+                {"track_id": 2, "bbox_xyxy": [14.0, 0.0, 24.0, 10.0]},
+            ]
+        }
+        pred = {
+            0: [
+                {"track_id": 1, "bbox_xyxy": [11.0, 0.0, 21.0, 10.0]},
+                {"track_id": 2, "bbox_xyxy": [6.0, 0.0, 16.0, 10.0]},
+            ]
+        }
+        for use_lap in (True, False):
+            with self.subTest(use_lap=use_lap):
+                res = evaluate_mot(gt, pred, _use_lap=use_lap)
+                self.assertAlmostEqual(res["deta"], 0.350877, places=5)
+                self.assertAlmostEqual(res["assa"], 0.842105, places=5)
+                self.assertAlmostEqual(res["hota"], 0.530679, places=5)
+
     def test_single_id_switch_penalizes_idsw_idf1_and_hota(self):
         # 单条 10 帧真值轨迹：前 6 帧分配 ID=1，后 4 帧发生 1 次 ID 切换变为 ID=2（框完全重合）
         gt = {f: [{"track_id": 1, "bbox_xyxy": [0.0, 0.0, 20.0, 20.0]}] for f in range(10)}

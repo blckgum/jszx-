@@ -184,6 +184,8 @@
     calibImageDims: { w: 0, h: 0 },
     calibVersion: 0,
     calibPreviewReqId: 0,
+    calibExtractReqId: 0,
+    calibLoadedSource: "",
     calibPreview: null,
     chartsByRun: {},
     pendingDeleteRunId: null,
@@ -638,6 +640,12 @@
         }
       });
     } else if (viewId === "history") {
+      if (state.mode === "replay" && state.replay.playing) {
+        stopReplayPlayback();
+        if (widgets.pipeline && typeof widgets.pipeline.setPaused === "function") {
+          widgets.pipeline.setPaused(true);
+        }
+      }
       if (!state.runs.length) {
         loadRunsList();
       } else if (widgets.speedChart && typeof widgets.speedChart.refreshTheme === "function") {
@@ -646,6 +654,12 @@
         });
       }
     } else if (viewId === "studio") {
+      if (state.mode === "replay" && state.replay.playing) {
+        stopReplayPlayback();
+        if (widgets.pipeline && typeof widgets.pipeline.setPaused === "function") {
+          widgets.pipeline.setPaused(true);
+        }
+      }
       if (state.studioTab === "calib" && widgets.calibCanvas && typeof widgets.calibCanvas.refreshTheme === "function") {
         window.requestAnimationFrame(function () {
           widgets.calibCanvas.refreshTheme();
@@ -1336,6 +1350,7 @@
       conflictsTruncated: conflictsTruncated,
       allFramesLoaded: allFramesLoaded,
       loadedRanges: loadedRanges,
+      cappedFrames: {},
       loadingChunks: {},
       nominalFrameMs: nominalFrameMs,
       speedsByFrame: speedsByFrame,
@@ -1563,6 +1578,12 @@
 
     var chunkStart = Math.floor(clamped / REPLAY_CHUNK_SIZE) * REPLAY_CHUNK_SIZE;
     var chunkEnd = Math.min(totalF - 1, chunkStart + REPLAY_CHUNK_SIZE - 1);
+    while (chunkStart < clamped && isReplayFrameLoaded(dataset, chunkStart)) {
+      chunkStart += 1;
+    }
+    while (chunkEnd > clamped && isReplayFrameLoaded(dataset, chunkEnd)) {
+      chunkEnd -= 1;
+    }
     var chunkKey = chunkStart + ":" + chunkEnd;
     if (dataset.loadingChunks[chunkKey]) {
       return dataset.loadingChunks[chunkKey];
@@ -1596,9 +1617,13 @@
         var completeEnd = reqEnd;
         if (spTrunc) completeEnd = Math.min(completeEnd, maxSpFrame - 1);
         if (cfTrunc) completeEnd = Math.min(completeEnd, maxCfFrame - 1);
-        // 单帧即超出单页上限时不再向前拆半帧，保留当前帧并防止死循环
+        // 单帧即超出单页上限时保留该帧已返回片段并记录标记，同时继续向后请求同区间其余帧
         var hitSingleFrameCap = (spTrunc || cfTrunc) && completeEnd < reqStart;
-        if (hitSingleFrameCap) completeEnd = reqStart;
+        if (hitSingleFrameCap) {
+          completeEnd = reqStart;
+          if (!dataset.cappedFrames) dataset.cappedFrames = {};
+          dataset.cappedFrames[reqStart] = true;
+        }
 
         for (var fi = reqStart; fi <= completeEnd; fi += 1) {
           delete dataset.speedsByFrame[fi];
@@ -1646,7 +1671,7 @@
           }
         }
 
-        if ((spTrunc || cfTrunc) && completeEnd < reqEnd && !hitSingleFrameCap) {
+        if ((spTrunc || cfTrunc) && completeEnd < reqEnd) {
           return fetchSubRange(completeEnd + 1, reqEnd);
         }
         return null;
@@ -1921,6 +1946,10 @@
 
   function enterReplayMode(runId, initialFrame) {
     setMonitorMode("replay");
+    stopReplayPlayback();
+    if (widgets.pipeline && typeof widgets.pipeline.setPaused === "function") {
+      widgets.pipeline.setPaused(true);
+    }
     var reqToken = ++state.replayReqToken;
     state.replay.runId = runId;
     state.replay.data = null;
@@ -2810,7 +2839,7 @@
 
         tr.appendChild(makeCell("td", formatNumber(a.veh_speed_kmh, 1, "--"), "mono tabular"));
 
-        var ttcStr = formatNumber(a.ttc_seconds, 2, "--") + "s";
+        var ttcStr = a.ttc_seconds != null ? (formatNumber(a.ttc_seconds, 2, "--") + "s") : "--";
         if (typeof a.pet_seconds === "number") {
           ttcStr += " / PET " + a.pet_seconds.toFixed(2) + "s";
         }
@@ -3381,26 +3410,32 @@
     if (!source) {
       showCalibError("请输入或浏览本地视频路径后再提取标定帧");
       if (dom.calibSource) dom.calibSource.focus();
-      return;
+      return Promise.resolve(null);
     }
     var frameIdx = parseInt(dom.calibFrameIndex ? dom.calibFrameIndex.value : "0", 10);
     if (!Number.isFinite(frameIdx) || frameIdx < 0) {
       showCalibError("帧号必须是非负整数");
-      return;
+      return Promise.resolve(null);
     }
 
+    var reqId = ++state.calibExtractReqId;
     showCalibError("");
     if (dom.btnCalibExtract) {
       dom.btnCalibExtract.disabled = true;
       dom.btnCalibExtract.textContent = "提取中...";
     }
 
-    fetchJson("/api/calibration/frame", {
+    return fetchJson("/api/calibration/frame", {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8" },
       body: JSON.stringify({ source: source, frame_index: frameIdx })
     })
       .then(function (res) {
+        var curSource = dom.calibSource ? dom.calibSource.value.trim() : "";
+        var curFrame = parseInt(dom.calibFrameIndex ? dom.calibFrameIndex.value : "0", 10);
+        if (reqId !== state.calibExtractReqId || curSource !== source || curFrame !== frameIdx) {
+          return null;
+        }
         if (dom.calibFrameMeta) {
           dom.calibFrameMeta.textContent =
             (res.width || 0) + "x" + (res.height || 0) +
@@ -3423,10 +3458,12 @@
           });
         }
         var dimsChanged = (prevW > 0 && prevH > 0 && (prevW !== nextW || prevH !== nextH)) || hasOutOfBounds;
+        var sourceChanged = Boolean(state.calibLoadedSource && state.calibLoadedSource !== source);
+        state.calibLoadedSource = source;
         state.calibImageDims = { w: nextW, h: nextH };
         if (widgets.calibCanvas && typeof widgets.calibCanvas.loadImage === "function") {
           widgets.calibCanvas.loadImage(res.image_data_url, res.width, res.height);
-          if (dimsChanged) {
+          if (dimsChanged || sourceChanged) {
             if (typeof widgets.calibCanvas.clearPoints === "function") {
               widgets.calibCanvas.clearPoints();
             }
@@ -3437,12 +3474,15 @@
           resetCalibValidationBadge();
         }
         showToast("已提取标定帧 #" + (res.frame_index != null ? res.frame_index : frameIdx));
+        return res;
       })
       .catch(function (err) {
+        if (reqId !== state.calibExtractReqId) return null;
         showCalibError("提取视频帧失败: " + err.message);
+        return null;
       })
       .finally(function () {
-        if (dom.btnCalibExtract) {
+        if (reqId === state.calibExtractReqId && dom.btnCalibExtract) {
           dom.btnCalibExtract.disabled = false;
           dom.btnCalibExtract.textContent = "提取标定帧";
         }
@@ -4391,6 +4431,38 @@
         });
       });
     }
+    if (dom.calibSource) {
+      var onCalibSourceInput = function () {
+        state.calibExtractReqId += 1;
+        if (dom.btnCalibExtract) {
+          dom.btnCalibExtract.disabled = false;
+          dom.btnCalibExtract.textContent = "提取标定帧";
+        }
+        resetCalibValidationBadge();
+        var nextSrc = dom.calibSource.value.trim();
+        if (state.calibLoadedSource && state.calibLoadedSource !== nextSrc && widgets.calibCanvas) {
+          if (typeof widgets.calibCanvas.clearPoints === "function") {
+            widgets.calibCanvas.clearPoints();
+          }
+          if (typeof widgets.calibCanvas.clearParkingZones === "function") {
+            widgets.calibCanvas.clearParkingZones();
+          }
+        }
+      };
+      dom.calibSource.addEventListener("input", onCalibSourceInput);
+      dom.calibSource.addEventListener("change", onCalibSourceInput);
+    }
+    if (dom.calibFrameIndex) {
+      var onCalibFrameChange = function () {
+        state.calibExtractReqId += 1;
+        if (dom.btnCalibExtract) {
+          dom.btnCalibExtract.disabled = false;
+          dom.btnCalibExtract.textContent = "提取标定帧";
+        }
+      };
+      dom.calibFrameIndex.addEventListener("input", onCalibFrameChange);
+      dom.calibFrameIndex.addEventListener("change", onCalibFrameChange);
+    }
     if (dom.btnCalibExtract) {
       dom.btnCalibExtract.addEventListener("click", extractCalibrationFrame);
     }
@@ -4514,6 +4586,7 @@
       pollLiveJobState: pollLiveJobState,
       stopLiveJobPolling: stopLiveJobPolling,
       resetCalibValidationBadge: resetCalibValidationBadge,
+      extractCalibrationFrame: extractCalibrationFrame,
       previewCalibration: previewCalibration,
       renderHistoryTables: renderHistoryTables
     };

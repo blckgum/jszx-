@@ -311,7 +311,8 @@ class ConflictAnalyzer:
                 and t_cpa <= self.horizon_s
                 and t_cpa <= self.ttc_caution_s
             ):
-                ttc_out = t_cpa
+                # 擦肩近距预警分支中两包络并未相交，TTC 置空并仅在描述中展示预计最小间距。
+                ttc_out = None
                 conflict_x = veh.x_m + veh.vx_ms * t_cpa
                 conflict_y = veh.y_m + veh.vy_ms * t_cpa
                 level = RiskLevel.LEVEL_2_CAUTION
@@ -436,7 +437,7 @@ class ConflictAnalyzer:
         )
         drac = compute_drac(dx, dy, dvx, dvy, critical_dist_obb)
 
-        # 若等速外推未撞击且存在相对加速度，在 [0, horizon_s] 内精确求解二阶轨迹进入扩展 OBB 的最早时刻。
+        # 若等速外推未撞击且存在相对加速度，在 [0, horizon_s] 内精确求解二阶轨迹进入圆角扩展 OBB 的最早时刻。
         accel_entry_t: Optional[float] = None
         if not obb.collides and (dax * dax + day * day) > 1e-6:
             alx = cos_h * dax + sin_h * day
@@ -447,6 +448,7 @@ class ConflictAnalyzer:
                 (alx, aly),
                 obb.expanded_half_extents_xy,
                 self.horizon_s,
+                corner_radius_m=ped_radius_m,
             )
         accel_enters_obb = accel_entry_t is not None
 

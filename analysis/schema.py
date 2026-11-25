@@ -223,6 +223,10 @@ def validate_summary(data):
             not isinstance(data["annotated_output"], str) or not data["annotated_output"].strip()
         ):
             raise SchemaValidationError("summary.annotated_output 必须为非空字符串或 null")
+        if "video_frame_map" in data and data["video_frame_map"] is not None and (
+            not isinstance(data["video_frame_map"], str) or not data["video_frame_map"].strip()
+        ):
+            raise SchemaValidationError("summary.video_frame_map 必须为非空字符串或 null")
         for key in ("total_alert_events", "total_speeding_alerts", "total_caution_events",
                     "total_critical_conflicts"):
             _integer(data[key], f"summary.{key}", minimum=0)
@@ -547,6 +551,21 @@ def validate_run(run_dir: str | Path) -> dict:
         for required_name in ("configuration.json", "conflicts.jsonl", "events.jsonl", "speeds.csv"):
             if not (root / required_name).exists():
                 raise SchemaValidationError(f"完成运行缺少 {required_name}")
+        if summary.get("video_frame_map") is not None and not (root / "video_frame_map.json").is_file():
+            raise SchemaValidationError("完成运行缺少摘要声明的 video_frame_map.json")
+    frame_map_path = root / "video_frame_map.json"
+    if frame_map_path.exists():
+        fm_data = _mapping(load_json_strict(frame_map_path), "video_frame_map")
+        _reject_non_finite_tree(fm_data, "video_frame_map")
+        _schema_version(fm_data, "video_frame_map")
+        raw_src_frames = fm_data.get("source_frames")
+        if not isinstance(raw_src_frames, list):
+            raise SchemaValidationError("video_frame_map.source_frames 必须是列表")
+        prev_sf = -1
+        for sf in raw_src_frames:
+            if type(sf) is not int or sf < 0 or sf <= prev_sf:
+                raise SchemaValidationError("video_frame_map.source_frames 必须是严格递增非负整数")
+            prev_sf = sf
     if (root / "configuration.json").exists():
         validate_configuration(load_json_strict(root / "configuration.json"))
     if (root / "conflicts.jsonl").exists():
