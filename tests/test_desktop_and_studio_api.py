@@ -14,7 +14,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -27,9 +29,11 @@ from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
+import yaml
 
 from analysis import desktop as desktop_mod
 from analysis.calibration import RoadCalibrator
+from analysis.scenarios import default_scenarios
 from analysis.service import (
     AnalysisService,
     DEFAULT_WEB_ROOT,
@@ -746,6 +750,116 @@ class TestDesktopSystemDialogExportChartsAndStudioApis(unittest.TestCase):
                 srv.shutdown()
                 srv.server_close()
 
+    def test_calibration_five_plus_points_ransac_preview_and_save_persists_yaml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_dir = root / "configs"
+            cfg_dir.mkdir()
+            default_calib = cfg_dir / "calibration.yaml"
+            base_pts = [(400.0, 300.0), (880.0, 300.0), (1150.0, 680.0), (130.0, 680.0)]
+            ref_cal = RoadCalibrator(base_pts, 6.0, 15.0, synthetic=True)
+            ref_cal.to_yaml(default_calib)
+
+            runs_root = root / "runs"
+            runs_root.mkdir()
+            svc = AnalysisService(runs_root, default_calib=default_calib)
+            srv = create_http_server(svc, host="127.0.0.1", port=0)
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            try:
+                extra_ground = [[3.0, 7.5], [1.5, 11.25]]
+                extra_img = []
+                for gx, gy in extra_ground:
+                    pt = ref_cal.ground_to_pixel_checked(gx, gy)
+                    assert pt is not None
+                    extra_img.append([float(pt[0]), float(pt[1])])
+
+                img_pts = [list(p) for p in base_pts] + extra_img
+                gd_pts = [[0.0, 0.0], [6.0, 0.0], [6.0, 15.0], [0.0, 15.0]] + extra_ground
+
+                st_prev, prev_res = _http_json(
+                    f"{base}/api/calibration/preview",
+                    method="POST",
+                    payload={
+                        "image_points": img_pts,
+                        "ground_points": gd_pts,
+                        "use_ransac": True,
+                        "ransac_reproj_threshold_m": 0.5,
+                        "name": "ransac_six_pt",
+                    },
+                )
+                self.assertEqual(st_prev, 200)
+                self.assertTrue(prev_res["valid"])
+                self.assertEqual(prev_res["inlier_count"], 6)
+                self.assertLess(prev_res["reprojection_rmse_m"], 0.02)
+                self.assertEqual(len(prev_res["ground_points"]), 6)
+
+                st_save, save_res = _http_json(
+                    f"{base}/api/calibration/save",
+                    method="POST",
+                    payload={
+                        "image_points": img_pts,
+                        "ground_points": gd_pts,
+                        "width_m": 6.0,
+                        "length_m": 15.0,
+                        "use_ransac": True,
+                        "ransac_reproj_threshold_m": 0.5,
+                        "name": "ransac_six_pt",
+                        "filename": "ransac_six_pt.yaml",
+                    },
+                )
+                self.assertEqual(st_save, 200)
+                self.assertTrue(save_res["saved"])
+                self.assertEqual(save_res["label"], "ransac_six_pt.yaml")
+                saved_file = (cfg_dir / "ransac_six_pt.yaml").resolve()
+                self.assertEqual(save_res["path"], str(saved_file))
+                self.assertTrue(saved_file.is_file())
+
+                raw_yaml = yaml.safe_load(saved_file.read_text(encoding="utf-8"))
+                self.assertFalse(raw_yaml["synthetic"])
+                self.assertTrue(raw_yaml["use_ransac"])
+                self.assertEqual(len(raw_yaml["image_points"]), 6)
+                self.assertEqual(len(raw_yaml["ground_points"]), 6)
+
+                reloaded = RoadCalibrator.from_yaml(saved_file)
+                self.assertFalse(reloaded.synthetic)
+                self.assertEqual(reloaded.inlier_count, 6)
+                self.assertEqual(len(reloaded.image_points), 6)
+                self.assertEqual(len(reloaded.ground_points), 6)
+                gx_mid, gy_mid = reloaded.pixel_to_ground(extra_img[0][0], extra_img[0][1])
+                self.assertAlmostEqual(gx_mid, 3.0, delta=0.05)
+                self.assertAlmostEqual(gy_mid, 7.5, delta=0.05)
+
+                # 5+ points without ground_points must return 400 instead of crashing RoadCalibrator.
+                st_no_gp, _ = _http_json(
+                    f"{base}/api/calibration/save",
+                    method="POST",
+                    payload={
+                        "image_points": img_pts,
+                        "width_m": 6.0,
+                        "length_m": 15.0,
+                        "use_ransac": True,
+                        "filename": "bad_five_no_gp.yaml",
+                    },
+                )
+                self.assertEqual(st_no_gp, 400)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+    def test_scenarios_default_heading_computed_from_velocity(self):
+        scenarios = {s.name: s for s in default_scenarios()}
+        cc = scenarios["critical_crossing"].readings
+        self.assertIs(type(cc[0].heading_deg), float)
+        self.assertAlmostEqual(cc[0].heading_deg, 90.0, places=6)
+        self.assertAlmostEqual(cc[1].heading_deg, 180.0, places=6)
+        div = scenarios["diverging_safe"].readings
+        self.assertAlmostEqual(div[0].heading_deg, 90.0, places=6)
+        self.assertAlmostEqual(div[1].heading_deg, 270.0, places=6)
+        parked = scenarios["parked_safe"].readings
+        self.assertAlmostEqual(parked[0].heading_deg, 0.0, places=6)
+
     def test_fastapi_registers_and_handles_all_new_routes(self):
         registered_routes = []
 
@@ -1071,16 +1185,31 @@ class TestStandaloneDesktopHost(unittest.TestCase):
         styles = (web_dir / "assets" / "styles.css").read_text(encoding="utf-8")
         app_js = (web_dir / "assets" / "app.js").read_text(encoding="utf-8")
         motion_js = (web_dir / "assets" / "motion.js").read_text(encoding="utf-8")
+        scenarios_py = (REPO_ROOT / "analysis" / "scenarios.py").read_text(encoding="utf-8")
 
         self.assertIn('id="btn-replay-sample" class="btn btn-ghost" hidden', html)
         self.assertIn('id="replay-sim-canvas"', html)
         self.assertIn('aria-controls="conflicts-table-region"', html)
         self.assertIn('aria-controls="studio-panel-calib"', html)
+        self.assertIn("1.80 s", html)
+        self.assertNotIn("1.50 s", html)
+        self.assertIn('id="sim-speed-model"', html)
+        self.assertIn('id="sim-conflict-model"', html)
+        self.assertIn('id="calib-corresp-wrap"', html)
+        self.assertIn('id="calib-corresp-list"', html)
+
+        self.assertNotIn("@property --beam-angle", styles)
+        self.assertNotIn("beam-spin", styles)
+
         self.assertIn("widgets.roadTwin.setConfig", app_js)
         self.assertIn("dom.replayFrameImg.onerror", app_js)
         self.assertIn("clearHistoryDisplay", app_js)
         self.assertIn("isPlayableRun", app_js)
         self.assertIn("bindTablistKeyboard", app_js)
+        self.assertIn("simSpeedModel", app_js)
+        self.assertIn("simConflictModel", app_js)
+        self.assertIn("calibGroundPoints", app_js)
+
         self.assertIn("CampusRoadTwinCanvas.prototype.setConfig", motion_js)
         self.assertIn("computeCvmCircleTtc", motion_js)
         self.assertIn("SCENARIO_CYCLE_S", motion_js)
@@ -1093,8 +1222,264 @@ class TestStandaloneDesktopHost(unittest.TestCase):
             ("styles.css", styles),
             ("app.js", app_js),
             ("motion.js", motion_js),
+            ("scenarios.py", scenarios_py),
         ):
             self.assertIsNone(emoji_re.search(content), f"{rel} 发现未清理的 emoji 字符")
+
+    def test_motion_js_scenarios_kinematics_and_replay_contract(self):
+        node_bin = shutil.which("node")
+        if node_bin is None:
+            self.skipTest("node runtime not available")
+
+        motion_path = REPO_ROOT / "analysis" / "web" / "assets" / "motion.js"
+        node_script = r"""
+const fs = require("fs");
+const vm = require("vm");
+
+const motionPath = process.env.MOTION_JS_PATH;
+const code = fs.readFileSync(motionPath, "utf8");
+const noop = () => {};
+const ctx = new Proxy(
+  {
+    measureText: (s) => ({ width: String(s || "").length * 6.5 }),
+    createLinearGradient: () => ({ addColorStop: noop })
+  },
+  {
+    get(target, prop) {
+      return prop in target ? target[prop] : noop;
+    }
+  }
+);
+const mkEl = () => ({
+  style: {},
+  classList: { add: noop, remove: noop, contains: () => false },
+  setAttribute: noop,
+  getAttribute: () => null,
+  appendChild: noop,
+  removeChild: noop,
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  addEventListener: noop,
+  removeEventListener: noop,
+  getBoundingClientRect: () => ({ width: 640, height: 380 }),
+  getContext: () => ctx,
+  width: 640,
+  height: 380
+});
+const sandbox = {
+  performance: { now: () => 0 },
+  matchMedia: () => ({ matches: false, addEventListener: noop, removeEventListener: noop }),
+  getComputedStyle: () => ({ getPropertyValue: () => "", colorScheme: "dark" }),
+  document: {
+    documentElement: { getAttribute: () => "dark", classList: { contains: () => false } },
+    body: { appendChild: noop, removeChild: noop },
+    createElement: mkEl,
+    createElementNS: mkEl
+  },
+  requestAnimationFrame: () => 1,
+  cancelAnimationFrame: noop,
+  setInterval: () => 1,
+  clearInterval: noop,
+  setTimeout: () => 1,
+  clearTimeout: noop
+};
+sandbox.window = sandbox;
+sandbox.globalThis = sandbox;
+vm.runInNewContext(code, sandbox);
+
+const CM = sandbox.CampusMotion;
+if (!CM || typeof CM._buildScenarioState !== "function" || typeof CM._computeCpaAndTtc !== "function") {
+  throw new Error("Missing expected CampusMotion exports");
+}
+
+function obbClearance(veh, vru) {
+  const dx = vru.x - veh.x;
+  const dy = vru.y - veh.y;
+  const c = Math.cos(veh.headingRad);
+  const s = Math.sin(veh.headingRad);
+  const lx = dx * c + dy * s;
+  const ly = -dx * s + dy * c;
+  const halfL = (veh.lengthM || 4.5) * 0.5;
+  const halfW = (veh.widthM || 1.9) * 0.5;
+  const cx = Math.max(-halfL, Math.min(halfL, lx));
+  const cy = Math.max(-halfW, Math.min(halfW, ly));
+  return Math.hypot(lx - cx, ly - cy) - (vru.radiusM || 0.42);
+}
+
+const scenarios = ["crosswalk_braking", "cyclist_vru_cutin", "ctrv_curve_yield"];
+const scenarioSummary = {};
+
+for (const sc of scenarios) {
+  const twin = new CM.CampusRoadTwinCanvas(mkEl(), {
+    config: { speedModel: "ctrv", conflictModel: "obb_ssm", stitching: true, cyclistVru: true }
+  });
+  twin.setScenario(sc);
+  twin._petCells = Object.create(null);
+  twin._vehTrails = Object.create(null);
+
+  let minClear = Infinity;
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  let parkClips = 0;
+  let l2Steps = 0;
+  let l3Steps = 0;
+  let sawL3 = false;
+  let departureAlerts = 0;
+  let lastRisk = -1;
+
+  for (let i = 0; i < 160; i += 1) {
+    const t = i * 0.05;
+    const st = CM._buildScenarioState(sc, t, twin._config);
+    twin._evaluateSimulation(st, t, 0);
+    const snap = twin._latestSimSnapshot;
+    lastRisk = snap.riskLevel;
+    if (snap.riskLevel === 2) l2Steps += 1;
+    if (snap.riskLevel === 3) {
+      l3Steps += 1;
+      sawL3 = true;
+    }
+    if (sawL3 && t >= 5.2 && snap.riskLevel >= 2) {
+      departureAlerts += 1;
+    }
+
+    for (const v of st.vehicles) {
+      minX = Math.min(minX, v.x);
+      maxX = Math.max(maxX, v.x);
+      minY = Math.min(minY, v.y);
+      maxY = Math.max(maxY, v.y);
+      if (!v.inParkingZone) {
+        const c = Math.cos(v.headingRad);
+        const s = Math.sin(v.headingRad);
+        const hl = (v.lengthM || 4.5) * 0.5;
+        const hw = (v.widthM || 1.9) * 0.5;
+        for (const [lx, ly] of [[-hl, -hw], [hl, -hw], [hl, hw], [-hl, hw], [0, 0]]) {
+          const gx = v.x + lx * c - ly * s;
+          const gy = v.y + lx * s + ly * c;
+          for (const pz of st.parkingZones) {
+            const xs = pz.map((p) => p[0]);
+            const ys = pz.map((p) => p[1]);
+            if (
+              gx >= Math.min(...xs) &&
+              gx <= Math.max(...xs) &&
+              gy >= Math.min(...ys) &&
+              gy <= Math.max(...ys)
+            ) {
+              parkClips += 1;
+            }
+          }
+        }
+        for (const u of st.vrus) {
+          minClear = Math.min(minClear, obbClearance(v, u));
+        }
+      }
+    }
+  }
+  twin.destroy();
+
+  if (minClear < 0.30) {
+    throw new Error(`${sc}: collision or tight pass minClear=${minClear}`);
+  }
+  if (minX < -2.9 || maxX > 2.9 || minY < 0.5 || maxY > 14.95) {
+    throw new Error(`${sc}: out of road bounds x=[${minX},${maxX}] y=[${minY},${maxY}]`);
+  }
+  if (parkClips !== 0) {
+    throw new Error(`${sc}: active vehicle clipped parking zone (${parkClips} hits)`);
+  }
+  if (l2Steps < 8 || l3Steps < 10) {
+    throw new Error(`${sc}: insufficient caution/critical steps l2=${l2Steps} l3=${l3Steps}`);
+  }
+  if (departureAlerts !== 0 || lastRisk !== 0) {
+    throw new Error(`${sc}: unexpected departure alert depAlerts=${departureAlerts} lastRisk=${lastRisk}`);
+  }
+  scenarioSummary[sc] = { minClear, l2Steps, l3Steps, lastRisk };
+}
+
+const replayTwin = new CM.CampusRoadTwinCanvas(mkEl(), {});
+replayTwin.setMode("replay");
+replayTwin.setReplayFrame({
+  frameIndex: 5,
+  timestampS: 0.5,
+  vehicles: [{ track_id: 1, category: "car", x_m: 0, y_m: 3, vx_ms: 0, vy_ms: 8, speed_kmh: 28.8 }],
+  vrus: [{ track_id: 2, category: "pedestrian", x_m: 0, y_m: 8, vx_ms: 0, vy_ms: 0 }],
+  conflicts: [{ veh_track_id: 1, ped_track_id: 2, risk_level: 3, ttc_seconds: 0.62 }]
+});
+const replayCriticalRisk = replayTwin._currentRenderState.maxRisk;
+if (!(replayCriticalRisk > 0)) {
+  throw new Error(`setReplayFrame expected non-zero maxRisk, got ${replayCriticalRisk}`);
+}
+replayTwin.setReplayFrame({
+  frameIndex: 6,
+  timestampS: 0.6,
+  vehicles: [{ track_id: 1, category: "car", x_m: 0, y_m: 3, vx_ms: 0, vy_ms: 4, speed_kmh: 14.4 }],
+  vrus: [{ track_id: 2, category: "pedestrian", x_m: 2.5, y_m: 12, vx_ms: 0, vy_ms: 0 }],
+  conflicts: []
+});
+const replaySafeRisk = replayTwin._currentRenderState.maxRisk;
+replayTwin.destroy();
+
+const modelProfiles = {};
+for (const sm of ["ctrv", "kalman", "ema"]) {
+  const modelTwin = new CM.CampusRoadTwinCanvas(mkEl(), {
+    config: { speedModel: sm, conflictModel: "obb_ssm", stitching: true, cyclistVru: true }
+  });
+  modelTwin.setScenario("ctrv_curve_yield");
+  modelTwin._petCells = Object.create(null);
+  let l2 = 0;
+  let l3 = 0;
+  const earlyTtc = [];
+  for (let i = 0; i < 160; i += 1) {
+    const t = i * 0.05;
+    const st = CM._buildScenarioState("ctrv_curve_yield", t, modelTwin._config);
+    modelTwin._evaluateSimulation(st, t, 0);
+    const snap = modelTwin._latestSimSnapshot;
+    if (snap.riskLevel === 2) l2 += 1;
+    if (snap.riskLevel === 3) l3 += 1;
+    if (i < 25) earlyTtc.push(snap.minTtcS);
+  }
+  modelTwin.destroy();
+  const st055 = CM._buildScenarioState("ctrv_curve_yield", 0.55, { speedModel: sm });
+  const cpa055 = CM._computeCpaAndTtc(st055.vehicles[0], st055.vrus[0], 3.5, sm);
+  modelProfiles[sm] = JSON.stringify({
+    l2,
+    l3,
+    earlyTtc,
+    minDist055: Number(cpa055.minDistanceM.toFixed(4)),
+    ttc055: cpa055.ttcSeconds
+  });
+}
+
+if (
+  modelProfiles.ctrv === modelProfiles.kalman ||
+  modelProfiles.ctrv === modelProfiles.ema ||
+  modelProfiles.kalman === modelProfiles.ema
+) {
+  throw new Error(`Expected distinct ctrv/kalman/ema behavior: ${JSON.stringify(modelProfiles)}`);
+}
+
+console.log(JSON.stringify({ scenarioSummary, replayCriticalRisk, replaySafeRisk, modelProfiles }));
+"""
+        env = os.environ.copy()
+        env["MOTION_JS_PATH"] = str(motion_path)
+        proc = subprocess.run(
+            [node_bin, "-"],
+            input=node_script,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=30,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            msg=f"Node motion.js check failed:\nstdout={proc.stdout}\nstderr={proc.stderr}",
+        )
+        summary = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(summary["replayCriticalRisk"], 3)
+        self.assertEqual(summary["replaySafeRisk"], 0)
+        self.assertEqual(set(summary["scenarioSummary"].keys()), {"crosswalk_braking", "cyclist_vru_cutin", "ctrv_curve_yield"})
 
 
 if __name__ == "__main__":

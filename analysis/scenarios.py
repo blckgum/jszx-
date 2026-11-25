@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def _reading(
     reliable=True,
     stationary=False,
     speed_kmh=None,
-    heading_deg: float = 0.0,
+    heading_deg: float | None = None,
     ax_ms2: float = 0.0,
     ay_ms2: float = 0.0,
     yaw_rate_rad_s: float = 0.0,
@@ -31,6 +32,8 @@ def _reading(
     # 构造确定性物理读数供回归场景使用，绕过图像检测与单应性变换噪声。
     speed_ms = (vx * vx + vy * vy) ** 0.5
     effective_speed_kmh = speed_ms * 3.6 if speed_kmh is None else speed_kmh
+    if heading_deg is None:
+        heading_deg = (math.degrees(math.atan2(vy, vx)) + 360.0) % 360.0 if speed_ms > 1e-6 else 0.0
     return SpeedReading(
         track_id=track_id,
         category=category,
@@ -42,7 +45,7 @@ def _reading(
         speed_ms=speed_ms,
         speed_kmh=effective_speed_kmh,
         is_speeding=effective_speed_kmh > 30.0,
-        heading_deg=heading_deg,
+        heading_deg=float(heading_deg),
         is_reliable=reliable,
         is_stationary=stationary,
         ax_ms2=ax_ms2,

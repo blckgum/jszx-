@@ -150,7 +150,7 @@
 
       <main class="main-content">
         <!-- View 1: 实时监测台 -->
-        <section id="view-monitor" class="view-section" aria-labelledby="view-title">
+        <section id="view-monitor" class="view-section">
           <div class="kpi-grid">
             <article class="panel kpi-card">
               <p class="kpi-label">最高车速</p>
@@ -160,7 +160,7 @@
             <article class="panel kpi-card">
               <p class="kpi-label">最小碰撞时间 TTC</p>
               <div id="kpi-min-ttc" class="kpi-value tabular">--</div>
-              <p id="kpi-ttc-meta" class="kpi-meta tabular">临界阈值 1.50 s</p>
+              <p id="kpi-ttc-meta" class="kpi-meta tabular">临界 1.80 s · 注意 3.50 s</p>
             </article>
             <article class="panel kpi-card">
               <p class="kpi-label">当前活跃预警</p>
@@ -181,10 +181,10 @@
                   <h2 class="card-title">视频感知视口</h2>
                   <span id="viewport-mode-badge" class="meta-tag mono">仿真模式</span>
                 </div>
-                <div class="badge-strip" aria-label="当前启用算法配置">
+                <div class="badge-strip" role="group" aria-label="当前启用算法配置">
                   <span id="badge-speed-model" class="algo-chip mono">CTRV</span>
                   <span id="badge-conflict-model" class="algo-chip mono">OBB-SSM</span>
-                  <span id="badge-vru-model" class="algo-chip mono">HSV+VRU</span>
+                  <span id="badge-vru-model" class="algo-chip mono">HSV缝合+VRU</span>
                 </div>
               </header>
 
@@ -278,7 +278,16 @@
                 <h2 class="card-title">算法管线信号流</h2>
                 <span id="pipeline-stage-detail" class="meta-tag">点击节点查看模块算法参数</span>
               </div>
-              <div class="pipeline-toggles" aria-label="仿真管线开关">
+              <div class="pipeline-toggles" role="group" aria-label="仿真管线开关">
+                <select id="sim-speed-model" class="select-compact select-inline" aria-label="仿真速度运动学模型">
+                  <option value="ctrv" selected>CTRV 弯道</option>
+                  <option value="kalman">Kalman 恒速</option>
+                  <option value="ema">EMA 平滑</option>
+                </select>
+                <select id="sim-conflict-model" class="select-compact select-inline" aria-label="仿真冲突评估模型">
+                  <option value="obb_ssm" selected>OBB-SSM</option>
+                  <option value="cvm_circle">CVM-Circle</option>
+                </select>
                 <label class="inline-check">
                   <input type="checkbox" id="toggle-stitching" checked>
                   <span>轨迹缝合</span>
@@ -291,7 +300,7 @@
             </header>
 
             <div class="pipeline-svg-wrap">
-              <svg id="pipeline-svg" viewBox="0 0 980 128" role="img" aria-label="视觉感知与双端预警算法管线">
+              <svg id="pipeline-svg" viewBox="0 0 980 128" role="group" aria-label="视觉感知与双端预警算法管线">
                 <g class="pipeline-beams" fill="none">
                   <path class="beam-path" data-segment="0" d="M 164 64 L 214 64"></path>
                   <path class="beam-pulse" data-segment="0" d="M 164 64 L 214 64"></path>
@@ -343,7 +352,7 @@
         </section>
 
         <!-- View 2: 双端预警镜像 -->
-        <section id="view-alerts" class="view-section" hidden aria-labelledby="view-title">
+        <section id="view-alerts" class="view-section" hidden>
           <div class="panel alerts-toolbar">
             <div class="card-title-group">
               <span class="field-label">双端联动状态</span>
@@ -362,7 +371,7 @@
           </div>
 
           <div class="dual-terminals-grid">
-            <article id="driver-terminal" class="panel terminal-card beam-active" data-risk="0">
+            <article id="driver-terminal" class="panel terminal-card" data-risk="0">
               <header class="terminal-head">
                 <div>
                   <p class="terminal-kicker mono">Driver Unit</p>
@@ -398,7 +407,7 @@
               <div id="driver-queue-list" class="terminal-queue" aria-live="polite"></div>
             </article>
 
-            <article id="pedestrian-terminal" class="panel terminal-card beam-active" data-risk="0">
+            <article id="pedestrian-terminal" class="panel terminal-card" data-risk="0">
               <header class="terminal-head">
                 <div>
                   <p class="terminal-kicker mono">Pedestrian Signboard</p>
@@ -459,7 +468,7 @@
         </section>
 
         <!-- View 3: 历史档案与时间轴 -->
-        <section id="view-history" class="view-section" hidden aria-labelledby="view-title">
+        <section id="view-history" class="view-section" hidden>
           <div class="panel history-toolbar">
             <div class="history-select-group">
               <label for="history-run-select" class="field-label">历史分析记录</label>
@@ -593,7 +602,7 @@
         </section>
 
         <!-- View 4: 标定与实验中心 -->
-        <section id="view-studio" class="view-section" hidden aria-labelledby="view-title">
+        <section id="view-studio" class="view-section" hidden>
           <div class="panel studio-tabs-bar">
             <div class="segmented" role="tablist" aria-label="标定与算法实验功能切换">
               <button type="button" id="studio-tab-calib" class="seg-btn is-active" role="tab" aria-selected="true" aria-controls="studio-panel-calib" tabindex="0" data-studio-tab="calib">可视化道路标定</button>
@@ -615,8 +624,8 @@
               <div class="calib-source-row">
                 <div class="calib-source-field">
                   <label class="sr-only" for="calib-source">标定视频路径</label>
-                  <input id="calib-source" type="text" class="form-control" placeholder="输入本地视频路径，或点击上方预设 / 右侧浏览">
-                  <button type="button" id="btn-calib-browse-video" class="btn btn-secondary" hidden>浏览视频...</button>
+                  <input id="calib-source" type="text" class="form-control" placeholder="输入视频路径，或从预设选择">
+                  <button type="button" id="btn-calib-browse-video" class="btn btn-secondary" hidden>浏览视频</button>
                 </div>
                 <div class="calib-frame-controls">
                   <label class="field-label" for="calib-frame-index">帧号</label>
@@ -683,6 +692,11 @@
                       <label class="field-label" for="calib-filename">保存文件名 (.yaml)</label>
                       <input id="calib-filename" type="text" class="form-control mono" value="campus_calibrated.yaml" required>
                     </div>
+                  </div>
+
+                  <div id="calib-corresp-wrap" class="calib-corresp-wrap" hidden>
+                    <p class="field-hint">已选 5+ 参考点，启用多点对应求解 (RANSAC)；可微调各点地面坐标 (X, Y) 单位 m</p>
+                    <div id="calib-corresp-list" class="calib-corresp-list"></div>
                   </div>
 
                   <label class="check-row">
@@ -852,8 +866,8 @@
         <div class="form-field form-field-full">
           <label class="field-label" for="job-source">视频输入源 (本地路径 / RTSP / 摄像头索引)</label>
           <div class="input-browse-row">
-            <input id="job-source" name="source" type="text" class="form-control" required autofocus placeholder="例如 runs/tracking-fixtures/sample_01/sample_a.mp4 或 0">
-            <button type="button" id="btn-job-browse-source" class="btn btn-secondary" hidden>浏览...</button>
+            <input id="job-source" name="source" type="text" class="form-control" required autofocus placeholder="runs/tracking-fixtures/sample_01/sample_a.mp4 或 0">
+            <button type="button" id="btn-job-browse-source" class="btn btn-secondary" hidden>浏览</button>
           </div>
         </div>
 
@@ -861,7 +875,7 @@
           <label class="field-label" for="job-calib">标定配置文件</label>
           <div class="input-browse-row">
             <select id="job-calib" name="calib_path" class="form-control"></select>
-            <button type="button" id="btn-job-browse-calib" class="btn btn-secondary" hidden>浏览...</button>
+            <button type="button" id="btn-job-browse-calib" class="btn btn-secondary" hidden>浏览</button>
           </div>
         </div>
 

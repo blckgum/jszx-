@@ -6,7 +6,11 @@
  *   CampusRoadTwinCanvas,
  *   SpeedTimelineChart,
  *   CalibrationCanvas,
- *   AlertAudioSynth
+ *   AlertAudioSynth,
+ *   SimulatedCameraCanvas,
+ *   _buildScenarioState,
+ *   _computeCpaAndTtc,
+ *   _computeCvmCircleTtc
  * }
  */
 (function (global) {
@@ -288,8 +292,44 @@
         return palette.safe;
     }
 
+    function attachResizeObserver(targetEl, instance, callback) {
+        instance._resizeRafId = null;
+        if (typeof ResizeObserver !== "function" || !targetEl) {
+            instance._resizeObserver = null;
+            return null;
+        }
+        var ro = new ResizeObserver(function () {
+            if (instance._destroyed) return;
+            if (typeof global.requestAnimationFrame === "function") {
+                if (instance._resizeRafId !== null) return;
+                instance._resizeRafId = global.requestAnimationFrame(function () {
+                    instance._resizeRafId = null;
+                    if (!instance._destroyed) {
+                        callback();
+                    }
+                });
+            } else {
+                callback();
+            }
+        });
+        ro.observe(targetEl);
+        instance._resizeObserver = ro;
+        return ro;
+    }
+
+    function detachResizeObserver(instance) {
+        if (instance._resizeRafId !== null && typeof global.cancelAnimationFrame === "function") {
+            global.cancelAnimationFrame(instance._resizeRafId);
+            instance._resizeRafId = null;
+        }
+        if (instance._resizeObserver) {
+            instance._resizeObserver.disconnect();
+            instance._resizeObserver = null;
+        }
+    }
+
     /* ======================================================================
-     * 1. RollingCounter (ported from number-flow)
+     * 1. RollingCounter (persistent slot reuse, zero DOM thrash on 100ms ticks)
      * ====================================================================== */
     function RollingCounter(el, options) {
         if (!(this instanceof RollingCounter)) {
@@ -303,12 +343,15 @@
         this._decimals = clamp(toNum(opts.decimals, 1), 0, 6);
         this._unit = typeof opts.unit === "string" ? opts.unit : "";
         this._fallback = typeof opts.fallback === "string" ? opts.fallback : "--";
+        this._slots = [];
+        this._unitEl = null;
+        this._templateKey = null;
         this._lastDigits = [];
         this._lastNumText = null;
         this._lastValid = null;
         this._lastUnit = null;
         this._lastUpdateMs = 0;
-        this._lastDurationMs = 320;
+        this._lastDurationMs = 180;
         this._rafId = null;
         this._destroyed = false;
 
@@ -327,24 +370,30 @@
     }
 
     RollingCounter.prototype._applyReducedState = function (isReduced) {
-        var strips = this._el.querySelectorAll(".nf-strip");
-        var dur = this._lastDurationMs || 320;
-        for (var i = 0; i < strips.length; i += 1) {
-            strips[i].style.transition = isReduced
-                ? "none"
-                : "transform " + dur + "ms cubic-bezier(0.22, 1, 0.36, 1)";
+        var dur = this._lastDurationMs || 180;
+        var transitionVal = isReduced
+            ? "none"
+            : "transform " + dur + "ms cubic-bezier(0.22, 1, 0.36, 1)";
+        for (var i = 0; i < this._slots.length; i += 1) {
+            if (this._slots[i].kind === "digit" && this._slots[i].strip) {
+                this._slots[i].strip.style.transition = transitionVal;
+                if (isReduced) {
+                    this._slots[i].strip.style.transform = "translateY(-" + (this._slots[i].targetDigit * 10) + "%)";
+                    this._slots[i].currentDigit = this._slots[i].targetDigit;
+                }
+            }
         }
     };
 
-    RollingCounter.prototype._createDigitSlot = function (initialDigit, targetDigit, isReduced) {
+    RollingCounter.prototype._createDigitSlot = function (initialDigit, targetDigit, isReduced, snapNow) {
         var slot = document.createElement("span");
         slot.className = "nf-slot";
         slot.setAttribute("aria-hidden", "true");
         slot.style.display = "inline-block";
         slot.style.overflow = "hidden";
-        slot.style.height = "1.28em";
-        slot.style.lineHeight = "1.28";
-        slot.style.verticalAlign = "text-bottom";
+        slot.style.height = "1.25em";
+        slot.style.lineHeight = "1.25em";
+        slot.style.verticalAlign = "baseline";
         slot.style.width = "1ch";
         slot.style.textAlign = "center";
 
@@ -352,7 +401,8 @@
         strip.className = "nf-strip";
         strip.style.display = "flex";
         strip.style.flexDirection = "column";
-        strip.style.lineHeight = "1.28";
+        strip.style.height = "auto";
+        strip.style.lineHeight = "1.25em";
         strip.style.fontVariantNumeric = "tabular-nums";
         strip.style.willChange = isReduced ? "auto" : "transform";
 
@@ -363,21 +413,29 @@
             cell.style.display = "flex";
             cell.style.alignItems = "center";
             cell.style.justifyContent = "center";
-            cell.style.height = "1.28em";
-            cell.style.lineHeight = "1.28";
+            cell.style.flex = "0 0 1.25em";
+            cell.style.height = "1.25em";
+            cell.style.lineHeight = "1.25em";
             strip.appendChild(cell);
         }
 
-        if (isReduced) {
-            strip.style.transition = "none";
+        var immediate = Boolean(isReduced || snapNow);
+        strip.style.transition = "none";
+        if (immediate) {
             strip.style.transform = "translateY(-" + (targetDigit * 10) + "%)";
         } else {
-            strip.style.transition = "none";
             strip.style.transform = "translateY(-" + (initialDigit * 10) + "%)";
         }
 
         slot.appendChild(strip);
-        return { slot: slot, strip: strip, targetDigit: targetDigit };
+        return {
+            kind: "digit",
+            slot: slot,
+            strip: strip,
+            startDigit: initialDigit,
+            targetDigit: targetDigit,
+            currentDigit: immediate ? targetDigit : initialDigit
+        };
     };
 
     RollingCounter.prototype.setValue = function (numOrNull, opts) {
@@ -402,11 +460,14 @@
             return;
         }
 
+        var wasValid = this._lastValid;
         var nowMs = typeof performance !== "undefined" ? performance.now() : Date.now();
-        var elapsedMs = this._lastUpdateMs > 0 ? (nowMs - this._lastUpdateMs) : 9999;
-        this._lastUpdateMs = nowMs;
-        var animDurationMs = (decimals === 0 && elapsedMs < 350) ? 180 : 320;
-        this._lastDurationMs = animDurationMs;
+        var elapsedMs = (wasValid && this._lastUpdateMs > 0) ? (nowMs - this._lastUpdateMs) : 9999;
+        this._lastUpdateMs = isValid ? nowMs : 0;
+        var isReduced = this._motionTracker.isReduced();
+        var shouldSnap = isReduced || elapsedMs < 380;
+        var animDurationMs = shouldSnap ? 0 : 180;
+        this._lastDurationMs = animDurationMs || 180;
         this._lastNumText = numText;
         this._lastValid = isValid;
         this._lastUnit = unit;
@@ -415,10 +476,80 @@
         this._el.setAttribute("aria-label", fullAria);
         this._el.setAttribute("data-value", numText);
 
-        var isReduced = this._motionTracker.isReduced();
-        var prevDigits = this._lastDigits;
-        var newDigits = [];
-        var digitSlots = [];
+        var transitionValue = shouldSnap
+            ? "none"
+            : ("transform " + animDurationMs + "ms cubic-bezier(0.22, 1, 0.36, 1)");
+
+        var templateKey = "";
+        if (!isValid) {
+            templateKey = "FB|" + fallback;
+        } else {
+            var tplChars = [];
+            for (var t = 0; t < numText.length; t += 1) {
+                var tc = numText.charCodeAt(t);
+                tplChars.push((tc >= 48 && tc <= 57) ? "#" : numText.charAt(t));
+            }
+            templateKey = "NUM|" + tplChars.join("") + "|" + unit;
+        }
+
+        // Fast path: template unchanged (same length and separator positions) -> reuse DOM nodes
+        if (templateKey === this._templateKey && isValid && this._slots.length === numText.length) {
+            var reuseDigits = [];
+            var pendingAnim = [];
+            for (var r = 0; r < numText.length; r += 1) {
+                var rSlot = this._slots[r];
+                var rCode = numText.charCodeAt(r);
+                if (rSlot && rSlot.kind === "digit" && rCode >= 48 && rCode <= 57) {
+                    var nextD = rCode - 48;
+                    reuseDigits.push(nextD);
+                    if (rSlot.currentDigit !== nextD) {
+                        rSlot.targetDigit = nextD;
+                        rSlot.currentDigit = nextD;
+                        pendingAnim.push(rSlot);
+                    }
+                }
+            }
+            this._lastDigits = reuseDigits;
+            if (shouldSnap) {
+                if (this._rafId !== null && typeof global.cancelAnimationFrame === "function") {
+                    global.cancelAnimationFrame(this._rafId);
+                    this._rafId = null;
+                }
+                for (var ps = 0; ps < this._slots.length; ps += 1) {
+                    var snSlot = this._slots[ps];
+                    if (snSlot && snSlot.kind === "digit") {
+                        snSlot.strip.style.transition = "none";
+                        snSlot.strip.style.transform = "translateY(-" + (snSlot.targetDigit * 10) + "%)";
+                        snSlot.currentDigit = snSlot.targetDigit;
+                    }
+                }
+            } else if (pendingAnim.length > 0) {
+                if (this._rafId !== null && typeof global.cancelAnimationFrame === "function") {
+                    global.cancelAnimationFrame(this._rafId);
+                    this._rafId = null;
+                    var selfReuse = this;
+                    this._rafId = global.requestAnimationFrame(function () {
+                        selfReuse._rafId = null;
+                        if (selfReuse._destroyed) return;
+                        for (var p = 0; p < selfReuse._slots.length; p += 1) {
+                            var sItem = selfReuse._slots[p];
+                            if (sItem.kind === "digit") {
+                                sItem.strip.style.transition = transitionValue;
+                                sItem.strip.style.transform = "translateY(-" + (sItem.targetDigit * 10) + "%)";
+                                sItem.currentDigit = sItem.targetDigit;
+                            }
+                        }
+                    });
+                } else {
+                    for (var p2 = 0; p2 < pendingAnim.length; p2 += 1) {
+                        var pSlot = pendingAnim[p2];
+                        pSlot.strip.style.transition = transitionValue;
+                        pSlot.strip.style.transform = "translateY(-" + (pSlot.targetDigit * 10) + "%)";
+                    }
+                }
+            }
+            return;
+        }
 
         if (this._rafId !== null && typeof global.cancelAnimationFrame === "function") {
             global.cancelAnimationFrame(this._rafId);
@@ -428,16 +559,28 @@
         while (this._el.firstChild) {
             this._el.removeChild(this._el.firstChild);
         }
+        this._slots = [];
+        this._unitEl = null;
+        this._templateKey = templateKey;
 
         if (!isValid) {
             var fbSpan = document.createElement("span");
             fbSpan.className = "nf-char nf-fallback";
             fbSpan.setAttribute("aria-hidden", "true");
             fbSpan.textContent = fallback;
+            fbSpan.style.display = "inline-block";
+            fbSpan.style.height = "1.25em";
+            fbSpan.style.lineHeight = "1.25em";
+            fbSpan.style.verticalAlign = "baseline";
             this._el.appendChild(fbSpan);
+            this._slots.push({ kind: "fallback", el: fbSpan });
             this._lastDigits = [];
             return;
         }
+
+        var prevDigits = this._lastDigits;
+        var newDigits = [];
+        var digitSlots = [];
 
         // Count digit characters first to index right-to-left for smooth carry continuity
         var totalDigits = 0;
@@ -447,6 +590,7 @@
         }
 
         var digitCursor = 0;
+        var needsAnim = false;
         for (var i = 0; i < numText.length; i += 1) {
             var chStr = numText.charAt(i);
             var code = numText.charCodeAt(i);
@@ -455,9 +599,11 @@
                 var fromRight = totalDigits - 1 - digitCursor;
                 var prevIdx = prevDigits.length - 1 - fromRight;
                 var startDigit = (prevIdx >= 0 && prevIdx < prevDigits.length) ? prevDigits[prevIdx] : digit;
-                var created = this._createDigitSlot(startDigit, digit, isReduced);
+                var created = this._createDigitSlot(startDigit, digit, isReduced, shouldSnap);
                 this._el.appendChild(created.slot);
+                this._slots.push(created);
                 digitSlots.push(created);
+                if (startDigit !== digit) needsAnim = true;
                 newDigits.push(digit);
                 digitCursor += 1;
             } else {
@@ -466,9 +612,11 @@
                 sep.setAttribute("aria-hidden", "true");
                 sep.textContent = chStr;
                 sep.style.display = "inline-block";
-                sep.style.lineHeight = "1.28";
-                sep.style.verticalAlign = "text-bottom";
+                sep.style.height = "1.25em";
+                sep.style.lineHeight = "1.25em";
+                sep.style.verticalAlign = "baseline";
                 this._el.appendChild(sep);
+                this._slots.push({ kind: "char", el: sep, text: chStr });
             }
         }
 
@@ -477,23 +625,34 @@
             unitSpan.className = "nf-unit";
             unitSpan.setAttribute("aria-hidden", "true");
             unitSpan.textContent = unit;
-            unitSpan.style.lineHeight = "1.28";
+            unitSpan.style.display = "inline-block";
+            unitSpan.style.height = "1.25em";
+            unitSpan.style.lineHeight = "1.25em";
+            unitSpan.style.verticalAlign = "baseline";
             this._el.appendChild(unitSpan);
+            this._unitEl = unitSpan;
         }
 
         this._lastDigits = newDigits;
 
-        if (!isReduced && digitSlots.length > 0 && typeof global.requestAnimationFrame === "function") {
+        if (!shouldSnap && needsAnim && digitSlots.length > 0 && typeof global.requestAnimationFrame === "function") {
             var self = this;
             this._rafId = global.requestAnimationFrame(function () {
                 self._rafId = null;
                 if (self._destroyed) return;
                 for (var k = 0; k < digitSlots.length; k += 1) {
                     var item = digitSlots[k];
-                    item.strip.style.transition = "transform " + animDurationMs + "ms cubic-bezier(0.22, 1, 0.36, 1)";
+                    item.strip.style.transition = transitionValue;
                     item.strip.style.transform = "translateY(-" + (item.targetDigit * 10) + "%)";
+                    item.currentDigit = item.targetDigit;
                 }
             });
+        } else {
+            for (var k2 = 0; k2 < digitSlots.length; k2 += 1) {
+                digitSlots[k2].strip.style.transition = "none";
+                digitSlots[k2].strip.style.transform = "translateY(-" + (digitSlots[k2].targetDigit * 10) + "%)";
+                digitSlots[k2].currentDigit = digitSlots[k2].targetDigit;
+            }
         }
     };
 
@@ -549,14 +708,9 @@
         this._ensureSvgStructure();
         this._measurePaths();
 
-        if (typeof ResizeObserver === "function") {
-            this._resizeObserver = new ResizeObserver(function () {
-                self._measurePaths();
-            });
-            this._resizeObserver.observe(this._svg);
-        } else {
-            this._resizeObserver = null;
-        }
+        attachResizeObserver(this._svg, this, function () {
+            self._measurePaths();
+        });
 
         this.setRiskLevel(0);
         this.setConfig(this._config);
@@ -835,10 +989,7 @@
             global.cancelAnimationFrame(this._rafId);
             this._rafId = null;
         }
-        if (this._resizeObserver) {
-            this._resizeObserver.disconnect();
-            this._resizeObserver = null;
-        }
+        detachResizeObserver(this);
         this._unobserveTheme();
         this._motionTracker.destroy();
         if (this._probe && this._probe.parentNode) {
@@ -915,10 +1066,11 @@
         };
     }
 
-    function computeCpaAndTtc(veh, vru, horizonS) {
+    function computeCpaAndTtc(veh, vru, horizonS, speedModel) {
         var horizon = horizonS || 3.5;
         var dt = 0.05;
         var steps = Math.round(horizon / dt);
+        var model = String(speedModel || "ctrv").toLowerCase();
 
         var psi = veh.headingRad;
         var x = veh.x;
@@ -926,6 +1078,14 @@
         var v = Math.hypot(veh.vx, veh.vy);
         var a = veh.accelMs2 || 0;
         var omega = veh.yawRate || 0;
+
+        if (model === "ema") {
+            v = v * 0.88;
+            a = 0;
+            omega = 0;
+        } else if (model === "kalman") {
+            omega = 0;
+        }
 
         var px = vru.x;
         var py = vru.y;
@@ -1008,16 +1168,25 @@
         };
     }
 
-    function predictCtrvArc(veh, horizonS, steps) {
+    function predictCtrvArc(veh, horizonS, steps, speedModel) {
         var pts = [{ x: veh.x, y: veh.y, t: 0 }];
         var count = steps || 15;
         var dt = (horizonS || 2.5) / count;
+        var model = String(speedModel || "ctrv").toLowerCase();
         var x = veh.x;
         var y = veh.y;
         var psi = veh.headingRad;
         var v = Math.hypot(veh.vx, veh.vy);
         var a = veh.accelMs2 || 0;
         var omega = veh.yawRate || 0;
+
+        if (model === "ema") {
+            v = v * 0.88;
+            a = 0;
+            omega = 0;
+        } else if (model === "kalman") {
+            omega = 0;
+        }
 
         for (var i = 1; i <= count; i += 1) {
             var nextV = Math.max(0, v + a * dt);
@@ -1047,30 +1216,54 @@
 
     function integrateCtrvState(tSec) {
         var psiTarget = Math.PI * 0.5;
+        var v0 = 5.4;
+        var omega0 = 0.28;
+        var tC = 0.20;
+        var a1 = -7.5;
+        var t1 = 0.50;
+        var a2 = -0.28;
+        var t2 = 1.65;
+        var a3 = -3.5;
+        var v1 = v0 + a1 * t1;
+        var v2 = v1 + a2 * t2;
+        var t1End = tC + t1;
+        var t2End = t1End + t2;
+        var tStop = t2End + v2 / (-a3);
+        var tGo = tStop + 1.55;
+        var accelDep = 1.60;
+
         function phaseParams(tau, curPsi) {
-            if (tau < 0.55) {
-                return { v: 5.4, a: 0.0, omega: 0.25 };
+            if (tau < tC) {
+                return { v: v0, a: 0.0, omega: omega0 };
             }
-            if (tau < 1.95) {
-                var a1 = -5.4 / 1.40;
-                var v1 = Math.max(0.0, 5.4 + a1 * (tau - 0.55));
-                return { v: v1, a: a1, omega: 0.25 * (v1 / 5.4) };
+            if (tau < t1End) {
+                var vA = v0 + a1 * (tau - tC);
+                return { v: vA, a: a1, omega: omega0 * (vA / v0) };
             }
-            if (tau < 4.75) {
+            if (tau < t2End) {
+                var vB = v1 + a2 * (tau - t1End);
+                return { v: vB, a: a2, omega: omega0 * (vB / v0) };
+            }
+            if (tau < tStop) {
+                var vC = Math.max(0.0, v2 + a3 * (tau - t2End));
+                return { v: vC, a: a3, omega: omega0 * (vC / v0) };
+            }
+            if (tau < tGo) {
                 return { v: 0.0, a: 0.0, omega: 0.0 };
             }
-            var v2 = tau < 7.20 ? 2.2 * (tau - 4.75) : 5.39;
-            var a2 = tau < 7.20 ? 2.2 : 0.0;
+            var u = tau - tGo;
+            var vDep = Math.min(2.6, accelDep * u);
+            var aDep = vDep < 2.6 ? accelDep : 0.0;
             var err = curPsi - psiTarget;
-            var omega2 = (v2 > 0.05 && err > 0.002)
-                ? -Math.min(0.36, err * 1.15) * Math.min(1.0, v2 / 1.8)
+            var omegaDep = (vDep > 0.05 && Math.abs(err) > 0.002)
+                ? -clamp(err * 1.4, -0.45, 0.45) * Math.min(1.0, vDep / 1.5)
                 : 0.0;
-            return { v: v2, a: a2, omega: omega2 };
+            return { v: vDep, a: aDep, omega: omegaDep };
         }
 
-        var x = 1.25;
-        var y = -2.25;
-        var psi = Math.PI * 0.5 + 0.03;
+        var x = 1.40;
+        var y = 0.78;
+        var psi = Math.PI * 0.5;
         var steps = Math.max(1, Math.ceil(tSec / 0.02));
         var dtStep = tSec > 0 ? (tSec / steps) : 0;
         for (var i = 0; i < steps; i += 1) {
@@ -1081,7 +1274,7 @@
             x += pMid.v * Math.cos(psiMid) * dtStep;
             y += pMid.v * Math.sin(psiMid) * dtStep;
             psi += pMid.omega * dtStep;
-            if (tau >= 4.75 && psi < psiTarget) {
+            if (tau >= tGo && Math.abs(psi - psiTarget) < 0.005) {
                 psi = psiTarget;
             }
         }
@@ -1094,80 +1287,93 @@
         var vehicles = [];
         var vrus = [];
         var parkingZones = [
-            [[1.85, 2.2], [3.05, 2.2], [3.05, 6.2], [1.85, 6.2]]
+            [[1.85, 2.2], [3.05, 2.2], [3.05, 6.8], [1.85, 6.8]]
         ];
         var stitchingOn = !(config && config.stitching === false);
 
         if (scenarioId === "cyclist_vru_cutin") {
-            // Scenario 2: Cyclist blind-spot cut-in past parked car (continuous kinematics dx/dt=vx, dy/dt=vy)
-            var suvX = 0.35;
-            var suvY = -1.25;
-            var suvVx = 0.0;
-            var suvVy = 5.0;
-            var suvAy = 0.0;
+            // Scenario 2: Cyclist blind-spot cut-in past parked car V-02 (bounded y in [0.72, 13.61])
+            var s2Tc = 0.15;
+            var s2V0 = 4.8;
+            var s2A1 = -6.5;
+            var s2T1 = 0.45;
+            var s2A2 = -0.30;
+            var s2T2 = 1.65;
+            var s2A3 = -3.5;
+            var s2Y0 = 0.72;
+            var s2Y1 = s2Y0 + s2V0 * s2Tc;
+            var s2V1 = s2V0 + s2A1 * s2T1;
+            var s2Y2 = s2Y1 + s2V0 * s2T1 + 0.5 * s2A1 * s2T1 * s2T1;
+            var s2V2 = s2V1 + s2A2 * s2T2;
+            var s2Y3 = s2Y2 + s2V1 * s2T2 + 0.5 * s2A2 * s2T2 * s2T2;
+            var s2TStop = s2Tc + s2T1 + s2T2 + s2V2 / (-s2A3);
+            var s2TGo = s2TStop + 1.55;
+            var s2YStop = s2Y3 + 0.5 * s2V2 * s2V2 / (-s2A3);
+            var s2AccelDep = 1.50;
 
-            if (t < 0.45) {
-                suvVy = 5.0;
-                suvY = -1.25 + 5.0 * t;
+            var suvY = s2Y0;
+            var suvVy = s2V0;
+            var suvAy = 0.0;
+            if (t < s2Tc) {
+                suvVy = s2V0;
                 suvAy = 0.0;
-            } else if (t < 1.85) {
-                var u2 = t - 0.45;
-                var w2 = u2 / 1.40;
-                suvAy = -5.0 / 1.40;
-                suvVy = Math.max(0.0, 5.0 + suvAy * u2);
-                suvY = 1.00 + 5.0 * u2 + 0.5 * suvAy * u2 * u2;
-                suvX = 0.35 - 0.22 * (3 * w2 * w2 - 2 * w2 * w2 * w2);
-                suvVx = (-0.22 / 1.40) * (6 * w2 - 6 * w2 * w2);
-            } else if (t < 4.95) {
-                suvX = 0.13;
-                suvY = 4.50;
-                suvVx = 0.0;
+                suvY = s2Y0 + s2V0 * t;
+            } else if (t < s2Tc + s2T1) {
+                var su1 = t - s2Tc;
+                suvAy = s2A1;
+                suvVy = s2V0 + s2A1 * su1;
+                suvY = s2Y1 + s2V0 * su1 + 0.5 * s2A1 * su1 * su1;
+            } else if (t < s2Tc + s2T1 + s2T2) {
+                var su2 = t - s2Tc - s2T1;
+                suvAy = s2A2;
+                suvVy = s2V1 + s2A2 * su2;
+                suvY = s2Y2 + s2V1 * su2 + 0.5 * s2A2 * su2 * su2;
+            } else if (t < s2TStop) {
+                var su3 = t - s2Tc - s2T1 - s2T2;
+                suvAy = s2A3;
+                suvVy = Math.max(0.0, s2V2 + s2A3 * su3);
+                suvY = s2Y3 + s2V2 * su3 + 0.5 * s2A3 * su3 * su3;
+            } else if (t < s2TGo) {
                 suvVy = 0.0;
                 suvAy = 0.0;
-            } else if (t < 7.60) {
-                var u3 = t - 4.95;
-                var w3 = Math.min(1.0, u3 / 1.50);
-                suvAy = 2.4;
-                suvVy = suvAy * u3;
-                suvY = 4.50 + 0.5 * suvAy * u3 * u3;
-                suvX = 0.13 + 0.14 * (3 * w3 * w3 - 2 * w3 * w3 * w3);
-                suvVx = w3 < 1.0 ? (0.14 / 1.50) * (6 * w3 - 6 * w3 * w3) : 0.0;
+                suvY = s2YStop;
             } else {
-                var u4 = t - 7.60;
-                suvAy = 0.0;
-                suvVy = 2.4 * 2.65; // 6.36 m/s
-                suvY = 4.50 + 0.5 * 2.4 * 2.65 * 2.65 + suvVy * u4;
-                suvX = 0.27;
-                suvVx = 0.0;
+                var su4 = t - s2TGo;
+                var s2Ta = 1.80;
+                if (su4 < s2Ta) {
+                    suvAy = s2AccelDep;
+                    suvVy = suvAy * su4;
+                    suvY = s2YStop + 0.5 * suvAy * su4 * su4;
+                } else {
+                    suvAy = 0.0;
+                    suvVy = s2AccelDep * s2Ta;
+                    suvY = s2YStop + 0.5 * s2AccelDep * s2Ta * s2Ta + suvVy * (su4 - s2Ta);
+                }
             }
-
-            var suvSpd = Math.hypot(suvVx, suvVy);
-            var suvPsi = suvSpd > 0.05 ? Math.atan2(suvVy, suvVx) : Math.PI * 0.5;
-            var suvYawRate = (t >= 0.45 && t < 1.85) ? 0.06 : 0.0;
 
             vehicles.push({
                 trackId: 1,
                 kind: "suv",
-                x: suvX,
+                x: -0.32,
                 y: suvY,
-                vx: suvVx,
+                vx: 0,
                 vy: suvVy,
                 ax: 0,
                 ay: suvAy,
                 accelMs2: suvAy,
-                headingRad: suvPsi,
-                yawRate: suvYawRate,
+                headingRad: Math.PI * 0.5,
+                yawRate: 0,
                 lengthM: 4.7,
                 widthM: 1.95,
-                speedKmh: suvSpd * 3.6,
+                speedKmh: suvVy * 3.6,
                 inParkingZone: false
             });
 
             vehicles.push({
                 trackId: 2,
                 kind: "car",
-                x: 2.42,
-                y: 4.2,
+                x: 2.40,
+                y: 4.60,
                 vx: 0,
                 vy: 0,
                 ax: 0,
@@ -1175,33 +1381,36 @@
                 accelMs2: 0,
                 headingRad: Math.PI * 0.5,
                 yawRate: 0,
-                lengthM: 4.4,
+                lengthM: 4.2,
                 widthM: 1.85,
                 speedKmh: 0,
                 inParkingZone: true
             });
 
-            // Cyclist emerges from behind V-02 laterally across SUV lane
-            var cycX, cycY, cycVx, cycVy;
-            if (t < 5.20) {
-                cycVx = -0.95;
-                cycVy = 0.22;
-                cycX = 2.35 + cycVx * t;
-                cycY = 7.40 + cycVy * t;
-            } else if (t < 5.60) {
-                var cu = t - 5.20;
-                var cAx = 0.95 / 0.40;
-                var cAy = (0.85 - 0.22) / 0.40;
-                cycVx = -0.95 + cAx * cu;
-                cycVy = 0.22 + cAy * cu;
-                cycX = 2.35 - 0.95 * 5.20 - 0.95 * cu + 0.5 * cAx * cu * cu;
-                cycY = 7.40 + 0.22 * 5.20 + 0.22 * cu + 0.5 * cAy * cu * cu;
+            // Cyclist B-12 emerges past parked car V-02 laterally across SUV lane
+            var bX0 = 2.85;
+            var bY0 = 9.05;
+            var bVx1 = -0.42;
+            var bTTurn = 1.40;
+            var bVx2 = -1.45;
+            var cycX, cycY, cycVx, cycVy = 0.14;
+            if (t < bTTurn) {
+                cycVx = bVx1;
+                cycX = bX0 + cycVx * t;
+                cycY = bY0 + cycVy * t;
             } else {
-                var cu2 = t - 5.60;
-                cycVx = 0.0;
-                cycVy = 0.85;
-                cycX = 2.35 - 0.95 * 5.20 - 0.5 * 0.95 * 0.40;
-                cycY = 7.40 + 0.22 * 5.20 + 0.5 * (0.22 + 0.85) * 0.40 + 0.85 * cu2;
+                var bxTurn = bX0 + bVx1 * bTTurn;
+                var byTurn = bY0 + cycVy * bTTurn;
+                cycVx = bVx2;
+                cycX = bxTurn + cycVx * (t - bTTurn);
+                cycY = byTurn + cycVy * (t - bTTurn);
+                if (cycX < -2.65) {
+                    var dtDone = (-2.65 - bxTurn) / bVx2;
+                    cycX = -2.65;
+                    cycVx = 0.0;
+                    cycVy = 0.85;
+                    cycY = byTurn + 0.14 * dtDone + 0.85 * (t - bTTurn - dtDone);
+                }
             }
             var cycTrackId = (!stitchingOn && t >= 1.15) ? 19 : 12;
 
@@ -1225,7 +1434,7 @@
                 kind: "pedestrian",
                 category: "pedestrian",
                 x: -2.75,
-                y: 11.2 + 0.35 * Math.sin(t * ped5Omega),
+                y: 11.5 + 0.35 * Math.sin(t * ped5Omega),
                 vx: 0,
                 vy: 0.35 * ped5Omega * Math.cos(t * ped5Omega),
                 radiusM: 0.40
@@ -1253,59 +1462,88 @@
                 inParkingZone: false
             });
 
-            // Pedestrian P-04 crosses centered on zebra crosswalk (y=8.05m) onto left sidewalk (x=-2.9485m)
+            // Pedestrian P-04 crosses centered on zebra crosswalk (y=9.40m) onto left sidewalk (x=-2.90m)
             var pedX, pedVx;
-            if (t < 4.42) {
-                pedVx = -1.05;
-                pedX = 1.85 + pedVx * t;
-            } else if (t < 4.72) {
-                var pu = t - 4.42;
-                var pAx = 1.05 / 0.30;
-                pedVx = -1.05 + pAx * pu;
-                pedX = 1.85 - 1.05 * 4.42 - 1.05 * pu + 0.5 * pAx * pu * pu;
+            if (t <= 1.45) {
+                pedVx = -0.44;
+                pedX = 2.55 + pedVx * t;
             } else {
+                pedVx = -1.35;
+                pedX = (2.55 - 0.44 * 1.45) + pedVx * (t - 1.45);
+            }
+            if (pedX <= -2.90) {
+                pedX = -2.90;
                 pedVx = 0.0;
-                pedX = 1.85 - 1.05 * 4.42 - 0.5 * 1.05 * 0.30;
             }
             vrus.push({
                 trackId: 4,
                 kind: "pedestrian",
                 category: "pedestrian",
                 x: pedX,
-                y: 8.05,
+                y: 9.40,
                 vx: pedVx,
                 vy: 0,
                 radiusM: 0.42
             });
         } else {
-            // Scenario 1 (default): Crosswalk emergency braking (30.6 km/h L1 -> L2 -> L3 -> full yield -> depart)
-            var vY = -1.65;
-            var vSpeedMs = 8.5; // 30.6 km/h (> 30 km/h L1)
+            // Scenario 1 (default): Crosswalk emergency braking (30.8 km/h L1 -> L2 -> L3 -> 1.55s yield -> L0 depart)
+            var s1Tc = 0.15;
+            var s1V0 = 8.55;
+            var s1A1 = -14.5;
+            var s1T1 = 0.50;
+            var s1A2 = -0.40;
+            var s1T2 = 1.70;
+            var s1A3 = -3.5;
+            var s1Y0 = 0.68;
+            var s1Y1 = s1Y0 + s1V0 * s1Tc;
+            var s1V1 = s1V0 + s1A1 * s1T1;
+            var s1Y2 = s1Y1 + s1V0 * s1T1 + 0.5 * s1A1 * s1T1 * s1T1;
+            var s1V2 = s1V1 + s1A2 * s1T2;
+            var s1Y3 = s1Y2 + s1V1 * s1T2 + 0.5 * s1A2 * s1T2 * s1T2;
+            var s1YStop = s1Y3 + 0.5 * s1V2 * s1V2 / (-s1A3);
+            var s1TStop = s1Tc + s1T1 + s1T2 + s1V2 / (-s1A3);
+            var s1TGo = s1TStop + 1.60;
+            var s1AccelDep = 1.12;
+
+            var vY = s1Y0;
+            var vSpeedMs = s1V0;
             var vAccel = 0.0;
 
-            if (t < 0.22) {
-                vSpeedMs = 8.5;
+            if (t < s1Tc) {
+                vSpeedMs = s1V0;
                 vAccel = 0.0;
-                vY = -1.65 + 8.5 * t;
-            } else if (t < 1.33) {
-                var b1 = t - 0.22;
-                vAccel = -8.5 / 1.11;
-                vSpeedMs = Math.max(0.0, 8.5 + vAccel * b1);
-                vY = 0.22 + 8.5 * b1 + 0.5 * vAccel * b1 * b1; // ends at y=4.9375m (front bumper=7.19m < 7.25m)
-            } else if (t < 4.75) {
-                vY = 4.9375;
+                vY = s1Y0 + s1V0 * t;
+            } else if (t < s1Tc + s1T1) {
+                var b1 = t - s1Tc;
+                vAccel = s1A1;
+                vSpeedMs = s1V0 + s1A1 * b1;
+                vY = s1Y1 + s1V0 * b1 + 0.5 * s1A1 * b1 * b1;
+            } else if (t < s1Tc + s1T1 + s1T2) {
+                var b2 = t - s1Tc - s1T1;
+                vAccel = s1A2;
+                vSpeedMs = s1V1 + s1A2 * b2;
+                vY = s1Y2 + s1V1 * b2 + 0.5 * s1A2 * b2 * b2;
+            } else if (t < s1TStop) {
+                var b3 = t - s1Tc - s1T1 - s1T2;
+                vAccel = s1A3;
+                vSpeedMs = Math.max(0.0, s1V2 + s1A3 * b3);
+                vY = s1Y3 + s1V2 * b3 + 0.5 * s1A3 * b3 * b3;
+            } else if (t < s1TGo) {
+                vY = s1YStop;
                 vSpeedMs = 0.0;
                 vAccel = 0.0;
-            } else if (t < 7.60) {
-                var b3 = t - 4.75;
-                vAccel = 2.4;
-                vSpeedMs = vAccel * b3;
-                vY = 4.9375 + 0.5 * vAccel * b3 * b3; // reaches y=14.6845m at v=6.84 m/s
             } else {
-                var b4 = t - 7.60;
-                vAccel = 0.0;
-                vSpeedMs = 2.4 * 2.85;
-                vY = 4.9375 + 0.5 * 2.4 * 2.85 * 2.85 + vSpeedMs * b4;
+                var b4 = t - s1TGo;
+                var s1Ta = 2.20;
+                if (b4 < s1Ta) {
+                    vAccel = s1AccelDep;
+                    vSpeedMs = vAccel * b4;
+                    vY = s1YStop + 0.5 * vAccel * b4 * b4;
+                } else {
+                    vAccel = 0.0;
+                    vSpeedMs = s1AccelDep * s1Ta;
+                    vY = s1YStop + 0.5 * s1AccelDep * s1Ta * s1Ta + vSpeedMs * (b4 - s1Ta);
+                }
             }
 
             vehicles.push({
@@ -1326,27 +1564,18 @@
                 inParkingZone: false
             });
 
-            // Pedestrian P-07 steps from right sidewalk onto crosswalk and exits left sidewalk cleanly
+            // Pedestrian P-07 steps from right sidewalk across zebra crosswalk (y=9.40m) and clears onto left curb
             var p7x, p7vx;
-            if (t < 0.22) {
-                p7vx = -0.35;
-                p7x = 2.65 + p7vx * t;
-            } else if (t < 0.42) {
-                var pu1 = t - 0.22;
-                var pax1 = (-1.10 - (-0.35)) / 0.20;
-                p7vx = -0.35 + pax1 * pu1;
-                p7x = 2.65 - 0.35 * 0.22 - 0.35 * pu1 + 0.5 * pax1 * pu1 * pu1;
-            } else if (t < 4.95) {
-                p7vx = -1.10;
-                p7x = 2.428 + p7vx * (t - 0.42);
-            } else if (t < 5.25) {
-                var pu2 = t - 4.95;
-                var pax2 = 1.10 / 0.30;
-                p7vx = -1.10 + pax2 * pu2;
-                p7x = 2.428 - 1.10 * (4.95 - 0.42) - 1.10 * pu2 + 0.5 * pax2 * pu2 * pu2;
+            if (t < 2.22) {
+                p7vx = -1.15;
+                p7x = 2.80 + p7vx * t;
             } else {
+                p7vx = -1.75;
+                p7x = (2.80 - 1.15 * 2.22) + p7vx * (t - 2.22);
+            }
+            if (p7x <= -2.90) {
+                p7x = -2.90;
                 p7vx = 0.0;
-                p7x = 2.428 - 1.10 * (4.95 - 0.42) - 0.5 * 1.10 * 0.30;
             }
 
             vrus.push({
@@ -1354,7 +1583,7 @@
                 kind: "pedestrian",
                 category: "pedestrian",
                 x: p7x,
-                y: 7.85,
+                y: 9.40,
                 vx: p7vx,
                 vy: 0,
                 radiusM: 0.42
@@ -1366,9 +1595,9 @@
                 kind: "pedestrian",
                 category: "pedestrian",
                 x: 2.75,
-                y: 11.4 - 0.45 * Math.cos(t * p3Omega),
+                y: 11.8 - 0.40 * Math.cos(t * p3Omega),
                 vx: 0,
-                vy: 0.45 * p3Omega * Math.sin(t * p3Omega),
+                vy: 0.40 * p3Omega * Math.sin(t * p3Omega),
                 radiusM: 0.40
             });
         }
@@ -1407,16 +1636,15 @@
         this._offscreenPaused = false;
         this._destroyed = false;
 
-        this._simTimeS = 0.72; // Start near L3 conflict approach peak if reduced motion or paused
-        this._simFrameCount = 0;
         this._lastDrawTs = null;
         this._lastTelemetryTs = 0;
         this._rafId = null;
         this._bgTimerId = null;
         this._lastBgTs = null;
 
-        // 0.5m PET spatial occupancy grid: key -> { vehId, vehTime, vruId, vruTime, petS }
+        // 0.5m PET spatial occupancy grid & swept centerline vehicle trails
         this._petCells = Object.create(null);
+        this._vehTrails = Object.create(null);
         this._replayPrevTracks = Object.create(null);
         this._lastReplayFrameIdx = -1;
 
@@ -1437,6 +1665,10 @@
                 self._syncLoop();
             }
         });
+        this._simTimeS = (this._userPaused || this._motionTracker.isReduced()) ? 1.55 : 0.35;
+        this._simFrameCount = Math.floor(this._simTimeS * 25 + 1e-9) + 1;
+        this._lastEmittedRisk = -1;
+        this._lastEmittedAlerts = -1;
         this._unobserveTheme = observeThemeChanges(function () {
             self.refreshTheme();
         });
@@ -1463,15 +1695,10 @@
             maxRisk: 0
         };
 
-        if (typeof ResizeObserver === "function") {
-            this._resizeObserver = new ResizeObserver(function () {
-                self._measureCanvas();
-                self._renderCurrent();
-            });
-            this._resizeObserver.observe(this._canvas);
-        } else {
-            this._resizeObserver = null;
-        }
+        attachResizeObserver(this._canvas, this, function () {
+            self._measureCanvas();
+            self._renderCurrent();
+        });
 
         if (typeof IntersectionObserver === "function") {
             this._intersectionObserver = new IntersectionObserver(function (entries) {
@@ -1514,19 +1741,49 @@
 
     CampusRoadTwinCanvas.prototype._seedInitialPetTrail = function () {
         this._petCells = Object.create(null);
+        this._vehTrails = Object.create(null);
         var useCvm = this._config && this._config.conflictModel === "cvm_circle";
-        if (useCvm) {
-            return;
-        }
-        // Seed recent swept-OBB history behind initial keyframe so PET grid is intelligible immediately
-        var startT = Math.max(0, this._simTimeS - 2.0);
+        var cycleTime = ((this._simTimeS % SCENARIO_CYCLE_S) + SCENARIO_CYCLE_S) % SCENARIO_CYCLE_S;
+        var startT = Math.max(0, cycleTime - 2.0);
         var activeCyclistVru = !(this._config && this._config.cyclistVru === false);
-        for (var t = startT; t <= this._simTimeS; t += 0.25) {
+        for (var t = startT; t <= cycleTime + 1e-6; t += 0.20) {
             var st = buildScenarioState(this._scenarioId, t, this._config);
-            var activeVrus = activeCyclistVru
-                ? st.vrus
-                : st.vrus.filter(function (v) { return !isCyclistVruKind(v); });
-            this._recordPetGrid(st.vehicles, activeVrus, t);
+            this._recordVehTrails(st.vehicles, t);
+            if (!useCvm) {
+                var activeVrus = activeCyclistVru
+                    ? st.vrus
+                    : st.vrus.filter(function (v) { return !isCyclistVruKind(v); });
+                this._recordPetGrid(st.vehicles, activeVrus, t);
+            }
+        }
+    };
+
+    CampusRoadTwinCanvas.prototype._recordVehTrails = function (vehicles, timeS) {
+        for (var vi = 0; vi < vehicles.length; vi += 1) {
+            var v = vehicles[vi];
+            if (v.inParkingZone) continue;
+            var spdMs = Math.hypot(v.vx || 0, v.vy || 0);
+            if (spdMs < 0.35 && (v.speedKmh === undefined || v.speedKmh < 1.2)) continue;
+            var key = String(v.trackId);
+            var trail = this._vehTrails[key];
+            if (!trail) {
+                trail = [];
+                this._vehTrails[key] = trail;
+            }
+            var last = trail.length > 0 ? trail[trail.length - 1] : null;
+            if (!last || Math.hypot(v.x - last.x, v.y - last.y) >= 0.08 || Math.abs(timeS - last.t) >= 0.08) {
+                trail.push({ x: v.x, y: v.y, t: timeS });
+            }
+            while (trail.length > 32 || (trail.length > 0 && timeS - trail[0].t > 2.4)) {
+                trail.shift();
+            }
+        }
+        var tKeys = Object.keys(this._vehTrails);
+        for (var ti = 0; ti < tKeys.length; ti += 1) {
+            var arr = this._vehTrails[tKeys[ti]];
+            if (!arr || arr.length === 0 || (timeS - arr[arr.length - 1].t > 2.4)) {
+                delete this._vehTrails[tKeys[ti]];
+            }
         }
     };
 
@@ -1562,7 +1819,10 @@
                         existing.vehId = v.trackId;
                         existing.vehTime = timeS;
                         if (existing.vruId !== null && timeS >= existing.vruTime && (timeS - existing.vruTime) <= 2.2) {
-                            existing.petS = timeS - existing.vruTime;
+                            var dPet = Math.max(0.05, timeS - existing.vruTime);
+                            if (existing.petS === null || dPet < existing.petS) {
+                                existing.petS = dPet;
+                            }
                         }
                     }
                 }
@@ -1575,10 +1835,23 @@
             var pcy = Math.floor(p.y / cellSize);
             var pkey = pcx + "," + pcy;
             var cell = this._petCells[pkey];
-            if (cell && cell.vehTime <= timeS && (timeS - cell.vehTime) <= 2.4) {
+            if (!cell) {
+                this._petCells[pkey] = {
+                    cx: pcx,
+                    cy: pcy,
+                    vehId: null,
+                    vehTime: -999,
+                    vruId: p.trackId,
+                    vruTime: timeS,
+                    petS: null
+                };
+            } else if (cell.vehId !== null && cell.vehTime <= timeS && (timeS - cell.vehTime) <= 2.4) {
                 cell.vruId = p.trackId;
                 cell.vruTime = timeS;
                 cell.petS = Math.max(0.05, timeS - cell.vehTime);
+            } else {
+                cell.vruId = p.trackId;
+                cell.vruTime = timeS;
             }
         }
 
@@ -1586,13 +1859,13 @@
         var keys = Object.keys(this._petCells);
         for (var k = 0; k < keys.length; k += 1) {
             var rec = this._petCells[keys[k]];
-            if (timeS - rec.vehTime > 3.6) {
+            if (timeS - Math.max(rec.vehTime, rec.vruTime) > 3.6) {
                 delete this._petCells[keys[k]];
             }
         }
     };
 
-    CampusRoadTwinCanvas.prototype._evaluateSimulation = function (simData, timeS) {
+    CampusRoadTwinCanvas.prototype._evaluateSimulation = function (simData, timeS, cycleIdx) {
         var conflicts = [];
         var driverAlerts = [];
         var pedestrianAlerts = [];
@@ -1602,10 +1875,12 @@
         var minTtc = null;
         var cyclistVruEnabled = !(this._config && this._config.cyclistVru === false);
         var useCvmCircle = Boolean(this._config && this._config.conflictModel === "cvm_circle");
+        var speedModel = (this._config && this._config.speedModel) || "ctrv";
         var activeVrus = cyclistVruEnabled
             ? simData.vrus
             : simData.vrus.filter(function (item) { return !isCyclistVruKind(item); });
 
+        this._recordVehTrails(simData.vehicles, timeS);
         var pairPet = Object.create(null);
         if (useCvmCircle) {
             this._petCells = Object.create(null);
@@ -1636,7 +1911,7 @@
                 var vru = activeVrus[pi];
                 var res = useCvmCircle
                     ? computeCvmCircleTtc(veh, vru, 3.5)
-                    : computeCpaAndTtc(veh, vru, 3.5);
+                    : computeCpaAndTtc(veh, vru, 3.5, speedModel);
                 var pk2 = veh.trackId + ":" + vru.trackId;
                 var petS = !useCvmCircle && pairPet[pk2] !== undefined ? pairPet[pk2] : null;
                 if (res.currentDist > 16.0 && petS === null) continue;
@@ -1759,8 +2034,12 @@
             }
         }
 
+        var cycleTimestamp = Number(timeS.toFixed(2));
         this._latestSimSnapshot = {
-            timestampS: Number(timeS.toFixed(2)),
+            timestampS: cycleTimestamp,
+            cycleDurationS: SCENARIO_CYCLE_S,
+            cycleIndex: cycleIdx,
+            fps: 25,
             frameCount: this._simFrameCount,
             maxSpeedKmh: Number(maxSpeed.toFixed(1)),
             minTtcS: minTtc !== null ? Number(minTtc.toFixed(2)) : null,
@@ -1772,7 +2051,7 @@
             vehicleCount: simData.vehicles.length,
             vruCount: simData.vrus.length,
             seriesPoint: {
-                t: Number(timeS.toFixed(2)),
+                t: cycleTimestamp,
                 speedKmh: Number(maxSpeed.toFixed(1)),
                 ttcS: minTtc !== null ? Number(minTtc.toFixed(2)) : null,
                 riskLevel: maxRisk
@@ -1787,7 +2066,9 @@
             conflicts: conflicts,
             label: this._scenarioTitle(this._scenarioId),
             simTimeS: timeS,
-            maxRisk: maxRisk
+            maxRisk: maxRisk,
+            speedModel: speedModel,
+            conflictModel: useCvmCircle ? "cvm_circle" : "obb_ssm"
         };
     };
 
@@ -1799,16 +2080,18 @@
 
     CampusRoadTwinCanvas.prototype._stepSimulation = function (dt, forceEmit, skipRender) {
         if (this._mode !== "simulation") return;
-        var prevMod = this._simTimeS % SCENARIO_CYCLE_S;
+        var prevCycleIdx = Math.floor(this._simTimeS / SCENARIO_CYCLE_S);
         this._simTimeS += dt;
-        var nextMod = this._simTimeS % SCENARIO_CYCLE_S;
-        if (nextMod < prevMod) {
-            // Reset PET grid smoothly on scenario cycle restart
+        var cycleIdx = Math.floor(this._simTimeS / SCENARIO_CYCLE_S);
+        if (cycleIdx !== prevCycleIdx) {
+            // Reset PET grid and swept trails cleanly on scenario cycle restart
             this._petCells = Object.create(null);
+            this._vehTrails = Object.create(null);
         }
-        this._simFrameCount += 1;
-        var simData = buildScenarioState(this._scenarioId, this._simTimeS, this._config);
-        this._evaluateSimulation(simData, this._simTimeS);
+        var cycleTime = ((this._simTimeS % SCENARIO_CYCLE_S) + SCENARIO_CYCLE_S) % SCENARIO_CYCLE_S;
+        this._simFrameCount = Math.min(Math.round(SCENARIO_CYCLE_S * 25), Math.floor(cycleTime * 25 + 1e-9) + 1);
+        var simData = buildScenarioState(this._scenarioId, cycleTime, this._config);
+        this._evaluateSimulation(simData, cycleTime, cycleIdx);
         if (!skipRender) {
             this._renderCurrent();
         }
@@ -1819,10 +2102,15 @@
         if (!this._onTelemetry || !this._latestSimSnapshot || this._mode !== "simulation") {
             return;
         }
+        var snap = this._latestSimSnapshot;
+        var stateChanged = snap.riskLevel !== this._lastEmittedRisk ||
+            snap.activeConflicts !== this._lastEmittedAlerts;
         var now = typeof performance !== "undefined" ? performance.now() : Date.now();
-        if (force || (now - this._lastTelemetryTs >= 110)) {
+        if (force || stateChanged || (now - this._lastTelemetryTs >= 100)) {
             this._lastTelemetryTs = now;
-            this._onTelemetry(this._latestSimSnapshot);
+            this._lastEmittedRisk = snap.riskLevel;
+            this._lastEmittedAlerts = snap.activeConflicts;
+            this._onTelemetry(snap);
         }
     };
 
@@ -2015,6 +2303,7 @@
         ctx.font = "500 10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
         var firstX = Math.ceil(b.xMin);
+        var xLabelStep = scale < 36 ? Math.ceil(36 / Math.max(1, scale)) : 1;
         for (var gx = firstX; gx <= Math.floor(b.xMax); gx += 1) {
             var px1 = toPx(gx, b.yMin);
             var px2 = toPx(gx, b.yMax);
@@ -2024,7 +2313,7 @@
             ctx.lineTo(px2.x, px2.y);
             ctx.stroke();
 
-            if (gx % 2 === 0 || spanX <= 7) {
+            if (gx % xLabelStep === 0) {
                 ctx.fillStyle = pal.textMuted;
                 ctx.textAlign = "center";
                 ctx.textBaseline = "top";
@@ -2051,26 +2340,18 @@
             }
         }
 
-        // Crosswalk zebra stripes around y = 7.8m (plus subtle sidewalk curb ramps)
-        if (7.8 >= b.yMin + 0.5 && 7.8 <= b.yMax - 0.5) {
+        // Crosswalk zebra stripes strictly inside curbs (y = 8.80 .. 10.00m)
+        var cwY0 = 8.80;
+        var cwY1 = 10.00;
+        if (cwY1 >= b.yMin + 0.4 && cwY0 <= b.yMax - 0.4) {
             var cwLeft = b.xMin + 0.35;
             var cwRight = b.xMax - 0.35;
-            var cwY0 = 7.25;
-            var cwY1 = 8.45;
-            var cwTopPx = toPx(b.xMin, cwY1).y;
-            var cwBotPx = toPx(b.xMin, cwY0).y;
-            if (leftSidewalkW > 12) {
-                ctx.fillStyle = withAlpha(pal.textPrimary, pal.isLight ? 0.045 : 0.035);
-                ctx.fillRect(Math.max(padL, roadTopLeft.x - 1.2 * scale), cwTopPx, Math.min(leftSidewalkW, 1.2 * scale), cwBotPx - cwTopPx);
-            }
-            if (rightSidewalkW > 12) {
-                ctx.fillStyle = withAlpha(pal.textPrimary, pal.isLight ? 0.045 : 0.035);
-                ctx.fillRect(roadBotRight.x, cwTopPx, Math.min(rightSidewalkW, 1.2 * scale), cwBotPx - cwTopPx);
-            }
+            var cwClampedY0 = Math.max(b.yMin, cwY0);
+            var cwClampedY1 = Math.min(b.yMax, cwY1);
             ctx.fillStyle = withAlpha(pal.textPrimary, pal.isLight ? 0.14 : 0.11);
             for (var sx = cwLeft; sx < cwRight - 0.25; sx += 0.65) {
-                var spA = toPx(sx, cwY1);
-                var spB = toPx(Math.min(sx + 0.34, cwRight), cwY0);
+                var spA = toPx(sx, cwClampedY1);
+                var spB = toPx(Math.min(sx + 0.34, cwRight), cwClampedY0);
                 ctx.fillRect(spA.x, spA.y, spB.x - spA.x, spB.y - spA.y);
             }
         }
@@ -2162,23 +2443,29 @@
 
             ctx.font = "500 10px system-ui, -apple-system, sans-serif";
             var pzText = "禁停标定区";
-            var pzW = ctx.measureText(pzText).width + 6;
-            var pzH = 14;
+            var pzW = ctx.measureText(pzText).width + 12;
+            var pzH = 18;
             var pzCand = [
-                { x: pMaxX - pzW - 2, y: pMinY - pzH - 3 },
-                { x: pMinX + 2, y: pMinY - pzH - 3 },
+                { x: pMaxX - pzW - 2, y: pMinY - pzH - 4 },
+                { x: pMinX + 2, y: pMinY - pzH - 4 },
                 { x: pMaxX + 6, y: pMinY + 2 },
                 { x: pMinX + 3, y: pMaxY - pzH - 2 }
             ];
             var pzPicked = chooseBestBox(pzCand, pzW, pzH, safeArea, placedBoxes, obstacleBoxes);
-            ctx.fillStyle = withAlpha(pal.parkingZone, 0.94);
+            drawRoundedRectPath(ctx, pzPicked.x, pzPicked.y, pzPicked.w, pzPicked.h, 4);
+            ctx.fillStyle = withAlpha(pal.bgCard, 0.92);
+            ctx.fill();
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = withAlpha(pal.parkingZone, 0.72);
+            ctx.stroke();
+            ctx.fillStyle = pal.parkingZone;
             ctx.textAlign = "left";
             ctx.textBaseline = "middle";
-            ctx.fillText(pzText, pzPicked.x + 2, pzPicked.y + pzH * 0.5);
+            ctx.fillText(pzText, pzPicked.x + 6, pzPicked.y + pzPicked.h * 0.5 + 0.5);
             placedBoxes.push(pzPicked);
         }
 
-        // Clip dynamic road overlays (PET grid, CTRV curves, TTC rings) strictly inside road network draw area
+        // Clip dynamic road overlays (PET conflict cells, swept ribbons, CTRV arcs, TTC rings) strictly inside road network draw area
         var netClipX = padL;
         var netClipY = Math.max(30, roadTopLeft.y);
         var netClipW = Math.max(40, (w - padR) - padL);
@@ -2189,14 +2476,43 @@
         ctx.rect(netClipX, netClipY, netClipW, netClipH);
         ctx.clip();
 
-        // 0.5m PET swept-OBB occupancy grid
+        // Subtle translucent swept centerline ribbon behind moving vehicles
+        var trailList = st.vehicles || [];
+        for (var trIdx = 0; trIdx < trailList.length; trIdx += 1) {
+            var trVeh = trailList[trIdx];
+            if (trVeh.inParkingZone) continue;
+            var trailPts = this._vehTrails[String(trVeh.trackId)];
+            if (!trailPts || trailPts.length < 2) continue;
+            var trColor = trVeh.riskLevel >= 1 ? riskColor(pal, trVeh.riskLevel) : pal.safe;
+            var ribbonW = Math.max(6, (trVeh.widthM || 1.9) * scale * 0.42);
+            ctx.save();
+            ctx.lineCap = "round";
+            ctx.lineJoin = "round";
+            ctx.beginPath();
+            for (var tp = 0; tp < trailPts.length; tp += 1) {
+                var trPx = toPx(trailPts[tp].x, trailPts[tp].y);
+                if (tp === 0) ctx.moveTo(trPx.x, trPx.y);
+                else ctx.lineTo(trPx.x, trPx.y);
+            }
+            ctx.strokeStyle = withAlpha(trColor, 0.11);
+            ctx.lineWidth = ribbonW;
+            ctx.stroke();
+            ctx.strokeStyle = withAlpha(trColor, 0.32);
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        // Discrete 0.5m PET conflict intersection cells ONLY (no muddy raw occupancy grid squares)
         var refTime = st.simTimeS;
         var cellSize = 0.5;
         var cellKeys = Object.keys(this._petCells);
         for (var ci = 0; ci < cellKeys.length; ci += 1) {
             var cell = this._petCells[cellKeys[ci]];
-            var age = refTime - cell.vehTime;
-            if (age < 0 || age > 3.6) continue;
+            if (cell.petS === null) continue;
+            var latestTouch = Math.max(cell.vehTime, cell.vruTime);
+            var age = refTime - latestTouch;
+            if (age < 0 || age > 2.4) continue;
             var wx0 = cell.cx * cellSize;
             var wy0 = cell.cy * cellSize;
             if (wx0 + cellSize < b.xMin || wx0 > b.xMax || wy0 + cellSize < b.yMin || wy0 > b.yMax) continue;
@@ -2205,29 +2521,24 @@
             var cBotRight = toPx(wx0 + cellSize, wy0);
             var cw = cBotRight.x - cTopLeft.x;
             var ch = cBotRight.y - cTopLeft.y;
-            var fade = clamp(1 - age / 3.6, 0.12, 1);
+            var fade = clamp(1 - age / 2.4, 0.18, 1);
 
-            if (cell.petS !== null && (refTime - cell.vruTime) <= 2.2) {
-                var petUrgent = cell.petS <= 1.0;
-                var petTint = petUrgent ? pal.critical : pal.accent;
-                ctx.fillStyle = withAlpha(petTint, 0.24 * fade);
-                ctx.fillRect(cTopLeft.x + 0.5, cTopLeft.y + 0.5, cw - 1, ch - 1);
-                ctx.strokeStyle = withAlpha(petTint, 0.65 * fade);
-                ctx.lineWidth = 1;
-                ctx.strokeRect(cTopLeft.x + 0.5, cTopLeft.y + 0.5, cw - 1, ch - 1);
-            } else {
-                ctx.fillStyle = withAlpha(pal.accent, 0.08 * fade);
-                ctx.fillRect(cTopLeft.x + 0.5, cTopLeft.y + 0.5, cw - 1, ch - 1);
-            }
+            var petUrgent = cell.petS <= 1.0;
+            var petTint = petUrgent ? pal.critical : pal.accent;
+            ctx.fillStyle = withAlpha(petTint, 0.24 * fade);
+            ctx.fillRect(cTopLeft.x + 0.5, cTopLeft.y + 0.5, cw - 1, ch - 1);
+            ctx.strokeStyle = withAlpha(petTint, 0.68 * fade);
+            ctx.lineWidth = 1;
+            ctx.strokeRect(cTopLeft.x + 0.5, cTopLeft.y + 0.5, cw - 1, ch - 1);
         }
 
-        // Draw 2nd-order CTRV/Kalman prediction arcs beneath vehicles (clipped cleanly inside road network)
+        // Draw kinematic prediction arcs beneath vehicles (honoring active speedModel)
         for (var vi = 0; vi < st.vehicles.length; vi += 1) {
             var veh = st.vehicles[vi];
             var spdMs = Math.hypot(veh.vx || 0, veh.vy || 0);
             if (spdMs < 0.35 || veh.inParkingZone) continue;
 
-            var arcPts = predictCtrvArc(veh, 2.5, 16);
+            var arcPts = predictCtrvArc(veh, 2.5, 16, st.speedModel);
             var arcColor = veh.riskLevel >= 1 ? riskColor(pal, veh.riskLevel) : pal.safe;
             ctx.save();
             ctx.setLineDash([5, 4]);
@@ -2333,6 +2644,23 @@
             ctx.lineWidth = v.riskLevel >= 2 ? 2.0 : 1.5;
             ctx.strokeStyle = vColor;
             ctx.stroke();
+
+            // Crisp front windshield trapezoid
+            ctx.fillStyle = withAlpha(pal.textPrimary, pal.isLight ? 0.24 : 0.20);
+            ctx.beginPath();
+            ctx.moveTo(lenPx * 0.14, -widPx * 0.34);
+            ctx.lineTo(lenPx * 0.31, -widPx * 0.27);
+            ctx.lineTo(lenPx * 0.31, widPx * 0.27);
+            ctx.lineTo(lenPx * 0.14, widPx * 0.34);
+            ctx.closePath();
+            ctx.fill();
+
+            // Semantic brake-light bar at rear bumper when decelerating (accelMs2 < -1.0)
+            if (!v.inParkingZone && isFiniteNum(v.accelMs2) && v.accelMs2 < -1.0) {
+                var brakeX = -lenPx * 0.5 + 1.2;
+                ctx.fillStyle = pal.critical;
+                ctx.fillRect(brakeX, -widPx * 0.34, 2.4, widPx * 0.68);
+            }
 
             // Directional heading triangle / headlight notch at +halfLen nose
             var noseX = lenPx * 0.5;
@@ -2587,9 +2915,14 @@
         if (this._destroyed) return;
         this._mode = mode === "replay" ? "replay" : "simulation";
         this._petCells = Object.create(null);
+        this._vehTrails = Object.create(null);
         this._replayPrevTracks = Object.create(null);
         this._lastReplayFrameIdx = -1;
         if (this._mode === "simulation") {
+            this._simTimeS = (this._userPaused || this._motionTracker.isReduced()) ? 1.55 : 0.0;
+            this._simFrameCount = Math.floor(this._simTimeS * 25 + 1e-9) + 1;
+            this._lastEmittedRisk = -1;
+            this._lastEmittedAlerts = -1;
             this._seedInitialPetTrail();
             this._stepSimulation(0, true);
         } else {
@@ -2602,7 +2935,12 @@
     CampusRoadTwinCanvas.prototype.setScenario = function (id) {
         if (this._destroyed) return;
         this._scenarioId = id || "crosswalk_braking";
-        this._simTimeS = (this._userPaused || this._motionTracker.isReduced()) ? 0.72 : 0.25;
+        this._simTimeS = (this._userPaused || this._motionTracker.isReduced()) ? 1.55 : 0.0;
+        this._simFrameCount = Math.floor(this._simTimeS * 25 + 1e-9) + 1;
+        this._lastEmittedRisk = -1;
+        this._lastEmittedAlerts = -1;
+        this._petCells = Object.create(null);
+        this._vehTrails = Object.create(null);
         this._seedInitialPetTrail();
         if (this._mode === "simulation") {
             this._stepSimulation(0, true);
@@ -2618,6 +2956,8 @@
             stitching: cfg.stitching !== undefined ? Boolean(cfg.stitching) : this._config.stitching,
             cyclistVru: cfg.cyclistVru !== undefined ? Boolean(cfg.cyclistVru) : this._config.cyclistVru
         };
+        this._lastEmittedRisk = -1;
+        this._lastEmittedAlerts = -1;
         if (this._mode === "simulation") {
             this._seedInitialPetTrail();
             this._stepSimulation(0, true);
@@ -2645,6 +2985,7 @@
 
         if (frameIdx < this._lastReplayFrameIdx || Math.abs(frameIdx - this._lastReplayFrameIdx) > 3) {
             this._petCells = Object.create(null);
+            this._vehTrails = Object.create(null);
             this._replayPrevTracks = Object.create(null);
         }
         this._lastReplayFrameIdx = frameIdx;
@@ -2774,7 +3115,19 @@
             }
         }
 
+        this._recordVehTrails(normVehicles, ts);
         this._recordPetGrid(normVehicles, normVrus, ts);
+
+        var maxRisk = parseRiskLevel(fd.riskLevel !== undefined ? fd.riskLevel : fd.risk_level);
+        for (var rvi = 0; rvi < normVehicles.length; rvi += 1) {
+            if (normVehicles[rvi].riskLevel > maxRisk) maxRisk = normVehicles[rvi].riskLevel;
+        }
+        for (var rui = 0; rui < normVrus.length; rui += 1) {
+            if (normVrus[rui].riskLevel > maxRisk) maxRisk = normVrus[rui].riskLevel;
+        }
+        for (var rci = 0; rci < normConflicts.length; rci += 1) {
+            if (normConflicts[rci].riskLevel > maxRisk) maxRisk = normConflicts[rci].riskLevel;
+        }
 
         this._currentRenderState = {
             bounds: bounds,
@@ -2783,8 +3136,12 @@
             vrus: normVrus,
             conflicts: normConflicts,
             label: fd.label || ("REPLAY · F" + padId(frameIdx) + " · " + ts.toFixed(1) + "s"),
+            cameraLabel: fd.cameraLabel || fd.camera_label || null,
+            cameraShortLabel: fd.cameraShortLabel || fd.camera_short_label || null,
             simTimeS: ts,
-            maxRisk: 0
+            maxRisk: maxRisk,
+            speedModel: (this._config && this._config.speedModel) || "ctrv",
+            conflictModel: (this._config && this._config.conflictModel) || "obb_ssm"
         };
         this._measureCanvas();
         this._renderCurrent();
@@ -2801,10 +3158,7 @@
         if (this._destroyed) return;
         this._destroyed = true;
         this._stopLoop();
-        if (this._resizeObserver) {
-            this._resizeObserver.disconnect();
-            this._resizeObserver = null;
-        }
+        detachResizeObserver(this);
         if (this._intersectionObserver) {
             this._intersectionObserver.disconnect();
             this._intersectionObserver = null;
@@ -2868,15 +3222,10 @@
         this._canvas.addEventListener("pointerleave", this._onPointerLeave);
         this._canvas.addEventListener("click", this._onClick);
 
-        if (typeof ResizeObserver === "function") {
-            this._resizeObserver = new ResizeObserver(function () {
-                self._measure();
-                self._render();
-            });
-            this._resizeObserver.observe(this._canvas);
-        } else {
-            this._resizeObserver = null;
-        }
+        attachResizeObserver(this._canvas, this, function () {
+            self._measure();
+            self._render();
+        });
 
         this._measure();
         this._render();
@@ -3057,7 +3406,7 @@
         ctx.fillStyle = pal.textMuted;
         ctx.textAlign = "right";
         ctx.textBaseline = "middle";
-        ctx.fillText("RISK", padL - 6, botBandY + botBandH * 0.5);
+        ctx.fillText("风险", padL - 6, botBandY + botBandH * 0.5);
 
         for (var m = 0; m < n; m += 1) {
             var pt = this._points[m];
@@ -3144,7 +3493,12 @@
 
             var ttcLabel = hp.ttcS !== null ? (" · TTC " + hp.ttcS.toFixed(2) + "s") : "";
             var tipText = "F" + hp.frameIndex + " · " + hp.t.toFixed(1) + "s · " + hp.speedKmh.toFixed(1) + "km/h" + ttcLabel + " · L" + hp.riskLevel;
-            drawPill(ctx, hx + 8, padT + 2, tipText, pal.bgRaised, pal.hairline, pal.textPrimary, w);
+            ctx.save();
+            ctx.font = "500 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+            var tipW = ctx.measureText(tipText).width + 12;
+            ctx.restore();
+            var tipX = (hx + 8 + tipW > w - 8) ? Math.max(8, hx - tipW - 8) : (hx + 8);
+            drawPill(ctx, tipX, padT + 2, tipText, pal.bgRaised, pal.hairline, pal.textPrimary, w);
         }
 
         ctx.restore();
@@ -3199,10 +3553,7 @@
         this._canvas.removeEventListener("pointermove", this._onPointerMove);
         this._canvas.removeEventListener("pointerleave", this._onPointerLeave);
         this._canvas.removeEventListener("click", this._onClick);
-        if (this._resizeObserver) {
-            this._resizeObserver.disconnect();
-            this._resizeObserver = null;
-        }
+        detachResizeObserver(this);
         this._unobserveTheme();
         if (this._probe && this._probe.parentNode) {
             this._probe.parentNode.removeChild(this._probe);
@@ -3322,15 +3673,10 @@
         this._canvas.addEventListener("pointercancel", this._onPointerCancel);
         this._canvas.addEventListener("pointerleave", this._onPointerLeave);
 
-        if (typeof ResizeObserver === "function") {
-            this._resizeObserver = new ResizeObserver(function () {
-                self._measure();
-                self._render();
-            });
-            this._resizeObserver.observe(this._canvas);
-        } else {
-            this._resizeObserver = null;
-        }
+        attachResizeObserver(this._canvas, this, function () {
+            self._measure();
+            self._render();
+        });
 
         this._measure();
         this._updateCursor();
@@ -4188,10 +4534,7 @@
         this._canvas.removeEventListener("pointerup", this._onPointerUp);
         this._canvas.removeEventListener("pointercancel", this._onPointerCancel);
         this._canvas.removeEventListener("pointerleave", this._onPointerLeave);
-        if (this._resizeObserver) {
-            this._resizeObserver.disconnect();
-            this._resizeObserver = null;
-        }
+        detachResizeObserver(this);
         this._unobserveTheme();
         this._motionTracker.destroy();
         if (this._probe && this._probe.parentNode) {
@@ -4369,15 +4712,10 @@
         this._unobserveTheme = observeThemeChanges(function () {
             self.refreshTheme();
         });
-        if (typeof ResizeObserver === "function") {
-            this._resizeObserver = new ResizeObserver(function () {
-                self._measure();
-                self._render();
-            });
-            this._resizeObserver.observe(this._canvas);
-        } else {
-            this._resizeObserver = null;
-        }
+        attachResizeObserver(this._canvas, this, function () {
+            self._measure();
+            self._render();
+        });
         this._measure();
         this._render();
     }
@@ -4429,6 +4767,50 @@
         };
     };
 
+    function drawCornerBracketBox(ctx, x1, y1, bw, bh, color, lineWidth) {
+        var arm = clamp(Math.min(bw, bh) * 0.24, 5, 14);
+        var x2 = x1 + bw;
+        var y2 = y1 + bh;
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lineWidth || 1.6;
+        ctx.lineCap = "square";
+        ctx.beginPath();
+        ctx.moveTo(x1, y1 + arm);
+        ctx.lineTo(x1, y1);
+        ctx.lineTo(x1 + arm, y1);
+        ctx.moveTo(x2 - arm, y1);
+        ctx.lineTo(x2, y1);
+        ctx.lineTo(x2, y1 + arm);
+        ctx.moveTo(x2, y2 - arm);
+        ctx.lineTo(x2, y2);
+        ctx.lineTo(x2 - arm, y2);
+        ctx.moveTo(x1 + arm, y2);
+        ctx.lineTo(x1, y2);
+        ctx.lineTo(x1, y2 - arm);
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    function drawProjectedQuad(ctx, pts, fillStyle, strokeStyle, lineWidth) {
+        if (!pts || pts.length < 3) return;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (var i = 1; i < pts.length; i += 1) {
+            ctx.lineTo(pts[i].x, pts[i].y);
+        }
+        ctx.closePath();
+        if (fillStyle) {
+            ctx.fillStyle = fillStyle;
+            ctx.fill();
+        }
+        if (strokeStyle) {
+            ctx.strokeStyle = strokeStyle;
+            ctx.lineWidth = lineWidth || 1;
+            ctx.stroke();
+        }
+    }
+
     SimulatedCameraCanvas.prototype._render = function () {
         if (!this._ctx || this._cssWidth < 2 || this._cssHeight < 2) return;
         var ctx = this._ctx;
@@ -4442,14 +4824,15 @@
             vrus: [],
             conflicts: [],
             maxRisk: 0,
+            speedModel: "ctrv",
             label: "SIM"
         };
         var b = st.bounds || { xMin: -3.2, xMax: 3.2, yMin: 0.0, yMax: 15.0 };
 
-        // Oblique roadside CCTV camera calibrated looking along +Y across crosswalk
-        var tgtY = 0.5 * (b.yMin + b.yMax);
-        var camY = b.yMin - 6.2;
-        var camZ = 5.1;
+        // Calibrated oblique roadside CCTV camera looking along +Y across crosswalk
+        var tgtY = 0.52 * (b.yMin + b.yMax);
+        var camY = b.yMin - 8.5;
+        var camZ = 6.2;
         var dY = tgtY - camY;
         var dZ = -camZ;
         var len = Math.hypot(dY, dZ) || 1;
@@ -4464,8 +4847,8 @@
             upY: -fwdZ,
             upZ: fwdY,
             cx: w * 0.5,
-            cy: h * 0.49,
-            focal: Math.min(w * 0.86, h * 1.48)
+            cy: h * 0.46,
+            focal: Math.min(w * 0.92, h * 1.42)
         };
 
         var self = this;
@@ -4500,9 +4883,293 @@
             ctx.restore();
         }
 
+        function drawLowPolyVehicle(v, vColor) {
+            var hl = (v.lengthM || 4.5) * 0.5;
+            var hw = (v.widthM || 1.9) * 0.5;
+            var vh = v.kind === "bus" ? 2.85 : (v.kind === "truck" ? 2.55 : (v.kind === "suv" ? 1.66 : 1.46));
+            var beltZ = v.kind === "bus" ? 1.32 : vh * 0.56;
+            var hRad = v.headingRad !== undefined ? v.headingRad : Math.PI * 0.5;
+            var cosH = Math.cos(hRad);
+            var sinH = Math.sin(hRad);
+
+            function vPt(lx, ly, lz) {
+                return p3(v.x + lx * cosH - ly * sinH, v.y + lx * sinH + ly * cosH, lz);
+            }
+
+            // Ground contact shadow
+            fillPolyPts(
+                [
+                    [v.x + hl * 1.06 * cosH - hw * 1.08 * sinH, v.y + hl * 1.06 * sinH + hw * 1.08 * cosH, 0.01],
+                    [v.x + hl * 1.06 * cosH + hw * 1.08 * sinH, v.y + hl * 1.06 * sinH - hw * 1.08 * cosH, 0.01],
+                    [v.x - hl * 1.06 * cosH + hw * 1.08 * sinH, v.y - hl * 1.06 * sinH - hw * 1.08 * cosH, 0.01],
+                    [v.x - hl * 1.06 * cosH - hw * 1.08 * sinH, v.y - hl * 1.06 * sinH + hw * 1.08 * cosH, 0.01]
+                ],
+                pal.isLight ? "rgba(18, 22, 30, 0.22)" : "rgba(0, 0, 0, 0.44)",
+                null,
+                0,
+                false
+            );
+
+            var cFL0 = vPt(hl, hw, 0.14);
+            var cFR0 = vPt(hl, -hw, 0.14);
+            var cRR0 = vPt(-hl, -hw, 0.14);
+            var cRL0 = vPt(-hl, hw, 0.14);
+            var cFL1 = vPt(hl, hw, beltZ);
+            var cFR1 = vPt(hl, -hw, beltZ);
+            var cRR1 = vPt(-hl, -hw, beltZ);
+            var cRL1 = vPt(-hl, hw, beltZ);
+
+            var isTall = v.kind === "bus" || v.kind === "truck";
+            var cabF = isTall ? (v.kind === "bus" ? hl * 0.90 : hl * 0.88) : hl * 0.36;
+            var cabB = isTall ? (v.kind === "bus" ? -hl * 0.88 : hl * 0.10) : -hl * 0.72;
+            var roofF = isTall ? cabF * 0.96 : hl * 0.16;
+            var roofB = isTall ? cabB : -hl * 0.54;
+            var roofHw = isTall ? hw * 0.96 : hw * 0.82;
+
+            var gFL0 = vPt(cabF, hw * 0.94, beltZ);
+            var gFR0 = vPt(cabF, -hw * 0.94, beltZ);
+            var gRR0 = vPt(cabB, -hw * 0.94, beltZ);
+            var gRL0 = vPt(cabB, hw * 0.94, beltZ);
+            var gFL1 = vPt(roofF, roofHw, vh);
+            var gFR1 = vPt(roofF, -roofHw, vh);
+            var gRR1 = vPt(roofB, -roofHw, vh);
+            var gRL1 = vPt(roofB, roofHw, vh);
+
+            var allCheck = [cFL0, cFR0, cRR0, cRL0, cFL1, cFR1, cRR1, cRL1, gFL0, gFR0, gRR0, gRL0, gFL1, gFR1, gRR1, gRL1];
+            for (var ci = 0; ci < allCheck.length; ci += 1) {
+                if (!allCheck[ci]) return null;
+            }
+
+            var bodyBase = v.inParkingZone
+                ? (pal.isLight ? "#8a92a0" : "#3a3f4a")
+                : (pal.isLight ? "#323c4c" : "#444e5e");
+            var bodySide = v.inParkingZone
+                ? (pal.isLight ? "#737b88" : "#2f343e")
+                : (pal.isLight ? "#28303e" : "#38414f");
+            var bodyDeck = v.inParkingZone
+                ? (pal.isLight ? "#9aa2af" : "#474d59")
+                : (pal.isLight ? "#445063" : "#566275");
+            var glassFill = pal.isLight ? "rgba(22, 34, 52, 0.74)" : "rgba(14, 22, 34, 0.88)";
+            var edgeCol = withAlpha(vColor, v.inParkingZone ? 0.55 : 0.85);
+
+            var faces = [];
+            function pushFace(pts, fill, stroke, tag) {
+                var zSum = 0;
+                for (var fi = 0; fi < pts.length; fi += 1) zSum += pts[fi].zCam;
+                faces.push({ pts: pts, fill: fill, stroke: stroke, zAvg: zSum / pts.length, tag: tag || "" });
+            }
+
+            // Lower chassis skirt faces
+            pushFace([cFL0, cFR0, cFR1, cFL1], bodyBase, edgeCol, "front");
+            pushFace([cRL0, cRR0, cRR1, cRL1], bodyBase, edgeCol, "rear");
+            pushFace([cFL0, cRL0, cRL1, cFL1], bodySide, edgeCol, "left");
+            pushFace([cFR0, cRR0, cRR1, cFR1], bodySide, edgeCol, "right");
+            pushFace([cFL1, cFR1, cRR1, cRL1], bodyDeck, edgeCol, "deck");
+
+            // Upper greenhouse / tilted windshield & roof faces
+            pushFace([gFL0, gFR0, gFR1, gFL1], glassFill, edgeCol, "windshield");
+            pushFace([gRL0, gRR0, gRR1, gRL1], glassFill, edgeCol, "rearGlass");
+            pushFace([gFL0, gRL0, gRL1, gFL1], glassFill, edgeCol, "leftGlass");
+            pushFace([gFR0, gRR0, gRR1, gFR1], glassFill, edgeCol, "rightGlass");
+            pushFace([gFL1, gFR1, gRR1, gRL1], bodyDeck, edgeCol, "roof");
+
+            faces.sort(function (fa, fb) { return fb.zAvg - fa.zAvg; });
+
+            ctx.save();
+            for (var fk = 0; fk < faces.length; fk += 1) {
+                drawProjectedQuad(ctx, faces[fk].pts, faces[fk].fill, faces[fk].stroke, 1.0);
+            }
+
+            // Warm front headlights
+            var hlL = vPt(hl + 0.01, hw * 0.66, beltZ * 0.56);
+            var hlR = vPt(hl + 0.01, -hw * 0.66, beltZ * 0.56);
+            var frontFacePts = [cFL0, cFR0, cFR1, cFL1];
+            var frontZ = (frontFacePts[0].zCam + frontFacePts[1].zCam) * 0.5;
+            var rearZ = (cRL0.zCam + cRR0.zCam) * 0.5;
+            if (hlL && hlR && frontZ <= rearZ + 0.8) {
+                var headR = clamp((0.14 / hlL.zCam) * cam.focal, 2.0, 5.0);
+                ctx.fillStyle = "#fde68a";
+                ctx.beginPath();
+                ctx.arc(hlL.x, hlL.y, headR, 0, Math.PI * 2);
+                ctx.arc(hlR.x, hlR.y, headR, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // Semantic brake-light bar & tail lamps when decelerating (accelMs2 < -1.0)
+            var isBraking = !v.inParkingZone && isFiniteNum(v.accelMs2) && v.accelMs2 < -1.0;
+            if (rearZ <= frontZ + 1.2) {
+                var blL0 = vPt(-hl - 0.01, hw * 0.80, beltZ * 0.60);
+                var blR0 = vPt(-hl - 0.01, -hw * 0.80, beltZ * 0.60);
+                var blL1 = vPt(-hl - 0.01, hw * 0.80, beltZ * 0.78);
+                var blR1 = vPt(-hl - 0.01, -hw * 0.80, beltZ * 0.78);
+                if (isBraking && blL0 && blR0 && blL1 && blR1) {
+                    drawProjectedQuad(ctx, [blL0, blR0, blR1, blL1], pal.critical, "#ff8b8f", 0.9);
+                } else {
+                    var tlL = vPt(-hl - 0.01, hw * 0.66, beltZ * 0.68);
+                    var tlR = vPt(-hl - 0.01, -hw * 0.66, beltZ * 0.68);
+                    if (tlL && tlR) {
+                        var tailR = clamp((0.11 / tlL.zCam) * cam.focal, 1.8, 4.0);
+                        ctx.fillStyle = withAlpha(pal.critical, 0.55);
+                        ctx.beginPath();
+                        ctx.arc(tlL.x, tlL.y, tailR, 0, Math.PI * 2);
+                        ctx.arc(tlR.x, tlR.y, tailR, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+            }
+            ctx.restore();
+
+            var minBx = Infinity;
+            var minBy = Infinity;
+            var maxBx = -Infinity;
+            var maxBy = -Infinity;
+            for (var bi = 0; bi < allCheck.length; bi += 1) {
+                if (allCheck[bi].x < minBx) minBx = allCheck[bi].x;
+                if (allCheck[bi].y < minBy) minBy = allCheck[bi].y;
+                if (allCheck[bi].x > maxBx) maxBx = allCheck[bi].x;
+                if (allCheck[bi].y > maxBy) maxBy = allCheck[bi].y;
+            }
+            return { x: minBx, y: minBy, w: Math.max(12, maxBx - minBx), h: Math.max(12, maxBy - minBy) };
+        }
+
+        function drawGroundedVruSilhouette(u, uColor, isBike) {
+            var fillBody = pal.isLight ? "#2a3342" : "#cfd6e2";
+            var fillBikeFrame = pal.isLight ? "#3a4558" : "#9aa6ba";
+            if (isBike) {
+                var psi = u.headingRad !== undefined ? u.headingRad : Math.atan2(u.vy || 0, u.vx || 1);
+                var cosB = Math.cos(psi);
+                var sinB = Math.sin(psi);
+                function bPt(lx, ly, lz) {
+                    return p3(u.x + lx * cosB - ly * sinB, u.y + lx * sinB + ly * cosB, lz);
+                }
+                var rw = bPt(-0.62, 0, 0.32);
+                var fw = bPt(0.62, 0, 0.32);
+                var seat = bPt(-0.18, 0, 0.90);
+                var bar = bPt(0.38, 0, 1.00);
+                var sh = bPt(0.05, 0, 1.32);
+                var head = bPt(0.12, 0, 1.54);
+                var gBack = bPt(-0.82, 0, 0);
+                var gFront = bPt(0.82, 0, 0);
+                if (!rw || !fw || !seat || !bar || !sh || !head || !gBack || !gFront) return null;
+
+                // Ground shadow
+                fillPolyPts(
+                    [
+                        [u.x - 0.8 * cosB - 0.28 * sinB, u.y - 0.8 * sinB + 0.28 * cosB, 0.01],
+                        [u.x + 0.8 * cosB - 0.28 * sinB, u.y + 0.8 * sinB + 0.28 * cosB, 0.01],
+                        [u.x + 0.8 * cosB + 0.28 * sinB, u.y + 0.8 * sinB - 0.28 * cosB, 0.01],
+                        [u.x - 0.8 * cosB + 0.28 * sinB, u.y - 0.8 * sinB - 0.28 * cosB, 0.01]
+                    ],
+                    pal.isLight ? "rgba(18, 22, 30, 0.22)" : "rgba(0, 0, 0, 0.42)",
+                    null,
+                    0,
+                    false
+                );
+
+                var wheelR = clamp((0.32 / rw.zCam) * cam.focal, 4, 15);
+                var headR = clamp((0.13 / head.zCam) * cam.focal, 2.5, 8);
+                ctx.save();
+                ctx.strokeStyle = fillBikeFrame;
+                ctx.lineWidth = 1.8;
+                ctx.beginPath();
+                ctx.arc(rw.x, rw.y, wheelR, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(fw.x, fw.y, wheelR, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(rw.x, rw.y);
+                ctx.lineTo(seat.x, seat.y);
+                ctx.lineTo(bar.x, bar.y);
+                ctx.lineTo(fw.x, fw.y);
+                ctx.stroke();
+
+                // Rider silhouette
+                ctx.strokeStyle = fillBody;
+                ctx.lineWidth = 2.6;
+                ctx.lineCap = "round";
+                ctx.beginPath();
+                ctx.moveTo(seat.x, seat.y);
+                ctx.lineTo(sh.x, sh.y);
+                ctx.lineTo(bar.x, bar.y);
+                ctx.stroke();
+
+                ctx.fillStyle = fillBody;
+                ctx.beginPath();
+                ctx.arc(head.x, head.y, headR, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+
+                var xs = [rw.x - wheelR, fw.x + wheelR, gBack.x, gFront.x, head.x];
+                var ys = [head.y - headR, rw.y + wheelR, fw.y + wheelR, gBack.y, gFront.y];
+                var x1 = Math.min.apply(null, xs) - 3;
+                var x2 = Math.max.apply(null, xs) + 3;
+                var y1 = Math.min.apply(null, ys) - 3;
+                var y2 = Math.max.apply(null, ys) + 2;
+                return { x: x1, y: y1, w: Math.max(16, x2 - x1), h: Math.max(24, y2 - y1) };
+            }
+
+            // Pedestrian grounded silhouette
+            var pFootL = p3(u.x - 0.14, u.y, 0);
+            var pFootR = p3(u.x + 0.14, u.y, 0);
+            var pHipL = p3(u.x - 0.13, u.y, 0.80);
+            var pHipR = p3(u.x + 0.13, u.y, 0.80);
+            var pShL = p3(u.x - 0.21, u.y, 1.36);
+            var pShR = p3(u.x + 0.21, u.y, 1.36);
+            var pHead = p3(u.x, u.y, 1.58);
+            if (!pFootL || !pFootR || !pHipL || !pHipR || !pShL || !pShR || !pHead) return null;
+
+            fillPolyPts(
+                [
+                    [u.x - 0.26, u.y - 0.26, 0.01],
+                    [u.x + 0.26, u.y - 0.26, 0.01],
+                    [u.x + 0.26, u.y + 0.26, 0.01],
+                    [u.x - 0.26, u.y + 0.26, 0.01]
+                ],
+                pal.isLight ? "rgba(18, 22, 30, 0.22)" : "rgba(0, 0, 0, 0.42)",
+                null,
+                0,
+                false
+            );
+
+            var pHeadR = clamp((0.135 / pHead.zCam) * cam.focal, 2.5, 8.5);
+            ctx.save();
+            // Legs
+            ctx.strokeStyle = fillBody;
+            ctx.lineWidth = clamp((0.10 / pFootL.zCam) * cam.focal, 1.8, 4.0);
+            ctx.lineCap = "round";
+            ctx.beginPath();
+            ctx.moveTo(pFootL.x, pFootL.y);
+            ctx.lineTo(pHipL.x, pHipL.y);
+            ctx.moveTo(pFootR.x, pFootR.y);
+            ctx.lineTo(pHipR.x, pHipR.y);
+            ctx.stroke();
+
+            // Torso
+            drawProjectedQuad(ctx, [pHipL, pHipR, pShR, pShL], fillBody, withAlpha(uColor, 0.75), 0.9);
+
+            // Head
+            ctx.fillStyle = fillBody;
+            ctx.beginPath();
+            ctx.arc(pHead.x, pHead.y, pHeadR, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+
+            var px1 = Math.min(pShL.x, pFootL.x, pHead.x - pHeadR) - 4;
+            var px2 = Math.max(pShR.x, pFootR.x, pHead.x + pHeadR) + 4;
+            var py1 = pHead.y - pHeadR - 3;
+            var py2 = Math.max(pFootL.y, pFootR.y) + 2;
+            return { x: px1, y: py1, w: Math.max(14, px2 - px1), h: Math.max(24, py2 - py1) };
+        }
+
         ctx.save();
         ctx.scale(this._dpr, this._dpr);
         ctx.clearRect(0, 0, w, h);
+
+        // Clip all 3D scene rendering strictly inside (0, 0, w, h)
+        ctx.beginPath();
+        ctx.rect(0, 0, w, h);
+        ctx.clip();
 
         // Background sky / campus horizon band + distant ground apron
         ctx.fillStyle = pal.isLight ? "#dde1e8" : "#101012";
@@ -4575,12 +5242,16 @@
         }
         ctx.restore();
 
-        // Crosswalk perspective zebra stripes (y = 7.25 .. 8.45)
-        if (7.8 >= b.yMin + 0.4 && 7.8 <= b.yMax - 0.4) {
+        // Crosswalk perspective zebra stripes (y = 8.80 .. 10.00, matching twin & scenarios)
+        var cwY0 = 8.80;
+        var cwY1 = 10.00;
+        if (cwY1 >= b.yMin + 0.4 && cwY0 <= b.yMax - 0.4) {
             var cwTint = withAlpha(pal.textPrimary, pal.isLight ? 0.16 : 0.12);
+            var cwClampedY0 = Math.max(b.yMin, cwY0);
+            var cwClampedY1 = Math.min(b.yMax, cwY1);
             for (var zx = b.xMin + 0.4; zx < b.xMax - 0.35; zx += 0.72) {
                 fillPolyPts(
-                    [[zx, 7.25], [Math.min(zx + 0.38, b.xMax - 0.3), 7.25], [Math.min(zx + 0.38, b.xMax - 0.3), 8.45], [zx, 8.45]],
+                    [[zx, cwClampedY0], [Math.min(zx + 0.38, b.xMax - 0.3), cwClampedY0], [Math.min(zx + 0.38, b.xMax - 0.3), cwClampedY1], [zx, cwClampedY1]],
                     cwTint,
                     null,
                     0,
@@ -4619,13 +5290,13 @@
             fillPolyPts(worldPoly, withAlpha(pal.parkingZone, 0.10), withAlpha(pal.parkingZone, 0.72), 1.3, true);
         }
 
-        // Future CTRV trajectory arcs projected onto pavement
+        // Future kinematic trajectory arcs projected onto pavement (honoring speedModel)
         var vehicles = Array.isArray(st.vehicles) ? st.vehicles : [];
         for (var vi = 0; vi < vehicles.length; vi += 1) {
             var veh = vehicles[vi];
             var spdMs = Math.hypot(veh.vx || 0, veh.vy || 0);
             if (spdMs < 0.35 || veh.inParkingZone) continue;
-            var arcPts = predictCtrvArc(veh, 2.5, 16);
+            var arcPts = predictCtrvArc(veh, 2.5, 16, st.speedModel);
             var arcColor = veh.riskLevel >= 1 ? riskColor(pal, veh.riskLevel) : pal.safe;
             ctx.save();
             ctx.setLineDash([5, 4]);
@@ -4696,7 +5367,7 @@
             }
         }
 
-        // Depth-sort actors far-to-near and project 3D boxes + 2D YOLO detection overlays
+        // Depth-sort actors far-to-near and render solid low-poly 3D vehicles & grounded VRUs
         var renderActors = [];
         for (var vIdx = 0; vIdx < vehicles.length; vIdx += 1) {
             renderActors.push({ kind: "veh", item: vehicles[vIdx], yDepth: vehicles[vIdx].y || 0 });
@@ -4707,8 +5378,26 @@
         renderActors.sort(function (a, bObj) { return bObj.yDepth - a.yDepth; });
 
         var placedLabels = [];
+        var obstacleBoxes = [];
         var safeRect = { minX: 6, minY: 30, maxX: w - 6, maxY: h - 6 };
 
+        // Reserve top HUD pill rectangles upfront so actor pills never collide with HUD overlays
+        var camTitle = st.cameraLabel
+            ? (w < 410 && st.cameraShortLabel ? st.cameraShortLabel : st.cameraLabel)
+            : (w < 410 ? "CAM-01 · 3D 透视仿真" : "CAM-01 · 3D 透视仿真视角 · 标定 6.0m x 15.0m");
+        var maxRisk = st.maxRisk || 0;
+        var riskTxt = maxRisk === 3 ? "L3 CRITICAL" : (maxRisk === 2 ? "L2 CAUTION" : (maxRisk === 1 ? "L1 SPEEDING" : "L0 SAFE"));
+        var riskCol = riskColor(pal, maxRisk);
+
+        ctx.save();
+        ctx.font = "500 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+        var camTitleW = ctx.measureText(camTitle).width + 12;
+        var pillW = ctx.measureText(riskTxt).width + 12;
+        ctx.restore();
+        placedLabels.push({ x: 10, y: 8, w: camTitleW, h: 18 });
+        placedLabels.push({ x: Math.max(10, w - pillW - 10), y: 8, w: pillW, h: 18 });
+
+        var pendingActorPills = [];
         for (var ai2 = 0; ai2 < renderActors.length; ai2 += 1) {
             var entry = renderActors[ai2];
             if (entry.kind === "veh") {
@@ -4716,120 +5405,42 @@
                 var vColor = v.inParkingZone
                     ? pal.textMuted
                     : (v.riskLevel >= 1 ? riskColor(pal, v.riskLevel) : pal.safe);
-                var hl = (v.lengthM || 4.5) * 0.5;
-                var hw = (v.widthM || 1.9) * 0.5;
-                var vh = v.kind === "bus" ? 2.85 : (v.kind === "truck" ? 2.55 : 1.48);
-                var hRad = v.headingRad !== undefined ? v.headingRad : Math.PI * 0.5;
-                var cosH = Math.cos(hRad);
-                var sinH = Math.sin(hRad);
-                var cornersWorld = [
-                    [v.x + hl * cosH - hw * sinH, v.y + hl * sinH + hw * cosH],
-                    [v.x + hl * cosH + hw * sinH, v.y + hl * sinH - hw * cosH],
-                    [v.x - hl * cosH + hw * sinH, v.y - hl * sinH - hw * cosH],
-                    [v.x - hl * cosH - hw * sinH, v.y - hl * sinH + hw * cosH]
-                ];
-                var basePx = [];
-                var topPx = [];
-                var allValid = true;
-                for (var ci2 = 0; ci2 < 4; ci2 += 1) {
-                    var bp = p3(cornersWorld[ci2][0], cornersWorld[ci2][1], 0);
-                    var tp = p3(cornersWorld[ci2][0], cornersWorld[ci2][1], vh);
-                    if (!bp || !tp) {
-                        allValid = false;
-                        break;
-                    }
-                    basePx.push(bp);
-                    topPx.push(tp);
-                }
-                if (!allValid) continue;
+                var vBox = drawLowPolyVehicle(v, vColor);
+                if (!vBox) continue;
 
-                // Subtle 3D wireframe cabin shell + roof tint
-                ctx.save();
-                ctx.fillStyle = withAlpha(vColor, v.inParkingZone ? 0.12 : 0.16);
-                ctx.strokeStyle = withAlpha(vColor, 0.72);
-                ctx.lineWidth = 1.1;
-                ctx.beginPath();
-                ctx.moveTo(topPx[0].x, topPx[0].y);
-                for (var ti2 = 1; ti2 < 4; ti2 += 1) ctx.lineTo(topPx[ti2].x, topPx[ti2].y);
-                ctx.closePath();
-                ctx.fill();
-                ctx.stroke();
+                drawCornerBracketBox(ctx, vBox.x, vBox.y, vBox.w, vBox.h, vColor, v.riskLevel >= 2 ? 2.0 : 1.5);
+                obstacleBoxes.push(vBox);
 
-                for (var ei = 0; ei < 4; ei += 1) {
-                    ctx.beginPath();
-                    ctx.moveTo(basePx[ei].x, basePx[ei].y);
-                    ctx.lineTo(topPx[ei].x, topPx[ei].y);
-                    ctx.stroke();
-                }
-                ctx.restore();
-
-                // Compute 2D YOLO detection bbox around projected 3D box
-                var allBoxPts = basePx.concat(topPx);
-                var minBx = Infinity;
-                var minBy = Infinity;
-                var maxBx = -Infinity;
-                var maxBy = -Infinity;
-                for (var bi = 0; bi < allBoxPts.length; bi += 1) {
-                    if (allBoxPts[bi].x < minBx) minBx = allBoxPts[bi].x;
-                    if (allBoxPts[bi].y < minBy) minBy = allBoxPts[bi].y;
-                    if (allBoxPts[bi].x > maxBx) maxBx = allBoxPts[bi].x;
-                    if (allBoxPts[bi].y > maxBy) maxBy = allBoxPts[bi].y;
-                }
-                ctx.strokeStyle = vColor;
-                ctx.lineWidth = v.riskLevel >= 2 ? 2.0 : 1.5;
-                ctx.strokeRect(minBx, minBy, maxBx - minBx, maxBy - minBy);
-
-                // Ground anchor dot
                 var anchorPt = p3(v.x, v.y, 0);
                 if (anchorPt) {
                     ctx.fillStyle = pal.accent;
                     ctx.beginPath();
-                    ctx.arc(anchorPt.x, anchorPt.y, 3, 0, Math.PI * 2);
+                    ctx.arc(anchorPt.x, anchorPt.y, 2.8, 0, Math.PI * 2);
                     ctx.fill();
                 }
 
                 var spdTxt = isFiniteNum(v.speedKmh) ? v.speedKmh.toFixed(1) + " km/h" : "0.0 km/h";
                 var statusSuffix = v.riskLevel >= 3 ? " [ALERT]" : (v.riskLevel === 2 ? " [CAUTION]" : (v.riskLevel === 1 ? " [SPEEDING]" : ""));
                 var vLabel = "V-" + padId(v.trackId) + " | " + spdTxt + statusSuffix;
-                var vBg = v.riskLevel >= 3 ? pal.critical : pal.bgCard;
-                var vFg = v.riskLevel >= 3 ? "#ffffff" : pal.textPrimary;
-                placePill(
-                    ctx,
-                    { cx: (minBx + maxBx) * 0.5, cy: minBy - 10, rx: 0, ry: 2 },
-                    vLabel,
-                    vBg,
-                    vColor,
-                    vFg,
-                    safeRect,
-                    placedLabels,
-                    []
-                );
+                pendingActorPills.push({
+                    priority: 10 + (v.riskLevel || 0),
+                    target: { cx: vBox.x + vBox.w * 0.5, cy: vBox.y - 10, rx: vBox.w * 0.5, ry: 2 },
+                    text: vLabel,
+                    bg: v.riskLevel >= 3 ? pal.critical : pal.bgCard,
+                    border: vColor,
+                    fg: v.riskLevel >= 3 ? "#ffffff" : pal.textPrimary
+                });
             } else {
                 var u = entry.item;
                 var isBike = u.kind === "bicycle" || u.category === "bicycle" || u.kind === "motorcycle";
                 var uColor = u.riskLevel >= 2 ? riskColor(pal, u.riskLevel) : (isBike ? pal.accent : pal.safe);
-                var uw = isBike ? 0.55 : 0.36;
-                var uh = isBike ? 1.42 : 1.72;
-                var uBaseL = p3(u.x - uw, u.y, 0);
-                var uBaseR = p3(u.x + uw, u.y, 0);
-                var uTopL = p3(u.x - uw, u.y, uh);
-                var uTopR = p3(u.x + uw, u.y, uh);
+                var uBox = drawGroundedVruSilhouette(u, uColor, isBike);
+                if (!uBox) continue;
+
+                drawCornerBracketBox(ctx, uBox.x, uBox.y, uBox.w, uBox.h, uColor, u.riskLevel >= 2 ? 1.8 : 1.4);
+                obstacleBoxes.push(uBox);
+
                 var uAnchor = p3(u.x, u.y, 0);
-                if (!uBaseL || !uBaseR || !uTopL || !uTopR) continue;
-
-                var bx1 = Math.min(uBaseL.x, uTopL.x);
-                var bx2 = Math.max(uBaseR.x, uTopR.x);
-                var by1 = Math.min(uTopL.y, uTopR.y);
-                var by2 = Math.max(uBaseL.y, uBaseR.y);
-                var bw = Math.max(14, bx2 - bx1);
-                var bh = Math.max(24, by2 - by1);
-
-                ctx.fillStyle = withAlpha(uColor, 0.14);
-                ctx.fillRect(bx1, by1, bw, bh);
-                ctx.strokeStyle = uColor;
-                ctx.lineWidth = u.riskLevel >= 2 ? 1.8 : 1.4;
-                ctx.strokeRect(bx1, by1, bw, bh);
-
                 if (uAnchor) {
                     ctx.fillStyle = pal.accent;
                     ctx.beginPath();
@@ -4841,32 +5452,39 @@
                 if (isBike && Math.hypot(u.vx || 0, u.vy || 0) > 0.2) {
                     uTag += " " + (Math.hypot(u.vx || 0, u.vy || 0) * 3.6).toFixed(1) + "km/h";
                 }
-                placePill(
-                    ctx,
-                    { cx: bx1 + bw * 0.5, cy: by1 - 10, rx: 0, ry: 2 },
-                    uTag,
-                    u.riskLevel >= 3 ? pal.critical : pal.bgCard,
-                    uColor,
-                    u.riskLevel >= 3 ? "#ffffff" : pal.textPrimary,
-                    safeRect,
-                    placedLabels,
-                    []
-                );
+                pendingActorPills.push({
+                    priority: 20 + (u.riskLevel || 0),
+                    target: { cx: uBox.x + uBox.w * 0.5, cy: uBox.y - 10, rx: uBox.w * 0.5, ry: 2 },
+                    text: uTag,
+                    bg: u.riskLevel >= 3 ? pal.critical : pal.bgCard,
+                    border: uColor,
+                    fg: u.riskLevel >= 3 ? "#ffffff" : pal.textPrimary
+                });
             }
         }
 
-        // Top overlay status bar (clean corner pills)
-        var camTitle = st.cameraLabel
-            ? (w < 410 && st.cameraShortLabel ? st.cameraShortLabel : st.cameraLabel)
-            : (w < 410 ? "CAM-01 · 3D 透视仿真" : "CAM-01 · 3D 透视仿真视角 · 标定 6.0m x 15.0m");
-        drawPill(ctx, 10, 8, camTitle, pal.bgCard, pal.hairline, pal.textSecondary, w);
+        // Place actor labels avoiding all projected vehicle & VRU boxes (VRUs & higher risk first)
+        pendingActorPills.sort(function (a, bObj) { return bObj.priority - a.priority; });
+        for (var pp = 0; pp < pendingActorPills.length; pp += 1) {
+            var pItem = pendingActorPills[pp];
+            placePill(
+                ctx,
+                pItem.target,
+                pItem.text,
+                pItem.bg,
+                pItem.border,
+                pItem.fg,
+                safeRect,
+                placedLabels,
+                obstacleBoxes
+            );
+        }
 
-        var maxRisk = st.maxRisk || 0;
-        var riskTxt = maxRisk === 3 ? "L3 CRITICAL" : (maxRisk === 2 ? "L2 CAUTION" : (maxRisk === 1 ? "L1 SPEEDING" : "L0 SAFE"));
-        var riskCol = riskColor(pal, maxRisk);
+        // Top overlay status bar (clean corner pills with dynamically measured risk pill width)
+        drawPill(ctx, 10, 8, camTitle, pal.bgCard, pal.hairline, pal.textSecondary, w);
         drawPill(
             ctx,
-            Math.max(10, w - 104),
+            Math.max(10, w - pillW - 10),
             8,
             riskTxt,
             maxRisk === 3 ? pal.critical : pal.bgCard,
@@ -4881,10 +5499,7 @@
     SimulatedCameraCanvas.prototype.destroy = function () {
         if (this._destroyed) return;
         this._destroyed = true;
-        if (this._resizeObserver) {
-            this._resizeObserver.disconnect();
-            this._resizeObserver = null;
-        }
+        detachResizeObserver(this);
         this._unobserveTheme();
         if (this._probe && this._probe.parentNode) {
             this._probe.parentNode.removeChild(this._probe);
@@ -4902,6 +5517,8 @@
         CalibrationCanvas: CalibrationCanvas,
         AlertAudioSynth: AlertAudioSynth,
         SimulatedCameraCanvas: SimulatedCameraCanvas,
-        _buildScenarioState: buildScenarioState
+        _buildScenarioState: buildScenarioState,
+        _computeCpaAndTtc: computeCpaAndTtc,
+        _computeCvmCircleTtc: computeCvmCircleTtc
     };
 })(typeof window !== "undefined" ? window : globalThis);
