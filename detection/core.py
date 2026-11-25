@@ -230,7 +230,11 @@ def detect(args) -> Path:
                     pts = capture.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
                     timestamp_source = "video_pts"
                     if args.fps is not None or not math.isfinite(pts) or pts < 0 or pts <= previous_timestamp:
-                        pts, timestamp_source = count / fps, "fps_estimate"
+                        timestamp_source = "fps_estimate"
+                        if args.fps is not None or previous_timestamp < 0:
+                            pts = count / fps
+                        else:
+                            pts = max(count / fps, previous_timestamp + (1.0 / fps))
                     if pts <= previous_timestamp:
                         raise ValueError("视频时间戳不连续，请检查视频或用 --fps 指定固定帧率。")
                     previous_timestamp = pts

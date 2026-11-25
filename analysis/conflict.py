@@ -273,27 +273,39 @@ class ConflictAnalyzer:
             return None
 
         t_cpa = -dot_product / rel_speed_sq
-        if t_cpa <= 0 or t_cpa > self.horizon_s:
+        if t_cpa <= 0:
             return None
 
         rx_cpa = dx + dvx * t_cpa
         ry_cpa = dy + dvy * t_cpa
         min_dist = math.hypot(rx_cpa, ry_cpa)
 
-        conflict_x = veh.x_m + veh.vx_ms * t_cpa
-        conflict_y = veh.y_m + veh.vy_ms * t_cpa
-
         if min_dist <= critical_dist_m:
-            if t_cpa <= self.ttc_critical_s:
+            # 用相对速度与弦长精确求圆包络首次接触时刻，避免 t_cpa 越出视界时漏报或误判 TTC。
+            half_chord = math.sqrt(max(0.0, critical_dist_m * critical_dist_m - min_dist * min_dist))
+            t_contact = max(0.0, t_cpa - half_chord / math.sqrt(rel_speed_sq))
+            if t_contact > self.horizon_s:
+                return None
+            ttc_out = t_contact
+            conflict_x = veh.x_m + veh.vx_ms * t_contact
+            conflict_y = veh.y_m + veh.vy_ms * t_contact
+            if t_contact <= self.ttc_critical_s:
                 level = RiskLevel.LEVEL_3_CRITICAL
                 crit_prefix = f"紧急碰撞危险({target_label})!" if is_cyclist else "紧急碰撞危险!"
-                desc = f"{crit_prefix} (TTC={t_cpa:.1f}s, 预计间距={min_dist:.1f}m)"
-            elif t_cpa <= self.ttc_caution_s:
+                desc = f"{crit_prefix} (TTC={t_contact:.1f}s, 预计间距={min_dist:.1f}m)"
+            elif t_contact <= self.ttc_caution_s:
                 level = RiskLevel.LEVEL_2_CAUTION
-                desc = f"注意减速礼让{target_label} (TTC={t_cpa:.1f}s, 轨迹汇聚)"
+                desc = f"注意减速礼让{target_label} (TTC={t_contact:.1f}s, 轨迹汇聚)"
             else:
                 return None
-        elif min_dist <= critical_dist_m * 1.5 and t_cpa <= self.ttc_caution_s:
+        elif (
+            min_dist <= critical_dist_m * 1.5
+            and t_cpa <= self.horizon_s
+            and t_cpa <= self.ttc_caution_s
+        ):
+            ttc_out = t_cpa
+            conflict_x = veh.x_m + veh.vx_ms * t_cpa
+            conflict_y = veh.y_m + veh.vy_ms * t_cpa
             level = RiskLevel.LEVEL_2_CAUTION
             desc = f"注意横穿{target_label} (预计间距={min_dist:.1f}m)"
         else:
@@ -308,7 +320,7 @@ class ConflictAnalyzer:
             ped_speed_ms=ped.speed_ms,
             current_distance_m=current_dist,
             min_distance_m=min_dist,
-            ttc_seconds=t_cpa,
+            ttc_seconds=ttc_out,
             conflict_ground_xy=(conflict_x, conflict_y),
             vehicle_kind=vehicle_policy.kind,
             conflict_model="cvm_circle",

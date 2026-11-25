@@ -13,6 +13,7 @@ CampusMotion 独立桌面应用宿主模块 (Standalone Desktop App-Mode Host)
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import logging
 import os
@@ -23,10 +24,16 @@ import subprocess
 import sys
 import threading
 import time
-from typing import List, Optional
+from typing import Iterator, List, Optional
 from urllib.error import URLError
 from urllib.request import urlopen
+from uuid import uuid4
 import webbrowser
+
+if os.name == "nt":
+    import msvcrt
+else:  # pragma: no cover - POSIX 分支仅在 Linux/macOS 下使用
+    import fcntl
 
 from detection.core import is_blank_path
 from .service import AnalysisService, create_http_server
@@ -245,6 +252,45 @@ def _bind_server_with_port_scan(
     ) from last_exc
 
 
+@contextmanager
+def _startup_lock(lock_path: Path, timeout_s: float = 10.0) -> Iterator[None]:
+    """跨进程启动互斥锁，保护单实例检查、端口绑定与 instance.json 原子发布窗口。"""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + float(timeout_s)
+    fp = open(lock_path, "a+", encoding="utf-8")
+    locked = False
+    try:
+        while True:
+            try:
+                if os.name == "nt":
+                    fp.seek(0)
+                    if fp.tell() == 0 and os.path.getsize(lock_path) == 0:
+                        fp.write("\0")
+                        fp.flush()
+                    fp.seek(0)
+                    msvcrt.locking(fp.fileno(), msvcrt.LK_NBLCK, 1)
+                else:  # pragma: no cover
+                    fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"等待桌面单实例启动锁超时: {lock_path}") from None
+                time.sleep(0.025)
+        yield
+    finally:
+        if locked:
+            try:
+                if os.name == "nt":
+                    fp.seek(0)
+                    msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
+                else:  # pragma: no cover
+                    fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fp.close()
+
+
 def _write_instance_file(
     instance_path: Path,
     *,
@@ -261,12 +307,19 @@ def _write_instance_file(
         "url": url,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
-    tmp_path = instance_path.with_suffix(".json.tmp")
-    tmp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
-    tmp_path.replace(instance_path)
+    tmp_path = instance_path.with_name(f"{instance_path.name}.{os.getpid()}.{uuid4().hex[:6]}.tmp")
+    try:
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        tmp_path.replace(instance_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _cleanup_own_instance_file(instance_path: Path, *, pid: int, port: int) -> None:
@@ -313,41 +366,41 @@ def run_desktop(
     instance_path = data_dir / "instance.json"
 
     logger, file_handler = _create_logger(log_path)
+    lock_path = data_dir / "instance.lock"
     try:
-        existing_url = _check_existing_instance(instance_path, logger)
-        if existing_url is not None:
-            logger.info("Existing CampusMotion instance alive at %s", existing_url)
-            if not no_open:
-                _open_url(
-                    existing_url,
-                    app_data_dir=data_dir,
-                    browser_only=browser_only,
-                    logger=logger,
-                )
-            return 0
+        with _startup_lock(lock_path):
+            existing_url = _check_existing_instance(instance_path, logger)
+            if existing_url is not None:
+                logger.info("Existing CampusMotion instance alive at %s", existing_url)
+                if not no_open:
+                    _open_url(
+                        existing_url,
+                        app_data_dir=data_dir,
+                        browser_only=browser_only,
+                        logger=logger,
+                    )
+                return 0
 
-        shutdown_event = threading.Event()
-        service = AnalysisService(
-            runs_root=runs_root,
-            default_calib=default_calib,
-            desktop_mode=True,
-            allow_shutdown=True,
-            shutdown_callback=shutdown_event.set,
-        )
-        server = _bind_server_with_port_scan(service, host, port)
-        bound_host, bound_port = server.server_address[:2]
-        display_host = "127.0.0.1" if bound_host in ("0.0.0.0", "::", "") else bound_host
-        url = f"http://{display_host}:{bound_port}/"
+            shutdown_event = threading.Event()
+            service = AnalysisService(
+                runs_root=runs_root,
+                default_calib=default_calib,
+                desktop_mode=True,
+                allow_shutdown=True,
+                shutdown_callback=shutdown_event.set,
+            )
+            server = _bind_server_with_port_scan(service, host, port)
+            bound_host, bound_port = server.server_address[:2]
+            display_host = "127.0.0.1" if bound_host in ("0.0.0.0", "::", "") else bound_host
+            url = f"http://{display_host}:{bound_port}/"
 
-        server_thread = threading.Thread(
-            target=server.serve_forever,
-            name="CampusMotionDesktopHTTP",
-            daemon=True,
-        )
-        server_thread.start()
+            server_thread = threading.Thread(
+                target=server.serve_forever,
+                name="CampusMotionDesktopHTTP",
+                daemon=True,
+            )
+            server_thread.start()
 
-        browser_proc: Optional[subprocess.Popen] = None
-        try:
             ready_deadline = time.monotonic() + 3.0
             while time.monotonic() < ready_deadline:
                 if _is_health_ok(url, timeout_s=0.3):
@@ -362,6 +415,9 @@ def run_desktop(
                 url=url,
             )
             logger.info("CampusMotion desktop server listening at %s", url)
+
+        browser_proc: Optional[subprocess.Popen] = None
+        try:
 
             if not no_open:
                 browser_proc = _open_url(

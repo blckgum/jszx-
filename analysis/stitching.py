@@ -16,6 +16,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .mot_eval import _hungarian_max_weight
+
 
 def _is_finite_number(value: Any) -> bool:
     """精确校验有限数值，兼容 NumPy 数值标量并拒绝 bool/np.bool_ 伪装。"""
@@ -619,12 +621,41 @@ class TrackletStitcher:
                     )
                 )
 
-        # 优先按融合代价（无外观时即纯马氏距离）排序，依次贪心分配一对一缝合
-        candidates.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[4], row[5]))
+        # 使用最大基数 + 最小融合代价二分匹配进行一对一缝合，避免局部最小代价抢占造成可匹配新轨迹建重 ID
         matched_raw: set[int] = set()
         matched_lost: set[int] = set()
+        assigned_rows: List[Tuple[float, float, float, float, int, int, Optional[float], TrackObservation]] = []
+        if candidates:
+            raw_ids = sorted({row[4] for row in candidates})
+            lost_cids = sorted({row[5] for row in candidates})
+            raw_pos = {rid: idx for idx, rid in enumerate(raw_ids)}
+            lost_pos = {cid: idx for idx, cid in enumerate(lost_cids)}
+            rank_by_pair: dict[tuple[int, int], tuple[int, tuple[float, float, float, float, int, int, Optional[float], TrackObservation]]] = {}
+            ordered_cands = sorted(
+                candidates,
+                key=lambda row: (row[0], row[1], row[2], row[3], row[4], row[5]),
+            )
+            total_cands = max(1, len(ordered_cands))
+            max_cost = max(0.0, max(float(row[0]) for row in ordered_cands)) + 1.0
+            weights = np.zeros((len(raw_ids), len(lost_cids)), dtype=np.float64)
+            valid = np.zeros((len(raw_ids), len(lost_cids)), dtype=bool)
+            card_bonus = float(min(len(raw_ids), len(lost_cids)) + 1)
+            for rank_idx, row in enumerate(ordered_cands):
+                ri = raw_pos[row[4]]
+                ci = lost_pos[row[5]]
+                valid[ri, ci] = True
+                # 归一化真实 fused_cost（0.45 比重）并辅以微小确定性序偏移，确保先最大化匹配数，
+                # 又在同基数下最小化融合代价总和而非仅按秩次相加。
+                cost_val = max(0.0, float(row[0]))
+                penalty = 0.45 * (cost_val / max_cost) + 1e-6 * (rank_idx / total_cands)
+                weights[ri, ci] = card_bonus - penalty
+                rank_by_pair[(ri, ci)] = (rank_idx, row)
 
-        for _fused, d_m, dist_m, gap_s, raw_id, lost_cid, heading_diff_deg, obs in candidates:
+            pairs = _hungarian_max_weight(weights, valid)
+            assigned_rows = [rank_by_pair[(ri, ci)][1] for ri, ci in pairs]
+            assigned_rows.sort(key=lambda row: (row[4], row[5]))
+
+        for _fused, d_m, dist_m, gap_s, raw_id, lost_cid, heading_diff_deg, obs in assigned_rows:
             if raw_id in matched_raw or lost_cid in matched_lost:
                 continue
             matched_raw.add(raw_id)

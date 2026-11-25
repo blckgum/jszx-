@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from bisect import bisect_left
 from collections import deque
 import csv
 from dataclasses import dataclass, field
@@ -283,6 +284,8 @@ class LatestFrameCapture:
         self._cond = threading.Condition()
         self._stop_event = threading.Event()
         self._latest_frame: Any = None
+        self._latest_pts_ms: float = float("nan")
+        self._last_read_pts_ms: float = float("nan")
         self._has_unread: bool = False
         self._ended: bool = False
         self._released: bool = False
@@ -296,10 +299,23 @@ class LatestFrameCapture:
         )
         self._thread.start()
 
+    @staticmethod
+    def _parse_pts_ms(raw_pts: Any) -> float:
+        if (
+            type(raw_pts) is not bool
+            and not isinstance(raw_pts, np.bool_)
+            and isinstance(raw_pts, (int, float, np.integer, np.floating))
+        ):
+            val = float(raw_pts)
+            if math.isfinite(val):
+                return val
+        return float("nan")
+
     def _reader_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
                 ok, frame = self._cap.read()
+                pts_ms = self._parse_pts_ms(self._cap.get(cv2.CAP_PROP_POS_MSEC)) if (ok and frame is not None) else float("nan")
             except Exception as exc:
                 with self._cond:
                     self._reader_error = exc
@@ -319,11 +335,12 @@ class LatestFrameCapture:
                 if self._has_unread:
                     self.dropped_frames += 1
                 self._latest_frame = frame
+                self._latest_pts_ms = pts_ms
                 self._has_unread = True
                 self._cond.notify_all()
 
-    def read(self, timeout_s: Optional[float] = None) -> tuple[bool, Any]:
-        """获取最新可用帧；若尚无新帧则在超时范围内阻塞等待，已结束且无未读帧时返回 (False, None)。"""
+    def read_with_pts(self, timeout_s: Optional[float] = None) -> tuple[bool, Any, float]:
+        """原子获取最新可用帧及捕获时刻匹配的 PTS(ms)；无可读帧时返回 (False, None, nan)。"""
         if timeout_s is None:
             wait_limit = self._read_timeout_s
         else:
@@ -336,21 +353,32 @@ class LatestFrameCapture:
             while not self._has_unread and not self._ended and not self._stop_event.is_set():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
-                    return False, None
+                    return False, None, float("nan")
                 self._cond.wait(timeout=remaining)
 
             # 优先交付已捕获的最后一帧，确保有限测试流末尾不会漏掉最新帧。
             if self._has_unread and not self._stop_event.is_set():
                 frame = self._latest_frame
+                pts_ms = self._latest_pts_ms
                 self._latest_frame = None
+                self._latest_pts_ms = float("nan")
                 self._has_unread = False
-                return True, frame
-            return False, None
+                self._last_read_pts_ms = pts_ms
+                return True, frame, pts_ms
+            return False, None, float("nan")
+
+    def read(self, timeout_s: Optional[float] = None) -> tuple[bool, Any]:
+        """获取最新可用帧；若尚无新帧则在超时范围内阻塞等待，已结束且无未读帧时返回 (False, None)。"""
+        ok, frame, _ = self.read_with_pts(timeout_s=timeout_s)
+        return ok, frame
 
     def get(self, prop_id: int) -> Any:
-        """透传底层采集对象属性查询。"""
+        """透传底层采集对象属性查询；对 PTS 查询返回最近消费帧匹配的原子时间戳。"""
         if self._released:
             return 0.0
+        if prop_id == cv2.CAP_PROP_POS_MSEC:
+            with self._cond:
+                return self._last_read_pts_ms
         return self._cap.get(prop_id)
 
     def isOpened(self) -> bool:
@@ -541,6 +569,10 @@ class _ServiceJob:
     alert_queue: deque = field(default_factory=deque)
     summary: Optional[dict] = None
     error: Optional[str] = None
+    speed_model: str = "ema"
+    conflict_model: str = "cvm_circle"
+    enable_stitching: bool = False
+    include_cyclist_vru: bool = False
     stop_event: threading.Event = field(default_factory=threading.Event)
     cond: threading.Condition = field(default_factory=threading.Condition)
     thread: Optional[threading.Thread] = None
@@ -588,6 +620,7 @@ class AnalysisService:
         self._shutdown_callback = shutdown_callback
         self._lock = threading.Lock()
         self._jobs: Dict[str, _ServiceJob] = {}
+        self._active_output_dirs: Dict[str, tuple[str, Path]] = {}
 
     def resolve_web_asset(self, rel_path: str) -> tuple[Path, str]:
         """严格校验并解析 Web 控制台静态资源路径与 MIME 类型。"""
@@ -699,11 +732,48 @@ class AnalysisService:
         data = load_json_strict(summary_path)
         if not isinstance(data, dict):
             raise SchemaValidationError("summary.json 顶层必须是 JSON 对象")
-        return {
+        frame_map = self._load_video_frame_map(run_dir)
+        out = {
             "run_id": run_id,
             "has_video": (run_dir / "annotated_conflict.mp4").is_file(),
+            "has_video_frame_map": frame_map is not None,
             **data,
         }
+        if frame_map is not None:
+            out["video_frame_count"] = len(frame_map)
+        return out
+
+    @staticmethod
+    def _validate_frame_window(
+        frame_start: Optional[int], frame_end: Optional[int]
+    ) -> tuple[Optional[int], Optional[int]]:
+        if frame_start is not None and (type(frame_start) is not int or frame_start < 0):
+            raise ValueError("frame_start 必须是非负整数")
+        if frame_end is not None and (type(frame_end) is not int or frame_end < 0):
+            raise ValueError("frame_end 必须是非负整数")
+        if frame_start is not None and frame_end is not None and frame_end < frame_start:
+            raise ValueError("frame_end 不能小于 frame_start")
+        return frame_start, frame_end
+
+    @staticmethod
+    def _load_video_frame_map(run_dir: Path) -> Optional[List[int]]:
+        map_path = run_dir / "video_frame_map.json"
+        if not map_path.is_file():
+            return None
+        payload = load_json_strict(map_path)
+        if not isinstance(payload, dict):
+            raise SchemaValidationError("video_frame_map.json 顶层必须是 JSON 对象")
+        raw_frames = payload.get("source_frames")
+        if not isinstance(raw_frames, list):
+            raise SchemaValidationError("video_frame_map.json 缺少合法的 source_frames 列表")
+        parsed: List[int] = []
+        prev = -1
+        for item in raw_frames:
+            if type(item) is not int or item < 0 or item <= prev:
+                raise SchemaValidationError("video_frame_map.json 的 source_frames 必须是严格递增非负整数")
+            parsed.append(item)
+            prev = item
+        return parsed
 
     def get_run_events(self, run_id: str, *, limit: Optional[int] = None) -> List[dict]:
         """严格读取指定运行目录的 events.jsonl 告警事件序列。"""
@@ -716,10 +786,18 @@ class AnalysisService:
         rows = load_jsonl_strict(events_path)
         return rows[:limit] if limit is not None else rows
 
-    def get_run_speeds_preview(self, run_id: str, *, limit: int = 100) -> dict:
-        """读取指定运行目录的 speeds.csv 前 N 行预览（确保无 NaN/Inf）。"""
+    def get_run_speeds_preview(
+        self,
+        run_id: str,
+        *,
+        limit: int = 100,
+        frame_start: Optional[int] = None,
+        frame_end: Optional[int] = None,
+    ) -> dict:
+        """读取指定运行目录的 speeds.csv 预览或指定帧区间样本（确保无 NaN/Inf）。"""
         if type(limit) is not int or limit < 1:
             raise ValueError("limit 必须是 >= 1 的整数")
+        self._validate_frame_window(frame_start, frame_end)
         run_dir = self._resolve_run_dir(run_id)
         csv_path = run_dir / "speeds.csv"
         if not csv_path.is_file():
@@ -729,16 +807,30 @@ class AnalysisService:
                 "preview_count": 0,
                 "total_rows": 0,
                 "truncated": False,
+                "frame_start": frame_start,
+                "frame_end": frame_end,
                 "rows": [],
             }
 
         rows: List[dict] = []
         total_rows = 0
+        matched_rows = 0
+        has_window = frame_start is not None or frame_end is not None
         with csv_path.open("r", encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
             columns = list(reader.fieldnames or [])
             for raw_row in reader:
                 total_rows += 1
+                if has_window:
+                    try:
+                        f_idx = int(raw_row.get("frame_idx", -1))
+                    except (TypeError, ValueError):
+                        continue
+                    if frame_start is not None and f_idx < frame_start:
+                        continue
+                    if frame_end is not None and f_idx > frame_end:
+                        continue
+                matched_rows += 1
                 if len(rows) >= limit:
                     continue
                 clean_row = {}
@@ -749,25 +841,81 @@ class AnalysisService:
                     else:
                         clean_row[col] = val
                 rows.append(clean_row)
+        denom = matched_rows if has_window else total_rows
         return {
             "run_id": run_id,
             "columns": columns,
             "preview_count": len(rows),
             "total_rows": total_rows,
-            "truncated": total_rows > len(rows),
+            "matched_rows": matched_rows,
+            "truncated": denom > len(rows),
+            "frame_start": frame_start,
+            "frame_end": frame_end,
             "rows": rows,
         }
 
-    def get_run_conflicts(self, run_id: str, *, limit: Optional[int] = 300) -> List[dict]:
-        """严格读取指定运行目录的 conflicts.jsonl 帧级冲突序列。"""
+    def get_run_conflicts_window(
+        self,
+        run_id: str,
+        *,
+        limit: Optional[int] = 300,
+        frame_start: Optional[int] = None,
+        frame_end: Optional[int] = None,
+    ) -> dict:
+        """按可选帧区间读取 conflicts.jsonl 并返回完整总数与截断标记。"""
         if limit is not None and (type(limit) is not int or limit < 0):
             raise ValueError("limit 必须是非负整数")
+        self._validate_frame_window(frame_start, frame_end)
         run_dir = self._resolve_run_dir(run_id)
         conflicts_path = run_dir / "conflicts.jsonl"
         if not conflicts_path.is_file():
-            return []
+            return {
+                "run_id": run_id,
+                "count": 0,
+                "total_count": 0,
+                "truncated": False,
+                "frame_start": frame_start,
+                "frame_end": frame_end,
+                "conflicts": [],
+            }
         rows = load_jsonl_strict(conflicts_path)
-        return rows[:limit] if limit is not None else rows
+        has_window = frame_start is not None or frame_end is not None
+        if has_window:
+            filtered = []
+            for rec in rows:
+                f_idx = rec.get("frame_index")
+                if type(f_idx) is not int:
+                    continue
+                if frame_start is not None and f_idx < frame_start:
+                    continue
+                if frame_end is not None and f_idx > frame_end:
+                    continue
+                filtered.append(rec)
+        else:
+            filtered = rows
+        sliced = filtered[:limit] if limit is not None else filtered
+        return {
+            "run_id": run_id,
+            "count": len(sliced),
+            "total_count": len(filtered),
+            "truncated": len(filtered) > len(sliced),
+            "frame_start": frame_start,
+            "frame_end": frame_end,
+            "conflicts": sliced,
+        }
+
+    def get_run_conflicts(
+        self,
+        run_id: str,
+        *,
+        limit: Optional[int] = 300,
+        frame_start: Optional[int] = None,
+        frame_end: Optional[int] = None,
+    ) -> List[dict]:
+        """严格读取指定运行目录的 conflicts.jsonl 帧级冲突序列。"""
+        return self.get_run_conflicts_window(
+            run_id, limit=limit, frame_start=frame_start, frame_end=frame_end
+        )["conflicts"]
 
     def get_run_video_path(self, run_id: str) -> Path:
         """校验并返回指定运行目录中标注输出视频 annotated_conflict.mp4 的安全路径。"""
@@ -780,15 +928,23 @@ class AnalysisService:
         return video_path
 
     def get_run_frame_jpeg(self, run_id: str, frame_index: int = 0) -> bytes:
-        """从历史运行输出视频按帧号截取一帧并编码为 JPEG 字节流。"""
+        """从历史运行输出视频按源帧号截取一帧并编码为 JPEG 字节流（兼容稀疏映射）。"""
         if type(frame_index) is not int or frame_index < 0:
             raise ValueError("frame_index 必须是非负整数")
+        run_dir = self._resolve_run_dir(run_id)
+        frame_map = self._load_video_frame_map(run_dir)
+        target_video_pos = frame_index
+        if frame_map is not None:
+            pos = bisect_left(frame_map, frame_index)
+            if pos >= len(frame_map) or frame_map[pos] != frame_index:
+                raise FileNotFoundError(f"未找到源帧 {frame_index} 对应的输出视频帧")
+            target_video_pos = pos
         video_path = self.get_run_video_path(run_id)
         cap = cv2.VideoCapture(str(video_path))
         try:
             if not cap.isOpened():
                 raise RuntimeError(f"无法打开运行视频文件: {video_path.name}")
-            cap.set(cv2.CAP_PROP_POS_FRAMES, float(frame_index))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, float(target_video_pos))
             ok, frame = cap.read()
             if not ok or frame is None:
                 raise FileNotFoundError(f"未找到指定视频帧: {frame_index}")
@@ -945,6 +1101,10 @@ class AnalysisService:
                 "queued_alerts": len(job.alert_queue),
                 "error": job.error,
                 "summary": job.summary,
+                "speed_model": job.speed_model,
+                "conflict_model": job.conflict_model,
+                "enable_stitching": job.enable_stitching,
+                "include_cyclist_vru": job.include_cyclist_vru,
             }
 
     def _get_job_obj(self, job_id: str) -> _ServiceJob:
@@ -1030,13 +1190,28 @@ class AnalysisService:
             live_reconnect_delay_s=live_reconnect_delay_s,
         )
 
+        out_dir_key = os.path.normcase(str(out_dir))
         job = _ServiceJob(
             job_id=job_id,
             source=src_label,
             output_dir=str(out_dir),
             status="queued",
+            speed_model=str(speed_model),
+            conflict_model=str(conflict_model),
+            enable_stitching=bool(enable_stitching),
+            include_cyclist_vru=bool(include_cyclist_vru),
         )
         with self._lock:
+            for owner_id, active_path in self._active_output_dirs.values():
+                if (
+                    out_dir == active_path
+                    or out_dir.is_relative_to(active_path)
+                    or active_path.is_relative_to(out_dir)
+                ):
+                    raise _ServiceConflictError(
+                        f"输出目录正被活动任务 {owner_id} 占用: {out_dir}"
+                    )
+            self._active_output_dirs[out_dir_key] = (job_id, out_dir)
             self._jobs[job_id] = job
 
         def _on_frame(frame_idx: int, timestamp_s: float, render_frame: Optional[np.ndarray]) -> bool:
@@ -1097,10 +1272,22 @@ class AnalysisService:
                     job.status = "failed"
                     job.finished_at = _iso_now()
                     job.cond.notify_all()
+            finally:
+                with self._lock:
+                    owner = self._active_output_dirs.get(out_dir_key)
+                    if owner is not None and owner[0] == job_id:
+                        del self._active_output_dirs[out_dir_key]
 
         worker = threading.Thread(target=_worker, name=f"AnalysisJob-{job_id}", daemon=True)
         job.thread = worker
-        worker.start()
+        try:
+            worker.start()
+        except Exception:
+            with self._lock:
+                owner = self._active_output_dirs.get(out_dir_key)
+                if owner is not None and owner[0] == job_id:
+                    del self._active_output_dirs[out_dir_key]
+            raise
         return self._job_to_dict(job)
 
     def get_job_status(self, job_id: str) -> dict:
@@ -1942,17 +2129,32 @@ def create_http_server(
                         return
                     if sub == "speeds":
                         limit = self._parse_int_query(query, "limit", 100)
+                        frame_start = self._parse_int_query(query, "frame_start", None)
+                        frame_end = self._parse_int_query(query, "frame_end", None)
                         assert limit is not None
-                        self._send_json(HTTPStatus.OK, service.get_run_speeds_preview(run_id, limit=limit))
+                        self._send_json(
+                            HTTPStatus.OK,
+                            service.get_run_speeds_preview(
+                                run_id,
+                                limit=limit,
+                                frame_start=frame_start,
+                                frame_end=frame_end,
+                            ),
+                        )
                         return
                     if sub == "conflicts":
                         limit = self._parse_int_query(query, "limit", 300)
-                        conflicts = service.get_run_conflicts(run_id, limit=limit)
-                        self._send_json(HTTPStatus.OK, {
-                            "run_id": run_id,
-                            "count": len(conflicts),
-                            "conflicts": conflicts,
-                        })
+                        frame_start = self._parse_int_query(query, "frame_start", None)
+                        frame_end = self._parse_int_query(query, "frame_end", None)
+                        self._send_json(
+                            HTTPStatus.OK,
+                            service.get_run_conflicts_window(
+                                run_id,
+                                limit=limit,
+                                frame_start=frame_start,
+                                frame_end=frame_end,
+                            ),
+                        )
                         return
                     if sub == "frame":
                         frame_index = self._parse_int_query(query, "index", 0)
@@ -2365,21 +2567,40 @@ def create_fastapi_app(service: Optional[AnalysisService] = None):
             _raise_http(exc)
 
     @app.get("/api/runs/{run_id}/speeds")
-    def run_speeds(run_id: str, limit: int = 100):
+    def run_speeds(
+        run_id: str,
+        limit: int = 100,
+        frame_start: Optional[int] = None,
+        frame_end: Optional[int] = None,
+    ):
         try:
-            return _json_response(svc.get_run_speeds_preview(run_id, limit=limit))
+            return _json_response(
+                svc.get_run_speeds_preview(
+                    run_id,
+                    limit=limit,
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                )
+            )
         except Exception as exc:
             _raise_http(exc)
 
     @app.get("/api/runs/{run_id}/conflicts")
-    def run_conflicts(run_id: str, limit: Optional[int] = 300):
+    def run_conflicts(
+        run_id: str,
+        limit: Optional[int] = 300,
+        frame_start: Optional[int] = None,
+        frame_end: Optional[int] = None,
+    ):
         try:
-            conflicts = svc.get_run_conflicts(run_id, limit=limit)
-            return _json_response({
-                "run_id": run_id,
-                "count": len(conflicts),
-                "conflicts": conflicts,
-            })
+            return _json_response(
+                svc.get_run_conflicts_window(
+                    run_id,
+                    limit=limit,
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                )
+            )
         except Exception as exc:
             _raise_http(exc)
 

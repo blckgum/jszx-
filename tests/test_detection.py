@@ -86,6 +86,69 @@ class DetectionContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "相同图片"):
                 audit_dataset(config, ("train", "val"))
 
+    def test_detect_handles_duplicate_vfr_pts_monotonically(self):
+        import types
+        from unittest import mock
+        import numpy as np
+        import cv2
+        import detection.core as det_core
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vid = root / "vfr.mp4"
+            vid.write_bytes(b"stub")
+            out_dir = root / "out"
+            pts_seq = [0.0, 40.0, 120.0, 120.0]
+            state = {"idx": -1}
+
+            fake_cap = mock.Mock()
+            fake_cap.isOpened.return_value = True
+
+            def _read():
+                state["idx"] += 1
+                if state["idx"] < len(pts_seq):
+                    return True, np.zeros((32, 32, 3), dtype=np.uint8)
+                return False, None
+
+            fake_cap.read.side_effect = _read
+            fake_cap.get.side_effect = lambda prop: (
+                25.0 if prop == cv2.CAP_PROP_FPS else pts_seq[min(state["idx"], len(pts_seq) - 1)]
+            )
+            fake_writer = mock.Mock()
+            fake_writer.isOpened.return_value = True
+
+            class _FakeBoxes:
+                def __len__(self):
+                    return 0
+
+                def __iter__(self):
+                    return iter(())
+
+            fake_result = types.SimpleNamespace(boxes=_FakeBoxes())
+            fake_model = mock.Mock()
+            fake_model.names = {0: "person", 2: "car"}
+            fake_model.predict.return_value = [fake_result]
+
+            args = types.SimpleNamespace(
+                source=str(vid), weights="unused.pt", tracker="bytetrack.yaml",
+                output=str(out_dir), classes=["person", "car"], conf=0.25, iou=0.7,
+                imgsz=640, device=None, max_frames=None, fps=None, show=False,
+            )
+            with mock.patch("detection.core.select_classes", return_value=[0, 2]), \
+                    mock.patch("cv2.VideoCapture", return_value=fake_cap), \
+                    mock.patch("cv2.VideoWriter", return_value=fake_writer), \
+                    mock.patch("detection.core.load_model", return_value=fake_model):
+                det_core.detect(args)
+
+            lines = [
+                det_core.json.loads(line)
+                for line in (out_dir / "detections.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(lines), 4)
+            self.assertAlmostEqual(lines[3]["timestamp_s"], 0.16, places=6)
+            self.assertEqual(lines[3]["timestamp_source"], "fps_estimate")
+
 
 if __name__ == "__main__":
     unittest.main()

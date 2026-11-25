@@ -226,8 +226,23 @@ class ConflictEventTracker:
         if self._last_timestamp_s is not None and timestamp_s <= self._last_timestamp_s:
             # 时间戳不递增会产生负的 start/end 跨度与事件时长
             raise ValueError("timestamp_s 必须逐帧严格递增")
+        prev_frame_idx = self._last_frame_idx
         self._last_frame_idx = frame_idx
         self._last_timestamp_s = timestamp_s
+
+        # 若上游存在跳帧，先按真实跳过帧数推进挂起打断与冷却累计，防止稀疏帧把长间隙误算作连续告警。
+        missed_frames = (frame_idx - prev_frame_idx - 1) if prev_frame_idx is not None else 0
+        if missed_frames > 0:
+            for key, st in list(self._states.items()):
+                st.pending.reset()
+                if st.event is not None:
+                    st.silent_streak += missed_frames
+                    if st.silent_streak > self.cooldown_frames:
+                        st.event.end_reason = "cooldown"
+                        self._finalized.append(st.event)
+                        del self._states[key]
+                else:
+                    del self._states[key]
 
         alarmed: Dict[EventKey, ConflictAssessment] = {}
         for c in conflicts:

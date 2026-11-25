@@ -238,6 +238,20 @@ class TestTrackletStitcher(unittest.TestCase):
         self.assertEqual(pairs_expired, [])
         self.assertEqual(st_pool.lost_count, 0)
 
+    def test_stitcher_prefers_maximum_cardinality_matching_over_greedy_min(self):
+        st = TrackletStitcher(max_gap_s=1.5, max_distance_m=2.0, max_mahalanobis=8.0, velocity_noise_ms=1.0)
+        st.resolve_frame(
+            [(1, "vehicle", "car", 0.0, 0.0), (2, "vehicle", "car", 2.5, 0.0)],
+            0.0,
+        )
+        st.resolve_frame([], 0.2)
+        id_map, pairs = st.resolve_frame(
+            [(11, "vehicle", "car", 0.7, 0.0), (12, "vehicle", "car", -1.3, 0.0)],
+            0.7,
+        )
+        self.assertEqual(id_map, {11: 2, 12: 1})
+        self.assertEqual(sorted(pairs), [(11, 2), (12, 1)])
+
     def test_revived_raw_id_cannot_hijack_active_stitched_canonical_id(self):
         # 验证旧 raw_id 复活后不得抢占已被新 raw_id 缝合继承的活跃 canonical_id
         st = TrackletStitcher(max_gap_s=1.0, max_distance_m=3.5, max_mahalanobis=3.5)

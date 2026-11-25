@@ -35,7 +35,8 @@
   --border-strong: rgba(237, 237, 237, 0.18);
   --border-control: rgba(237, 237, 237, 0.36);
 
-  --surface-hairline-top: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --surface-hairline-top-color: rgba(255, 255, 255, 0.06);
+  --surface-hairline-top: inset 0 1px 0 var(--surface-hairline-top-color);
 
   --accent: #e5a00d;
   --accent-text: #e5a00d;
@@ -79,7 +80,8 @@ html[data-theme="light"] {
   --border-strong: rgba(23, 23, 23, 0.20);
   --border-control: rgba(23, 23, 23, 0.45);
 
-  --surface-hairline-top: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  --surface-hairline-top-color: rgba(255, 255, 255, 0.72);
+  --surface-hairline-top: inset 0 1px 0 var(--surface-hairline-top-color);
 
   --accent: #925a00;
   --accent-text: #925a00;
@@ -118,7 +120,8 @@ html[data-theme="light"] {
     --border-strong: light-dark(rgba(23, 23, 23, 0.20), rgba(237, 237, 237, 0.18));
     --border-control: light-dark(rgba(23, 23, 23, 0.45), rgba(237, 237, 237, 0.36));
 
-    --surface-hairline-top: light-dark(inset 0 1px 0 rgba(255, 255, 255, 0.72), inset 0 1px 0 rgba(255, 255, 255, 0.06));
+    --surface-hairline-top-color: light-dark(rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.06));
+    --surface-hairline-top: inset 0 1px 0 var(--surface-hairline-top-color);
 
     --accent: light-dark(#925a00, #e5a00d);
     --accent-text: light-dark(#925a00, #e5a00d);
@@ -1498,6 +1501,27 @@ select.form-control:hover {
 .data-table tbody tr:hover td,
 .data-table tbody tr:hover th {
   background-color: var(--bg-raised);
+}
+
+.table-jump-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 6px;
+  margin: -2px -6px;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: color 140ms var(--ease-out), background-color 140ms var(--ease-out);
+}
+
+.table-jump-btn:hover,
+.table-jump-btn:focus-visible {
+  color: var(--accent-text);
+  background-color: var(--accent-soft);
 }
 
 .cell-wrap {

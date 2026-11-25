@@ -1341,6 +1341,163 @@ class TestPipelineCtrvAnchorAndLiveDropIntegration(unittest.TestCase):
             self.assertEqual(len(snap["vehicles"]), 1)
             self.assertEqual(snap["vehicles"][0]["trackId"], 1)
 
+    def test_sparse_video_frame_map_and_latest_frame_pts_and_csv_object_kind(self):
+        import csv as csv_mod
+        import threading
+        import time as time_mod
+        from analysis.service import LatestFrameCapture, _ServiceConflictError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cal = RoadCalibrator(
+                [(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)], 6.0, 15.0
+            )
+            vid = root / "src_color.mp4"
+            # 构造 6 帧色彩区分视频：帧 0 蓝、帧 2 绿、帧 4 红，便于断言稀疏抽取映射精准
+            colors = [
+                (250, 0, 0),
+                (120, 120, 120),
+                (0, 250, 0),
+                (120, 120, 120),
+                (0, 0, 250),
+                (120, 120, 120),
+            ]
+            writer = cv2.VideoWriter(str(vid), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (128, 96))
+            self.assertTrue(writer.isOpened())
+            for bgr in colors:
+                img = np.zeros((96, 128, 3), dtype=np.uint8)
+                img[:, :] = bgr
+                writer.write(img)
+            writer.release()
+
+            tracks_path = root / "sparse_tracks.jsonl"
+            sparse_frames = []
+            for f_idx, ts in ((0, 0.0), (2, 0.2), (4, 0.4)):
+                sparse_frames.append(json.dumps({
+                    "schema_version": 1,
+                    "session_id": "s-sparse",
+                    "source": str(vid),
+                    "frame_index": f_idx,
+                    "timestamp_s": ts,
+                    "timestamp_source": "video_pts",
+                    "width": 128,
+                    "height": 96,
+                    "tracks": [
+                        {
+                            "track_id": 1,
+                            "class_id": 5,
+                            "class_name": "bus",
+                            "category": "vehicle",
+                            "confidence": 0.9,
+                            "bbox_xyxy": [40.0, 40.0, 60.0, 70.0],
+                            "anchor_xy": [50.0, 70.0],
+                        },
+                        {
+                            "track_id": 2,
+                            "class_id": 1,
+                            "class_name": "bicycle",
+                            "category": "vehicle",
+                            "confidence": 0.9,
+                            "bbox_xyxy": [10.0, 20.0, 20.0, 40.0],
+                            "anchor_xy": [15.0, 40.0],
+                        },
+                    ],
+                }))
+            tracks_path.write_text("\n".join(sparse_frames) + "\n", encoding="utf-8")
+
+            runs_root = root / "runs"
+            run_out = runs_root / "run-sparse"
+            pipe = ConflictPerceptionPipeline(calibrator=cal)
+            summary = pipe.process_tracks(tracks_path, run_out, video_path=vid)
+            self.assertEqual(summary["frames_processed"], 3)
+            self.assertTrue((run_out / "video_frame_map.json").is_file())
+
+            with (run_out / "speeds.csv").open("r", encoding="utf-8", newline="") as f_csv:
+                csv_rows = list(csv_mod.DictReader(f_csv))
+            self.assertEqual(csv_rows[0]["object_kind"], "bus")
+            self.assertEqual(float(csv_rows[0]["length_m"]), 10.0)
+            self.assertEqual(csv_rows[1]["object_kind"], "bicycle")
+            self.assertEqual(float(csv_rows[1]["length_m"]), 1.8)
+
+            svc = AnalysisService(runs_root=runs_root)
+            for f_idx, exp_chan in ((0, 0), (2, 1), (4, 2)):
+                jpg = svc.get_run_frame_jpeg("run-sparse", frame_index=f_idx)
+                arr = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                patch = arr[82:92, 108:124].mean(axis=(0, 1))
+                self.assertEqual(int(np.argmax(patch)), exp_chan)
+            with self.assertRaises(FileNotFoundError):
+                svc.get_run_frame_jpeg("run-sparse", frame_index=1)
+            with self.assertRaises(FileNotFoundError):
+                svc.get_run_frame_jpeg("run-sparse", frame_index=5)
+
+            # LatestFrameCapture 原子配对 (frame, pts)：消费 40ms 帧期间后台提前到 80ms，仍取到 40ms PTS
+            adv_evt = threading.Event()
+            read_call = {"n": 0}
+            cur_pts = {"val": 0.0}
+
+            class _SyncStubCap:
+                def isOpened(self):
+                    return True
+
+                def read(self):
+                    read_call["n"] += 1
+                    n = read_call["n"]
+                    if n == 1:
+                        cur_pts["val"] = 40.0
+                        return True, np.full((8, 8, 3), 40, dtype=np.uint8)
+                    if n == 2:
+                        adv_evt.wait(timeout=2.0)
+                        cur_pts["val"] = 80.0
+                        return True, np.full((8, 8, 3), 80, dtype=np.uint8)
+                    return False, None
+
+                def get(self, prop):
+                    return cur_pts["val"]
+
+                def release(self):
+                    adv_evt.set()
+
+            lfc = LatestFrameCapture(_SyncStubCap(), read_timeout_s=1.0)
+            try:
+                ok1, frm1, pts1 = lfc.read_with_pts(timeout_s=1.0)
+                self.assertTrue(ok1)
+                self.assertEqual(int(frm1[0, 0, 0]), 40)
+                self.assertEqual(pts1, 40.0)
+                adv_evt.set()
+                time_mod.sleep(0.05)
+                self.assertEqual(lfc.get(cv2.CAP_PROP_POS_MSEC), 40.0)
+            finally:
+                lfc.release()
+
+            # start_job 活动输出目录并发互斥，返回 _ServiceConflictError (409)
+            started_evt = threading.Event()
+            release_evt = threading.Event()
+
+            class _SlowPipeline:
+                def __init__(self, **kwargs):
+                    pass
+
+                def process_video(self, **kwargs):
+                    started_evt.set()
+                    release_evt.wait(timeout=2.0)
+                    return {"status": "ok", "frames_processed": 0}
+
+            shared_out = runs_root / "shared-job-dir"
+            j1 = svc.start_job(
+                str(vid), calibrator=cal, output_dir=shared_out, pipeline_factory=_SlowPipeline
+            )
+            self.assertTrue(started_evt.wait(timeout=2.0))
+            with self.assertRaises(_ServiceConflictError):
+                svc.start_job(
+                    str(vid), calibrator=cal, output_dir=shared_out, pipeline_factory=_SlowPipeline
+                )
+            release_evt.set()
+            svc.stop_job(j1["job_id"], wait_timeout_s=2.0)
+            j2 = svc.start_job(
+                str(vid), calibrator=cal, output_dir=shared_out, pipeline_factory=_SlowPipeline
+            )
+            svc.stop_job(j2["job_id"], wait_timeout_s=2.0)
+
 
 if __name__ == "__main__":
     unittest.main()

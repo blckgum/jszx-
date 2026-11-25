@@ -994,6 +994,27 @@ class CliSchemaEvaluateHardeningTests(unittest.TestCase):
             self.assertEqual(gt_res["speed_accuracy"]["matched_count"], 0)
             self.assertEqual(gt_res["event_accuracy"]["tp"], 0)
 
+            # 5) evaluate_ground_truth 在存在唯一满匹配时必须达到最大 TP=2, F1=1.0
+            opt_res = evaluate_ground_truth(
+                {
+                    "schema_version": 1,
+                    "tolerance_s": 0.0,
+                    "expected_events": [
+                        {"kind": "conflict", "start_timestamp_s": 0.0, "end_timestamp_s": 10.0},
+                        {"kind": "conflict", "veh_track_id": 1, "start_timestamp_s": 6.0, "end_timestamp_s": 10.0},
+                    ],
+                },
+                speeds=[],
+                events=[
+                    {"kind": "conflict", "veh_track_id": 1, "ped_track_id": 2, "start_timestamp_s": 0.0, "end_timestamp_s": 10.0},
+                    {"kind": "conflict", "veh_track_id": 2, "ped_track_id": 2, "start_timestamp_s": 0.0, "end_timestamp_s": 5.0},
+                ],
+            )
+            self.assertEqual(opt_res["event_accuracy"]["tp"], 2)
+            self.assertEqual(opt_res["event_accuracy"]["fp"], 0)
+            self.assertEqual(opt_res["event_accuracy"]["fn"], 0)
+            self.assertAlmostEqual(opt_res["event_accuracy"]["f1"], 1.0, places=6)
+
     def test_pipeline_and_tools_reject_blank_paths_and_whitespace_track_fields(self):
         from analysis.evaluate import load_ground_truth, main as evaluate_main
         from analysis.interactive_calibrator import main as calib_main, run_interactive_calibration

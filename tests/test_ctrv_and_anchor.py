@@ -198,6 +198,30 @@ class TestVehicleAnchorBiasCompensation(unittest.TestCase):
         ex_x, ex_y = cal_cam.compensate_vehicle_anchor(1e308, 6.0, 4.5, 1.9, heading_deg=0.0)
         self.assertTrue(math.isfinite(ex_x) and math.isfinite(ex_y))
 
+    def test_ransac_rejected_outlier_does_not_alter_camera_ground_estimation_or_anchor(self):
+        inlier_img = [
+            (400.0, 300.0), (880.0, 300.0), (1150.0, 680.0),
+            (130.0, 680.0), (640.0, 490.0), (760.0, 560.0),
+        ]
+        base = RoadCalibrator(
+            [(400.0, 300.0), (880.0, 300.0), (1150.0, 680.0), (130.0, 680.0)],
+            6.0, 15.0,
+        )
+        inlier_gd = [base.pixel_to_ground(u, v) for u, v in inlier_img]
+        cal_clean = RoadCalibrator.from_correspondences(inlier_img, inlier_gd, use_ransac=True)
+        cal_outlier = RoadCalibrator.from_correspondences(
+            inlier_img + [(5000.0, 5000.0)],
+            inlier_gd + [(1.0, 1.0)],
+            use_ransac=True,
+        )
+        self.assertEqual(cal_clean.inlier_count, 6)
+        self.assertEqual(cal_outlier.inlier_count, 6)
+        self.assertEqual(cal_clean.estimate_camera_ground_xy(), cal_outlier.estimate_camera_ground_xy())
+        self.assertEqual(
+            cal_clean.compensate_vehicle_anchor(3.0, 8.0, 4.5, 1.9, heading_deg=90.0),
+            cal_outlier.compensate_vehicle_anchor(3.0, 8.0, 4.5, 1.9, heading_deg=90.0),
+        )
+
 
 class TestConstantTurnRateKalman2D(unittest.TestCase):
     def test_ctrv_jacobian_matches_finite_differences_across_regimes(self):

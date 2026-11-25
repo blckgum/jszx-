@@ -101,6 +101,17 @@ class TestMotEval(unittest.TestCase):
                 self.assertAlmostEqual(res["deta"], 1.0, places=6)
                 self.assertAlmostEqual(res["assa"], 1.0, places=6)
 
+    def test_clear_mot_maximizes_match_cardinality_before_iou_sum(self):
+        gt_boxes = [[i * 3.2, 0.0, i * 3.2 + 10.0, 10.0] for i in range(5)]
+        pred_boxes = [[(i - 1) * 3.2, 0.0, (i - 1) * 3.2 + 10.0, 10.0] for i in range(5)]
+        gt = {0: [{"track_id": i + 1, "bbox_xyxy": b} for i, b in enumerate(gt_boxes)]}
+        pred = {0: [{"track_id": i + 11, "bbox_xyxy": b} for i, b in enumerate(pred_boxes)]}
+        for use_lap in (True, False):
+            with self.subTest(use_lap=use_lap):
+                res = evaluate_mot(gt, pred, iou_threshold=0.5, _use_lap=use_lap)
+                self.assertEqual((res["tp"], res["fp"], res["fn"]), (5, 0, 0))
+                self.assertAlmostEqual(res["mota"], 1.0, places=6)
+
     def test_single_id_switch_penalizes_idsw_idf1_and_hota(self):
         # 单条 10 帧真值轨迹：前 6 帧分配 ID=1，后 4 帧发生 1 次 ID 切换变为 ID=2（框完全重合）
         gt = {f: [{"track_id": 1, "bbox_xyxy": [0.0, 0.0, 20.0, 20.0]}] for f in range(10)}

@@ -536,11 +536,43 @@ class TestConflictAnalyzer(unittest.TestCase):
         assessment = self.analyzer.evaluate_pair(veh, ped)
         self.assertIsNotNone(assessment)
         self.assertEqual(assessment.risk_level, RiskLevel.LEVEL_3_CRITICAL)
-        self.assertAlmostEqual(assessment.ttc_seconds, 1.0, delta=0.05)
-        self.assertAlmostEqual(assessment.min_distance_m, 0.0, delta=0.1)
+        # 两包络在中心重合 t=1.0s 前提前 R/v_rel = 3.0/sqrt(104) 秒首次接触，故 TTC≈0.706s
+        self.assertAlmostEqual(assessment.ttc_seconds, 1.0 - 3.0 / math.hypot(10.0, 2.0), delta=0.02)
+        self.assertAlmostEqual(assessment.min_distance_m, 0.0, delta=0.05)
         self.assertIsNotNone(assessment.conflict_ground_xy)
-        self.assertAlmostEqual(assessment.conflict_ground_xy[0], 3.0, delta=0.1)
-        self.assertAlmostEqual(assessment.conflict_ground_xy[1], 10.0, delta=0.1)
+        self.assertAlmostEqual(assessment.conflict_ground_xy[0], 3.0, delta=0.05)
+        self.assertAlmostEqual(assessment.conflict_ground_xy[1], 10.0 * assessment.ttc_seconds, delta=0.05)
+
+    def test_cvm_uses_first_envelope_contact_for_ttc_and_horizon(self):
+        # 4 m/s 直行接近静止行人，critical_dist=3.0m：
+        # 1) 初始间距 8m -> 首次包络接触 t=1.25s (L3)，CPA t=2.0s
+        veh_8 = SpeedReading(
+            track_id=1, category="vehicle", x_m=3.0, y_m=0.0,
+            vx_ms=0.0, vy_ms=4.0, speed_ms=4.0, speed_kmh=14.4,
+            is_speeding=False, heading_deg=90.0, is_reliable=True,
+        )
+        ped_8 = SpeedReading(
+            track_id=2, category="pedestrian", x_m=3.0, y_m=8.0,
+            vx_ms=0.0, vy_ms=0.0, speed_ms=0.0, speed_kmh=0.0,
+            is_speeding=False, heading_deg=0.0, is_reliable=True,
+        )
+        res_8 = self.analyzer.evaluate_pair(veh_8, ped_8)
+        self.assertIsNotNone(res_8)
+        self.assertEqual(res_8.risk_level, RiskLevel.LEVEL_3_CRITICAL)
+        self.assertAlmostEqual(res_8.ttc_seconds, 1.25, delta=1e-4)
+        self.assertAlmostEqual(res_8.min_distance_m, 0.0, delta=1e-4)
+
+        # 2) 初始间距 16m -> t_cpa=4.0s (>horizon 3.5s) 但首次包络接触 t=3.25s (<=3.5s, L2)
+        ped_16 = SpeedReading(
+            track_id=2, category="pedestrian", x_m=3.0, y_m=16.0,
+            vx_ms=0.0, vy_ms=0.0, speed_ms=0.0, speed_kmh=0.0,
+            is_speeding=False, heading_deg=0.0, is_reliable=True,
+        )
+        res_16 = self.analyzer.evaluate_pair(veh_8, ped_16)
+        self.assertIsNotNone(res_16)
+        self.assertEqual(res_16.risk_level, RiskLevel.LEVEL_2_CAUTION)
+        self.assertAlmostEqual(res_16.ttc_seconds, 3.25, delta=1e-4)
+        self.assertAlmostEqual(res_16.min_distance_m, 0.0, delta=1e-4)
 
     def test_analyzer_uses_own_speed_limit(self):
         # analyzer 用自身 speed_limit_kmh 重判而非信任 reading.is_speeding：
@@ -1058,6 +1090,27 @@ class TestConflictEventTracker(unittest.TestCase):
             tr.update([], 3, 0.4)
         with self.assertRaises(ValueError):
             tr.update([], 2, 0.5)
+
+    def test_sparse_frame_gap_resets_debounce_and_advances_cooldown(self):
+        # 1) confirm_frames=2 下，第 0 帧与第 10 帧中间缺帧 9 帧，不得连续确认开立事件
+        tr = ConflictEventTracker(confirm_frames=2, cooldown_frames=3)
+        self.assertEqual(tr.update([self._mk(1, 2, RiskLevel.LEVEL_3_CRITICAL, 1.0)], 0, 0.0), {})
+        self.assertEqual(tr.update([self._mk(1, 2, RiskLevel.LEVEL_3_CRITICAL, 1.0)], 10, 1.0), {})
+        tr.flush()
+        self.assertEqual(tr.pop_finalized(), [])
+
+        # 2) 已开立事件在中间缺帧 2 帧 (<=cooldown=3) 后延续并累计 gap_frames=2；缺帧 4 帧后按冷却归档
+        tr2 = ConflictEventTracker(confirm_frames=2, cooldown_frames=3)
+        tr2.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.0)], 0, 0.0)
+        ann = tr2.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.0)], 1, 0.1)
+        self.assertEqual(ann, {(1, 2): 1})
+        ann2 = tr2.update([self._mk(1, 2, RiskLevel.LEVEL_2_CAUTION, 2.0)], 4, 0.4)
+        self.assertEqual(ann2, {(1, 2): 1})
+        self.assertEqual(tr2.pop_finalized(), [])
+        tr2.update([], 9, 0.9)  # 跳过 5..8 共 4 帧 > cooldown=3，触发归档
+        (ev2,) = tr2.pop_finalized()
+        self.assertEqual(ev2.end_reason, "cooldown")
+        self.assertEqual(ev2.gap_frames, 2)
 
     def test_update_rejects_non_monotonic_timestamp(self):
         # 时间戳不递增会产生负的事件时长

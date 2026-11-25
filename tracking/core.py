@@ -208,16 +208,25 @@ class VideoClock:
         self.fps = fps
         self.force_fps = force_fps
         self.previous = -1.0
+        self.previous_frame_index = -1
 
     def timestamp(self, frame_index: int, milliseconds: float):
+        if frame_index <= self.previous_frame_index:
+            raise ValueError("视频时间戳不递增；检查输入或经确认后用 --fps 指定固定帧率")
         timestamp = milliseconds / 1000.0
         kind = "video_pts"
         if (self.force_fps or not math.isfinite(timestamp) or timestamp < 0
                 or timestamp <= self.previous):
-            timestamp, kind = frame_index / self.fps, "fps_estimate"
+            kind = "fps_estimate"
+            if self.force_fps or self.previous < 0:
+                timestamp = frame_index / self.fps
+            else:
+                step = (frame_index - self.previous_frame_index) / self.fps
+                timestamp = max(frame_index / self.fps, self.previous + step)
         if timestamp <= self.previous:
             raise ValueError("视频时间戳不递增；检查输入或经确认后用 --fps 指定固定帧率")
         self.previous = timestamp
+        self.previous_frame_index = frame_index
         return timestamp, kind
 
 

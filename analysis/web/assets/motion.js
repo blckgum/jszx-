@@ -1067,117 +1067,19 @@
         };
     }
 
-    function computeCpaAndTtc(veh, vru, horizonS, speedModel) {
-        var horizon = horizonS || 3.5;
-        var dt = 0.05;
-        var steps = Math.round(horizon / dt);
-        var model = String(speedModel || "ctrv").toLowerCase();
-
-        var psi = veh.headingRad;
-        var x = veh.x;
-        var y = veh.y;
-        var v = Math.hypot(veh.vx, veh.vy);
-        var a = veh.accelMs2 || 0;
-        var omega = veh.yawRate || 0;
-
-        if (model === "ema") {
-            v = v * 0.88;
-            a = 0;
-            omega = 0;
-        } else if (model === "kalman") {
-            omega = 0;
-        }
-
-        var px = vru.x;
-        var py = vru.y;
-        var pvx = vru.vx;
-        var pvy = vru.vy;
-
-        var halfL = (veh.lengthM || 4.5) * 0.5;
-        var halfW = (veh.widthM || 1.9) * 0.5;
-        var safeR = vru.radiusM || 0.42;
-
-        var currentDist = Math.hypot(px - x, py - y);
-        var minClearance = Infinity;
-        var bestX = x;
-        var bestY = y;
-        var ttc = null;
-
-        // If vehicle is effectively stationary and not overlapping right now, no TTC conflict
-        if (v < 0.25 && a <= 0.1) {
-            var dx0 = px - x;
-            var dy0 = py - y;
-            var c0 = Math.cos(psi);
-            var s0 = Math.sin(psi);
-            var lx0 = dx0 * c0 + dy0 * s0;
-            var ly0 = -dx0 * s0 + dy0 * c0;
-            var cx0 = clamp(lx0, -halfL, halfL);
-            var cy0 = clamp(ly0, -halfW, halfW);
-            var clear0 = Math.hypot(lx0 - cx0, ly0 - cy0) - safeR;
-            return {
-                currentDist: currentDist,
-                minDistanceM: Math.max(0, clear0),
-                ttcSeconds: clear0 <= 0.05 ? 0 : null,
-                conflictGroundXY: [x + cx0 * c0 - cy0 * s0, y + cx0 * s0 + cy0 * c0]
-            };
-        }
-
-        // Second-order deceleration rollout factor for realistic MTTC/TTC transition
-        var effA = a < 0 ? a * 0.72 : a;
-
-        for (var i = 0; i <= steps; i += 1) {
-            var t = i * dt;
-            var dx = (px + pvx * t) - x;
-            var dy = (py + pvy * t) - y;
-            var cosP = Math.cos(psi);
-            var sinP = Math.sin(psi);
-            var lx = dx * cosP + dy * sinP;
-            var ly = -dx * sinP + dy * cosP;
-            var cx = clamp(lx, -halfL, halfL);
-            var cy = clamp(ly, -halfW, halfW);
-            var clearance = Math.hypot(lx - cx, ly - cy) - safeR;
-
-            if (clearance < minClearance) {
-                minClearance = clearance;
-                bestX = x + (cx * cosP - cy * sinP + dx) * 0.5;
-                bestY = y + (cx * sinP + cy * cosP + dy) * 0.5;
-            }
-            if (ttc === null && clearance <= 0.12) {
-                ttc = t;
-            }
-
-            // Advance 2nd-order CTRV rollout step
-            var nextV = Math.max(0, v + effA * dt);
-            var avgV = 0.5 * (v + nextV);
-            if (Math.abs(omega) > 0.01) {
-                var nextPsi = psi + omega * dt;
-                x += (avgV / omega) * (Math.sin(nextPsi) - Math.sin(psi));
-                y += (avgV / omega) * (-Math.cos(nextPsi) + Math.cos(psi));
-                psi = nextPsi;
-            } else {
-                x += avgV * Math.cos(psi) * dt;
-                y += avgV * Math.sin(psi) * dt;
-            }
-            v = nextV;
-        }
-
-        return {
-            currentDist: currentDist,
-            minDistanceM: Math.max(0, minClearance),
-            ttcSeconds: ttc,
-            conflictGroundXY: [bestX, bestY]
-        };
+    function resolveHeadingRad(val, fallback) {
+        return isFiniteNum(val) ? val : (fallback !== undefined ? fallback : Math.PI * 0.5);
     }
 
-    function predictCtrvArc(veh, horizonS, steps, speedModel) {
-        var pts = [{ x: veh.x, y: veh.y, t: 0 }];
-        var count = steps || 15;
-        var dt = (horizonS || 2.5) / count;
+    function rolloutVehicleTrajectory(veh, horizonS, steps, speedModel) {
+        var count = steps || 35;
+        var totalHorizon = horizonS || 3.5;
+        var dt = totalHorizon / count;
         var model = String(speedModel || "ctrv").toLowerCase();
         var x = veh.x;
         var y = veh.y;
-        var psi = veh.headingRad;
-        var v = Math.hypot(veh.vx, veh.vy);
+        var psi = resolveHeadingRad(veh.headingRad, Math.PI * 0.5);
+        var v = Math.hypot(veh.vx || 0, veh.vy || 0);
         var a = veh.accelMs2 || 0;
         var omega = veh.yawRate || 0;
 
@@ -1189,6 +1091,7 @@
             omega = 0;
         }
 
+        var pts = [{ x: x, y: y, psi: psi, v: v, a: a, t: 0 }];
         for (var i = 1; i <= count; i += 1) {
             var nextV = Math.max(0, v + a * dt);
             var avgV = 0.5 * (v + nextV);
@@ -1202,12 +1105,90 @@
                 y += avgV * Math.sin(psi) * dt;
             }
             v = nextV;
-            pts.push({ x: x, y: y, t: i * dt });
+            pts.push({ x: x, y: y, psi: psi, v: v, a: a, t: i * dt });
         }
         return pts;
     }
 
-    var SCENARIO_CYCLE_S = 8.0;
+    function computeCpaAndTtc(veh, vru, horizonS, speedModel) {
+        var totalHorizon = horizonS || 3.5;
+        var steps = Math.max(1, Math.round(totalHorizon / 0.05));
+        var traj = rolloutVehicleTrajectory(veh, totalHorizon, steps, speedModel);
+        var x0 = traj[0].x;
+        var y0 = traj[0].y;
+        var psi0 = traj[0].psi;
+        var v0 = traj[0].v;
+        var a0 = traj[0].a;
+        var px = vru.x;
+        var py = vru.y;
+        var pvx = vru.vx;
+        var pvy = vru.vy;
+
+        var halfL = (veh.lengthM || 4.5) * 0.5;
+        var halfW = (veh.widthM || 1.9) * 0.5;
+        var safeR = vru.radiusM || 0.42;
+
+        var currentDist = Math.hypot(px - x0, py - y0);
+        var minClearance = Infinity;
+        var bestX = x0;
+        var bestY = y0;
+        var ttc = null;
+
+        // If vehicle is effectively stationary and not overlapping right now, no TTC conflict
+        if (v0 < 0.25 && a0 <= 0.1) {
+            var dx0 = px - x0;
+            var dy0 = py - y0;
+            var c0 = Math.cos(psi0);
+            var s0 = Math.sin(psi0);
+            var lx0 = dx0 * c0 + dy0 * s0;
+            var ly0 = -dx0 * s0 + dy0 * c0;
+            var cx0 = clamp(lx0, -halfL, halfL);
+            var cy0 = clamp(ly0, -halfW, halfW);
+            var clear0 = Math.hypot(lx0 - cx0, ly0 - cy0) - safeR;
+            return {
+                currentDist: currentDist,
+                minDistanceM: Math.max(0, clear0),
+                ttcSeconds: clear0 <= 0.05 ? 0 : null,
+                conflictGroundXY: [x0 + cx0 * c0 - cy0 * s0, y0 + cx0 * s0 + cy0 * c0]
+            };
+        }
+
+        for (var i = 0; i < traj.length; i += 1) {
+            var st = traj[i];
+            var t = st.t;
+            var dx = (px + pvx * t) - st.x;
+            var dy = (py + pvy * t) - st.y;
+            var cosP = Math.cos(st.psi);
+            var sinP = Math.sin(st.psi);
+            var lx = dx * cosP + dy * sinP;
+            var ly = -dx * sinP + dy * cosP;
+            var cx = clamp(lx, -halfL, halfL);
+            var cy = clamp(ly, -halfW, halfW);
+            var clearance = Math.hypot(lx - cx, ly - cy) - safeR;
+
+            if (clearance < minClearance) {
+                minClearance = clearance;
+                bestX = st.x + (cx * cosP - cy * sinP + dx) * 0.5;
+                bestY = st.y + (cx * sinP + cy * cosP + dy) * 0.5;
+            }
+            if (ttc === null && clearance <= 0.12) {
+                ttc = t;
+            }
+        }
+
+        return {
+            currentDist: currentDist,
+            minDistanceM: Math.max(0, minClearance),
+            ttcSeconds: ttc,
+            conflictGroundXY: [bestX, bestY]
+        };
+    }
+
+    function predictCtrvArc(veh, horizonS, steps, speedModel) {
+        return rolloutVehicleTrajectory(veh, horizonS || 2.5, steps || 15, speedModel);
+    }
+
+    var SCENARIO_CYCLE_S = 11.2;
 
     function isCyclistVruKind(item) {
         if (!item) return false;
@@ -1219,19 +1200,19 @@
         var psiTarget = Math.PI * 0.5;
         var v0 = 5.4;
         var omega0 = 0.28;
-        var tC = 0.20;
-        var a1 = -7.5;
+        var tC = 0.18;
+        var a1 = -7.0;
         var t1 = 0.50;
-        var a2 = -0.28;
-        var t2 = 1.65;
-        var a3 = -3.5;
+        var a2 = -0.40;
+        var t2 = 1.25;
+        var a3 = -3.4;
         var v1 = v0 + a1 * t1;
         var v2 = v1 + a2 * t2;
         var t1End = tC + t1;
         var t2End = t1End + t2;
         var tStop = t2End + v2 / (-a3);
-        var tGo = tStop + 1.55;
-        var accelDep = 1.60;
+        var tGo = tStop + 2.55;
+        var accelDep = 3.8;
 
         function phaseParams(tau, curPsi) {
             if (tau < tC) {
@@ -1253,8 +1234,8 @@
                 return { v: 0.0, a: 0.0, omega: 0.0 };
             }
             var u = tau - tGo;
-            var vDep = Math.min(2.6, accelDep * u);
-            var aDep = vDep < 2.6 ? accelDep : 0.0;
+            var vDep = Math.min(7.8, accelDep * u);
+            var aDep = vDep < 7.8 ? accelDep : 0.0;
             var err = curPsi - psiTarget;
             var omegaDep = (vDep > 0.05 && Math.abs(err) > 0.002)
                 ? -clamp(err * 1.4, -0.45, 0.45) * Math.min(1.0, vDep / 1.5)
@@ -1263,7 +1244,7 @@
         }
 
         var x = 1.40;
-        var y = 0.78;
+        var y = 0.60;
         var psi = Math.PI * 0.5;
         var steps = Math.max(1, Math.ceil(tSec / 0.02));
         var dtStep = tSec > 0 ? (tSec / steps) : 0;
@@ -1291,26 +1272,27 @@
             [[1.85, 2.2], [3.05, 2.2], [3.05, 6.8], [1.85, 6.8]]
         ];
         var stitchingOn = !(config && config.stitching === false);
+        var exitHideY = 17.6; // Far boundary beyond calibrated 15.0m + 2.6m apron
 
         if (scenarioId === "cyclist_vru_cutin") {
-            // Scenario 2: Cyclist blind-spot cut-in past parked car V-02 (bounded y in [0.72, 13.61])
-            var s2Tc = 0.15;
-            var s2V0 = 4.8;
+            // Scenario 2: Cyclist blind-spot cut-in past parked car V-02, departing clean past far boundary before wrap
+            var s2Tc = 0.22;
+            var s2V0 = 5.15;
             var s2A1 = -6.5;
-            var s2T1 = 0.45;
-            var s2A2 = -0.30;
-            var s2T2 = 1.65;
-            var s2A3 = -3.5;
-            var s2Y0 = 0.72;
+            var s2T1 = 0.50;
+            var s2A2 = -0.45;
+            var s2T2 = 1.25;
+            var s2A3 = -3.4;
+            var s2Y0 = 0.58;
             var s2Y1 = s2Y0 + s2V0 * s2Tc;
             var s2V1 = s2V0 + s2A1 * s2T1;
             var s2Y2 = s2Y1 + s2V0 * s2T1 + 0.5 * s2A1 * s2T1 * s2T1;
             var s2V2 = s2V1 + s2A2 * s2T2;
             var s2Y3 = s2Y2 + s2V1 * s2T2 + 0.5 * s2A2 * s2T2 * s2T2;
             var s2TStop = s2Tc + s2T1 + s2T2 + s2V2 / (-s2A3);
-            var s2TGo = s2TStop + 1.55;
+            var s2TGo = s2TStop + 2.60;
             var s2YStop = s2Y3 + 0.5 * s2V2 * s2V2 / (-s2A3);
-            var s2AccelDep = 1.50;
+            var s2AccelDep = 3.8;
 
             var suvY = s2Y0;
             var suvVy = s2V0;
@@ -1340,7 +1322,7 @@
                 suvY = s2YStop;
             } else {
                 var su4 = t - s2TGo;
-                var s2Ta = 1.80;
+                var s2Ta = 2.40;
                 if (su4 < s2Ta) {
                     suvAy = s2AccelDep;
                     suvVy = suvAy * su4;
@@ -1352,23 +1334,25 @@
                 }
             }
 
-            vehicles.push({
-                trackId: 1,
-                kind: "suv",
-                x: -0.32,
-                y: suvY,
-                vx: 0,
-                vy: suvVy,
-                ax: 0,
-                ay: suvAy,
-                accelMs2: suvAy,
-                headingRad: Math.PI * 0.5,
-                yawRate: 0,
-                lengthM: 4.7,
-                widthM: 1.95,
-                speedKmh: suvVy * 3.6,
-                inParkingZone: false
-            });
+            if (suvY - 2.35 <= exitHideY) {
+                vehicles.push({
+                    trackId: 1,
+                    kind: "suv",
+                    x: -0.32,
+                    y: suvY,
+                    vx: 0,
+                    vy: suvVy,
+                    ax: 0,
+                    ay: suvAy,
+                    accelMs2: suvAy,
+                    headingRad: Math.PI * 0.5,
+                    yawRate: 0,
+                    lengthM: 4.7,
+                    widthM: 1.95,
+                    speedKmh: suvVy * 3.6,
+                    inParkingZone: false
+                });
+            }
 
             vehicles.push({
                 trackId: 2,
@@ -1388,11 +1372,11 @@
                 inParkingZone: true
             });
 
-            // Cyclist B-12 emerges past parked car V-02 laterally across SUV lane
+            // Cyclist B-12 emerges past parked car V-02 laterally across SUV lane and exits cleanly past far horizon
             var bX0 = 2.85;
             var bY0 = 9.05;
-            var bVx1 = -0.42;
-            var bTTurn = 1.40;
+            var bVx1 = -0.45;
+            var bTTurn = 1.35;
             var bVx2 = -1.45;
             var cycX, cycY, cycVx, cycVy = 0.14;
             if (t < bTTurn) {
@@ -1409,27 +1393,30 @@
                     var dtDone = (-2.65 - bxTurn) / bVx2;
                     cycX = -2.65;
                     cycVx = 0.0;
-                    cycVy = 0.85;
-                    cycY = byTurn + 0.14 * dtDone + 0.85 * (t - bTTurn - dtDone);
+                    cycVy = 1.65;
+                    cycY = byTurn + 0.14 * dtDone + cycVy * (t - bTTurn - dtDone);
                 }
             }
             var cycTrackId = (!stitchingOn && t >= 1.15) ? 19 : 12;
 
-            vrus.push({
-                trackId: cycTrackId,
-                kind: "bicycle",
-                category: "bicycle",
-                x: cycX,
-                y: cycY,
-                vx: cycVx,
-                vy: cycVy,
-                radiusM: 0.50,
-                lengthM: 1.8,
-                widthM: 0.7,
-                headingRad: Math.atan2(cycVy, cycVx)
-            });
+            if (cycY - 0.9 <= exitHideY) {
+                vrus.push({
+                    trackId: cycTrackId,
+                    kind: "bicycle",
+                    category: "bicycle",
+                    x: cycX,
+                    y: cycY,
+                    vx: cycVx,
+                    vy: cycVy,
+                    radiusM: 0.50,
+                    lengthM: 1.8,
+                    widthM: 0.7,
+                    headingRad: Math.atan2(cycVy, cycVx)
+                });
+            }
 
-            var ped5Omega = Math.PI * 0.25;
+            // Periodic over SCENARIO_CYCLE_S so sidewalk pedestrian never snaps at cycle wrap
+            var ped5Omega = (2 * Math.PI) / SCENARIO_CYCLE_S;
             vrus.push({
                 trackId: 5,
                 kind: "pedestrian",
@@ -1441,29 +1428,31 @@
                 radiusM: 0.40
             });
         } else if (scenarioId === "ctrv_curve_yield") {
-            // Scenario 3: S-curve CTRV yield trajectory with lane counter-steer and safe crosswalk clearance
+            // Scenario 3: S-curve CTRV yield trajectory with lane counter-steer and off-screen departure
             parkingZones = [];
             var ctrv = integrateCtrvState(t);
 
-            vehicles.push({
-                trackId: 1,
-                kind: "car",
-                x: ctrv.x,
-                y: ctrv.y,
-                vx: Math.cos(ctrv.psi) * ctrv.v,
-                vy: Math.sin(ctrv.psi) * ctrv.v,
-                ax: Math.cos(ctrv.psi) * ctrv.a,
-                ay: Math.sin(ctrv.psi) * ctrv.a,
-                accelMs2: ctrv.a,
-                headingRad: ctrv.psi,
-                yawRate: ctrv.omega,
-                lengthM: 4.5,
-                widthM: 1.9,
-                speedKmh: ctrv.v * 3.6,
-                inParkingZone: false
-            });
+            if (ctrv.y - 2.25 <= exitHideY) {
+                vehicles.push({
+                    trackId: 1,
+                    kind: "car",
+                    x: ctrv.x,
+                    y: ctrv.y,
+                    vx: Math.cos(ctrv.psi) * ctrv.v,
+                    vy: Math.sin(ctrv.psi) * ctrv.v,
+                    ax: Math.cos(ctrv.psi) * ctrv.a,
+                    ay: Math.sin(ctrv.psi) * ctrv.a,
+                    accelMs2: ctrv.a,
+                    headingRad: ctrv.psi,
+                    yawRate: ctrv.omega,
+                    lengthM: 4.5,
+                    widthM: 1.9,
+                    speedKmh: ctrv.v * 3.6,
+                    inParkingZone: false
+                });
+            }
 
-            // Pedestrian P-04 crosses centered on zebra crosswalk (y=9.40m) onto left sidewalk (x=-2.90m)
+            // Pedestrian P-04 crosses zebra crosswalk and exits off left sidewalk beyond t=8.2s
             var pedX, pedVx;
             if (t <= 1.45) {
                 pedVx = -0.44;
@@ -1476,26 +1465,28 @@
                 pedX = -2.90;
                 pedVx = 0.0;
             }
-            vrus.push({
-                trackId: 4,
-                kind: "pedestrian",
-                category: "pedestrian",
-                x: pedX,
-                y: 9.40,
-                vx: pedVx,
-                vy: 0,
-                radiusM: 0.42
-            });
+            if (t <= 8.2) {
+                vrus.push({
+                    trackId: 4,
+                    kind: "pedestrian",
+                    category: "pedestrian",
+                    x: pedX,
+                    y: 9.40,
+                    vx: pedVx,
+                    vy: 0,
+                    radiusM: 0.42
+                });
+            }
         } else {
-            // Scenario 1 (default): Crosswalk emergency braking (30.8 km/h L1 -> L2 -> L3 -> 1.55s yield -> L0 depart)
+            // Scenario 1 (default): Crosswalk two-stage braking (L2 early caution -> L3 critical brake -> yield -> depart)
             var s1Tc = 0.15;
-            var s1V0 = 8.55;
-            var s1A1 = -14.5;
-            var s1T1 = 0.50;
-            var s1A2 = -0.40;
-            var s1T2 = 1.70;
-            var s1A3 = -3.5;
-            var s1Y0 = 0.68;
+            var s1V0 = 2.95;
+            var s1A1 = -0.30;
+            var s1T1 = 0.70;
+            var s1A2 = -0.25;
+            var s1T2 = 0.70;
+            var s1A3 = -3.2;
+            var s1Y0 = 0.50;
             var s1Y1 = s1Y0 + s1V0 * s1Tc;
             var s1V1 = s1V0 + s1A1 * s1T1;
             var s1Y2 = s1Y1 + s1V0 * s1T1 + 0.5 * s1A1 * s1T1 * s1T1;
@@ -1503,8 +1494,8 @@
             var s1Y3 = s1Y2 + s1V1 * s1T2 + 0.5 * s1A2 * s1T2 * s1T2;
             var s1YStop = s1Y3 + 0.5 * s1V2 * s1V2 / (-s1A3);
             var s1TStop = s1Tc + s1T1 + s1T2 + s1V2 / (-s1A3);
-            var s1TGo = s1TStop + 1.60;
-            var s1AccelDep = 1.12;
+            var s1TGo = s1TStop + 2.35;
+            var s1AccelDep = 3.6;
 
             var vY = s1Y0;
             var vSpeedMs = s1V0;
@@ -1535,7 +1526,7 @@
                 vAccel = 0.0;
             } else {
                 var b4 = t - s1TGo;
-                var s1Ta = 2.20;
+                var s1Ta = 2.40;
                 if (b4 < s1Ta) {
                     vAccel = s1AccelDep;
                     vSpeedMs = vAccel * b4;
@@ -1547,50 +1538,54 @@
                 }
             }
 
-            vehicles.push({
-                trackId: 1,
-                kind: "car",
-                x: -0.65,
-                y: vY,
-                vx: 0,
-                vy: vSpeedMs,
-                ax: 0,
-                ay: vAccel,
-                accelMs2: vAccel,
-                headingRad: Math.PI * 0.5,
-                yawRate: 0,
-                lengthM: 4.5,
-                widthM: 1.9,
-                speedKmh: vSpeedMs * 3.6,
-                inParkingZone: false
-            });
+            if (vY - 2.25 <= exitHideY) {
+                vehicles.push({
+                    trackId: 1,
+                    kind: "car",
+                    x: -0.65,
+                    y: vY,
+                    vx: 0,
+                    vy: vSpeedMs,
+                    ax: 0,
+                    ay: vAccel,
+                    accelMs2: vAccel,
+                    headingRad: Math.PI * 0.5,
+                    yawRate: 0,
+                    lengthM: 4.5,
+                    widthM: 1.9,
+                    speedKmh: vSpeedMs * 3.6,
+                    inParkingZone: false
+                });
+            }
 
-            // Pedestrian P-07 steps from right sidewalk across zebra crosswalk (y=9.40m) and clears onto left curb
+            // Pedestrian P-07 clears zebra crosswalk cleanly onto left sidewalk before departure
             var p7x, p7vx;
-            if (t < 2.22) {
-                p7vx = -1.15;
+            if (t < 1.90) {
+                p7vx = -1.30;
                 p7x = 2.80 + p7vx * t;
             } else {
-                p7vx = -1.75;
-                p7x = (2.80 - 1.15 * 2.22) + p7vx * (t - 2.22);
+                p7vx = -1.90;
+                p7x = (2.80 - 1.30 * 1.90) + p7vx * (t - 1.90);
             }
             if (p7x <= -2.90) {
                 p7x = -2.90;
                 p7vx = 0.0;
             }
+            if (t <= 8.2) {
+                vrus.push({
+                    trackId: 7,
+                    kind: "pedestrian",
+                    category: "pedestrian",
+                    x: p7x,
+                    y: 9.40,
+                    vx: p7vx,
+                    vy: 0,
+                    radiusM: 0.42
+                });
+            }
 
-            vrus.push({
-                trackId: 7,
-                kind: "pedestrian",
-                category: "pedestrian",
-                x: p7x,
-                y: 9.40,
-                vx: p7vx,
-                vy: 0,
-                radiusM: 0.42
-            });
-
-            var p3Omega = Math.PI * 0.25;
+            // Periodic over SCENARIO_CYCLE_S so sidewalk pedestrian P-03 has smooth closed loop
+            var p3Omega = (2 * Math.PI) / SCENARIO_CYCLE_S;
             vrus.push({
                 trackId: 3,
                 kind: "pedestrian",
@@ -1607,7 +1602,8 @@
             bounds: { xMin: -3.2, xMax: 3.2, yMin: 0.0, yMax: 15.0 },
             parkingZones: parkingZones,
             vehicles: vehicles,
-            vrus: vrus
+            vrus: vrus,
+            cycleFade: t < 0.25 ? (t / 0.25) : 1.0
         };
     }
 
@@ -1645,6 +1641,7 @@
 
         // 0.5m PET spatial occupancy grid & swept centerline vehicle trails
         this._petCells = Object.create(null);
+        this._lastPetTimeS = null;
         this._vehTrails = Object.create(null);
         this._replayPrevTracks = Object.create(null);
         this._lastReplayFrameIdx = -1;
@@ -1790,13 +1787,21 @@
 
     CampusRoadTwinCanvas.prototype._recordPetGrid = function (vehicles, vrus, timeS) {
         var cellSize = 0.5;
+        if (this._lastPetTimeS !== null && timeS < this._lastPetTimeS - 1e-6) {
+            this._petCells = Object.create(null);
+            this._lastPetTimeS = null;
+        }
+        var prevTimeS = this._lastPetTimeS !== null ? this._lastPetTimeS : timeS;
+
+        var curVehMap = Object.create(null);
         for (var vi = 0; vi < vehicles.length; vi += 1) {
             var v = vehicles[vi];
             if (v.inParkingZone || (v.speedKmh !== undefined && v.speedKmh < 0.4)) continue;
             var halfL = (v.lengthM || 4.5) * 0.5;
             var halfW = (v.widthM || 1.9) * 0.5;
-            var cosP = Math.cos(v.headingRad || 0);
-            var sinP = Math.sin(v.headingRad || 0);
+            var hRad = resolveHeadingRad(v.headingRad, Math.PI * 0.5);
+            var cosP = Math.cos(hRad);
+            var sinP = Math.sin(hRad);
 
             for (var lx = -halfL; lx <= halfL + 0.01; lx += cellSize) {
                 for (var ly = -halfW; ly <= halfW + 0.01; ly += cellSize) {
@@ -1805,65 +1810,113 @@
                     var cx = Math.floor(gx / cellSize);
                     var cy = Math.floor(gy / cellSize);
                     var key = cx + "," + cy;
-                    var existing = this._petCells[key];
-                    if (!existing) {
-                        this._petCells[key] = {
-                            cx: cx,
-                            cy: cy,
-                            vehId: v.trackId,
-                            vehTime: timeS,
-                            vruId: null,
-                            vruTime: -999,
-                            petS: null
-                        };
-                    } else {
-                        existing.vehId = v.trackId;
-                        existing.vehTime = timeS;
-                        if (existing.vruId !== null && timeS >= existing.vruTime && (timeS - existing.vruTime) <= 2.2) {
-                            var dPet = Math.max(0.05, timeS - existing.vruTime);
-                            if (existing.petS === null || dPet < existing.petS) {
-                                existing.petS = dPet;
-                            }
-                        }
-                    }
+                    curVehMap[key] = { cx: cx, cy: cy, id: v.trackId };
                 }
             }
         }
 
+        var curVruMap = Object.create(null);
         for (var pi = 0; pi < vrus.length; pi += 1) {
             var p = vrus[pi];
             var pcx = Math.floor(p.x / cellSize);
             var pcy = Math.floor(p.y / cellSize);
             var pkey = pcx + "," + pcy;
-            var cell = this._petCells[pkey];
-            if (!cell) {
-                this._petCells[pkey] = {
-                    cx: pcx,
-                    cy: pcy,
-                    vehId: null,
+            curVruMap[pkey] = { cx: pcx, cy: pcy, id: p.trackId };
+        }
+
+        var existingKeys = Object.keys(this._petCells);
+        for (var ei = 0; ei < existingKeys.length; ei += 1) {
+            var ek = existingKeys[ei];
+            var cell = this._petCells[ek];
+            var curVeh = curVehMap[ek];
+            var curVru = curVruMap[ek];
+
+            if (cell.vehActiveId !== null && (!curVeh || curVeh.id !== cell.vehActiveId)) {
+                cell.vehLastExitId = cell.vehActiveId;
+                cell.vehLastExitTime = prevTimeS;
+                cell.vehActiveId = null;
+            }
+            if (cell.vruActiveId !== null && (!curVru || curVru.id !== cell.vruActiveId)) {
+                cell.vruLastExitId = cell.vruActiveId;
+                cell.vruLastExitTime = prevTimeS;
+                cell.vruActiveId = null;
+            }
+        }
+
+        var touchedKeys = Object.keys(curVehMap);
+        var vruKeys = Object.keys(curVruMap);
+        for (var vi2 = 0; vi2 < vruKeys.length; vi2 += 1) {
+            if (!curVehMap[vruKeys[vi2]]) touchedKeys.push(vruKeys[vi2]);
+        }
+
+        for (var ti = 0; ti < touchedKeys.length; ti += 1) {
+            var tk = touchedKeys[ti];
+            var cv = curVehMap[tk] || null;
+            var cu = curVruMap[tk] || null;
+            var rec = this._petCells[tk];
+            if (!rec) {
+                var coord = cv || cu;
+                rec = {
+                    cx: coord.cx,
+                    cy: coord.cy,
+                    vehActiveId: null,
+                    vruActiveId: null,
+                    vehLastExitId: null,
+                    vehLastExitTime: -999,
+                    vruLastExitId: null,
+                    vruLastExitTime: -999,
                     vehTime: -999,
-                    vruId: p.trackId,
-                    vruTime: timeS,
-                    petS: null
+                    vruTime: -999,
+                    petS: null,
+                    petVehId: null,
+                    petVruId: null,
+                    petTime: -999
                 };
-            } else if (cell.vehId !== null && cell.vehTime <= timeS && (timeS - cell.vehTime) <= 2.4) {
-                cell.vruId = p.trackId;
-                cell.vruTime = timeS;
-                cell.petS = Math.max(0.05, timeS - cell.vehTime);
-            } else {
-                cell.vruId = p.trackId;
-                cell.vruTime = timeS;
+                this._petCells[tk] = rec;
+            }
+
+            if (cv && cu) {
+                // 车辆与 VRU 同帧同时占用该格属于并行重叠，不记作先后通行的正值 PET
+                rec.vehActiveId = cv.id;
+                rec.vruActiveId = cu.id;
+                rec.vehTime = timeS;
+                rec.vruTime = timeS;
+            } else if (cv) {
+                rec.vehActiveId = cv.id;
+                rec.vehTime = timeS;
+                if (rec.vruActiveId === null && rec.vruLastExitId !== null && timeS > rec.vruLastExitTime) {
+                    var dtV = timeS - rec.vruLastExitTime;
+                    if (dtV > 0 && dtV <= 2.2 && (rec.petS === null || dtV < rec.petS)) {
+                        rec.petS = dtV;
+                        rec.petVehId = cv.id;
+                        rec.petVruId = rec.vruLastExitId;
+                        rec.petTime = timeS;
+                    }
+                }
+            } else if (cu) {
+                rec.vruActiveId = cu.id;
+                rec.vruTime = timeS;
+                if (rec.vehActiveId === null && rec.vehLastExitId !== null && timeS > rec.vehLastExitTime) {
+                    var dtU = timeS - rec.vehLastExitTime;
+                    if (dtU > 0 && dtU <= 2.4 && (rec.petS === null || dtU < rec.petS)) {
+                        rec.petS = dtU;
+                        rec.petVehId = rec.vehLastExitId;
+                        rec.petVruId = cu.id;
+                        rec.petTime = timeS;
+                    }
+                }
             }
         }
 
         // Prune cells older than 3.6s to keep map clean and bounded
         var keys = Object.keys(this._petCells);
         for (var k = 0; k < keys.length; k += 1) {
-            var rec = this._petCells[keys[k]];
-            if (timeS - Math.max(rec.vehTime, rec.vruTime) > 3.6) {
+            var cRec = this._petCells[keys[k]];
+            if (timeS - Math.max(cRec.vehTime, cRec.vruTime, cRec.vehLastExitTime, cRec.vruLastExitTime) > 3.6) {
                 delete this._petCells[keys[k]];
             }
         }
+        this._lastPetTimeS = timeS;
     };
 
     CampusRoadTwinCanvas.prototype._evaluateSimulation = function (simData, timeS, cycleIdx) {
@@ -1885,13 +1938,14 @@
         var pairPet = Object.create(null);
         if (useCvmCircle) {
             this._petCells = Object.create(null);
+            this._lastPetTimeS = null;
         } else {
             this._recordPetGrid(simData.vehicles, activeVrus, timeS);
             var cellKeys = Object.keys(this._petCells);
             for (var c = 0; c < cellKeys.length; c += 1) {
                 var cell = this._petCells[cellKeys[c]];
-                if (cell.petS !== null && timeS - cell.vruTime <= 1.8) {
-                    var pk = cell.vehId + ":" + cell.vruId;
+                if (cell.petS !== null && cell.petVehId !== null && cell.petVruId !== null && (timeS - cell.petTime <= 1.8)) {
+                    var pk = cell.petVehId + ":" + cell.petVruId;
                     if (pairPet[pk] === undefined || cell.petS < pairPet[pk]) {
                         pairPet[pk] = cell.petS;
                     }
@@ -2069,7 +2123,8 @@
             simTimeS: timeS,
             maxRisk: maxRisk,
             speedModel: speedModel,
-            conflictModel: useCvmCircle ? "cvm_circle" : "obb_ssm"
+            conflictModel: useCvmCircle ? "cvm_circle" : "obb_ssm",
+            cycleFade: simData.cycleFade !== undefined ? simData.cycleFade : 1.0
         };
     };
 
@@ -2087,6 +2142,7 @@
         if (cycleIdx !== prevCycleIdx) {
             // Reset PET grid and swept trails cleanly on scenario cycle restart
             this._petCells = Object.create(null);
+            this._lastPetTimeS = null;
             this._vehTrails = Object.create(null);
         }
         var cycleTime = ((this._simTimeS % SCENARIO_CYCLE_S) + SCENARIO_CYCLE_S) % SCENARIO_CYCLE_S;
@@ -2409,8 +2465,9 @@
             var ovPx = toPx(ov.x, ov.y);
             var oLen = Math.max(14, (ov.lengthM || 4.5) * scale);
             var oWid = Math.max(8, (ov.widthM || 1.9) * scale);
-            var cosA = Math.abs(Math.cos(ov.headingRad || Math.PI * 0.5));
-            var sinA = Math.abs(Math.sin(ov.headingRad || Math.PI * 0.5));
+            var ovHead = resolveHeadingRad(ov.headingRad, Math.PI * 0.5);
+            var cosA = Math.abs(Math.cos(ovHead));
+            var sinA = Math.abs(Math.sin(ovHead));
             var bW = oLen * cosA + oWid * sinA;
             var bH = oLen * sinA + oWid * cosA;
             obstacleBoxes.push({ x: ovPx.x - bW * 0.5, y: ovPx.y - bH * 0.5, w: bW, h: bH });
@@ -2623,7 +2680,7 @@
             }
         }
 
-        // Draw rounded OBB vehicles (record pill tasks for collision-free layout)
+        // Draw rounded OBB vehicles (clipped inside calibrated road viewport; record pill tasks for collision-free layout)
         var pendingVehiclePills = [];
         for (var vi2 = 0; vi2 < st.vehicles.length; vi2 += 1) {
             var v = st.vehicles[vi2];
@@ -2634,10 +2691,14 @@
             var lenPx = Math.max(14, (v.lengthM || 4.5) * scale);
             var widPx = Math.max(8, (v.widthM || 1.9) * scale);
             var cornerPx = Math.min(lenPx, widPx) * 0.22;
+            var vehHeading = resolveHeadingRad(v.headingRad, Math.PI * 0.5);
 
             ctx.save();
+            if (!v.inParkingZone && isFiniteNum(st.cycleFade) && st.cycleFade < 1.0) {
+                ctx.globalAlpha = clamp(st.cycleFade, 0.05, 1.0);
+            }
             ctx.translate(vPx.x, vPx.y);
-            ctx.rotate(-(v.headingRad || Math.PI * 0.5));
+            ctx.rotate(-vehHeading);
 
             drawRoundedRectPath(ctx, -lenPx * 0.5, -widPx * 0.5, lenPx, widPx, cornerPx);
             ctx.fillStyle = withAlpha(vColor, v.inParkingZone ? 0.14 : 0.20);
@@ -2674,18 +2735,20 @@
             ctx.fill();
             ctx.restore();
 
-            var spdDisplay = isFiniteNum(v.speedKmh) ? v.speedKmh.toFixed(1) + "km/h" : "0.0km/h";
-            var badgeText = "V-" + padId(v.trackId) + " " + spdDisplay;
-            var cosV = Math.abs(Math.cos(v.headingRad || Math.PI * 0.5));
-            var sinV = Math.abs(Math.sin(v.headingRad || Math.PI * 0.5));
-            pendingVehiclePills.push({
-                cx: vPx.x,
-                cy: vPx.y,
-                rx: (lenPx * cosV + widPx * sinV) * 0.5,
-                ry: (lenPx * sinV + widPx * cosV) * 0.5,
-                text: badgeText,
-                border: withAlpha(vColor, 0.55)
-            });
+            if (v.y <= b.yMax + 0.5) {
+                var spdDisplay = isFiniteNum(v.speedKmh) ? v.speedKmh.toFixed(1) + "km/h" : "0.0km/h";
+                var badgeText = "V-" + padId(v.trackId) + " " + spdDisplay;
+                var cosV = Math.abs(Math.cos(vehHeading));
+                var sinV = Math.abs(Math.sin(vehHeading));
+                pendingVehiclePills.push({
+                    cx: clamp(vPx.x, safeArea.minX + 12, safeArea.maxX - 12),
+                    cy: clamp(vPx.y, safeArea.minY + 12, safeArea.maxY - 12),
+                    rx: (lenPx * cosV + widPx * sinV) * 0.5,
+                    ry: (lenPx * sinV + widPx * cosV) * 0.5,
+                    text: badgeText,
+                    border: withAlpha(vColor, 0.55)
+                });
+            }
         }
 
         // Draw pedestrian / cyclist VRUs (record pill tasks for collision-free layout)
@@ -4889,7 +4952,7 @@
             var hw = (v.widthM || 1.9) * 0.5;
             var vh = v.kind === "bus" ? 2.85 : (v.kind === "truck" ? 2.55 : (v.kind === "suv" ? 1.66 : 1.46));
             var beltZ = v.kind === "bus" ? 1.32 : vh * 0.56;
-            var hRad = v.headingRad !== undefined ? v.headingRad : Math.PI * 0.5;
+            var hRad = resolveHeadingRad(v.headingRad, Math.PI * 0.5);
             var cosH = Math.cos(hRad);
             var sinH = Math.sin(hRad);
 
@@ -5208,8 +5271,8 @@
             }
         }
 
-        // Far-extending asphalt carriageway & sidewalks
-        var farY = b.yMax + 10.0;
+        // Far-extending asphalt carriageway & sidewalks (farY aligned with scenario exit boundary)
+        var farY = b.yMax + 2.6;
         var nearY = Math.max(camY + 1.2, b.yMin - 1.5);
         fillPolyPts(
             [[b.xMin - 1.8, nearY], [b.xMax + 1.8, nearY], [b.xMax + 1.8, farY], [b.xMin - 1.8, farY]],
@@ -5520,6 +5583,9 @@
         SimulatedCameraCanvas: SimulatedCameraCanvas,
         _buildScenarioState: buildScenarioState,
         _computeCpaAndTtc: computeCpaAndTtc,
-        _computeCvmCircleTtc: computeCvmCircleTtc
+        _computeCvmCircleTtc: computeCvmCircleTtc,
+        _rolloutVehicleTrajectory: rolloutVehicleTrajectory,
+        _predictCtrvArc: predictCtrvArc,
+        _SCENARIO_CYCLE_S: SCENARIO_CYCLE_S
     };
 })(typeof window !== "undefined" ? window : globalThis);

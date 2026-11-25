@@ -54,11 +54,23 @@ class TrackingContractTests(unittest.TestCase):
         self.assertEqual(clock.timestamp(0, 0), (0.0, "video_pts"))
         self.assertEqual(clock.timestamp(1, 0), (0.1, "fps_estimate"))
         self.assertEqual(clock.timestamp(2, float("nan")), (0.2, "fps_estimate"))
+        with self.assertRaisesRegex(ValueError, "不递增"):
+            clock.timestamp(2, 500)
+
+        # VFR 遇到 0, 40, 120, 120 ms 重复 PTS 时，按上一有效时间+名义帧间隔单调推进，不得误中止
+        vfr_clock = VideoClock(25.0)
+        self.assertEqual(vfr_clock.timestamp(0, 0.0), (0.0, "video_pts"))
+        self.assertEqual(vfr_clock.timestamp(1, 40.0), (0.04, "video_pts"))
+        self.assertEqual(vfr_clock.timestamp(2, 120.0), (0.12, "video_pts"))
+        ts3, kind3 = vfr_clock.timestamp(3, 120.0)
+        self.assertEqual(kind3, "fps_estimate")
+        self.assertAlmostEqual(ts3, 0.16, places=6)
+
         override = VideoClock(5, force_fps=True)
         self.assertEqual(override.timestamp(0, 100), (0.0, "fps_estimate"))
-        clock.previous = 3.0
+        override.previous = 3.0
         with self.assertRaisesRegex(ValueError, "不递增"):
-            clock.timestamp(3, 0)
+            override.timestamp(1, 0)
 
     def test_trail_does_not_bridge_missing_frames_and_expires(self):
         history = TrailHistory(length=3, max_idle_frames=2)

@@ -45,8 +45,30 @@
     3: "L3 紧急避险"
   };
 
+  function getActivePipelineConfig() {
+    if (state.mode === "live" && state.liveJob && state.liveJob.config) {
+      return state.liveJob.config;
+    }
+    if (
+      state.mode === "replay" &&
+      state.replay &&
+      state.replay.data &&
+      state.replay.data.summary &&
+      state.replay.data.summary.configuration
+    ) {
+      var rCfg = state.replay.data.summary.configuration;
+      return {
+        speedModel: String(rCfg.speed_model || "ctrv"),
+        conflictModel: String(rCfg.conflict_model || "obb_ssm"),
+        stitching: Boolean(rCfg.enable_stitching),
+        cyclistVru: Boolean(rCfg.include_cyclist_vru)
+      };
+    }
+    return state && state.pipelineConfig ? state.pipelineConfig : {};
+  }
+
   function getPipelineStageDetail(stage) {
-    var cfg = state && state.pipelineConfig ? state.pipelineConfig : {};
+    var cfg = getActivePipelineConfig();
     if (stage === "detect") {
       return PIPELINE_STAGE_INFO.detect;
     }
@@ -107,12 +129,14 @@
     replay: {
       runId: null,
       framesCount: 0,
-      fps: 10,
+      fps: 25,
       currentIndex: 0,
       playing: false,
       timerId: null,
+      videoRafId: null,
       useJpegFallback: false,
       noVideo: false,
+      hasVideoFrameMap: false,
       isFixture: false,
       data: null
     },
@@ -121,6 +145,11 @@
       status: null,
       sinceSeq: 0,
       pollTimerId: null,
+      pollToken: 0,
+      pollSeq: 0,
+      lastAppliedPollSeq: 0,
+      lastFramesProcessed: -1,
+      config: null,
       lastMaxSpeed: null,
       lastMinTtc: null,
       speedLimitKmh: 30,
@@ -149,6 +178,8 @@
     calibGroundEdited: false,
     calibLastRectDims: { W: 6.0, L: 15.0 },
     calibImageDims: { w: 0, h: 0 },
+    calibVersion: 0,
+    calibPreviewReqId: 0,
     calibPreview: null,
     chartsByRun: {},
     pendingDeleteRunId: null,
@@ -726,28 +757,49 @@
   }
 
   function updateAlgorithmBadges() {
-    dom.badgeSpeedModel.textContent = state.pipelineConfig.speedModel.toUpperCase();
-    dom.badgeConflictModel.textContent = state.pipelineConfig.conflictModel === "obb_ssm" ? "OBB-SSM" : "CVM-CIRCLE";
-    var flags = [];
-    if (state.pipelineConfig.stitching) flags.push("HSV缝合");
-    if (state.pipelineConfig.cyclistVru) flags.push("VRU");
-    dom.badgeVruModel.textContent = flags.length ? flags.join("+") : "基础检测";
+    var cfg = getActivePipelineConfig();
+    if (dom.badgeSpeedModel) {
+      dom.badgeSpeedModel.textContent = String(cfg.speedModel || "ctrv").toUpperCase();
+    }
+    if (dom.badgeConflictModel) {
+      dom.badgeConflictModel.textContent = cfg.conflictModel === "cvm_circle" ? "CVM-CIRCLE" : "OBB-SSM";
+    }
+    if (dom.badgeVruModel) {
+      var flags = [];
+      if (cfg.stitching) flags.push("HSV缝合");
+      if (cfg.cyclistVru) flags.push("VRU");
+      dom.badgeVruModel.textContent = flags.length ? flags.join("+") : "基础检测";
+    }
   }
 
   function syncPipelineControls() {
-    if (dom.simSpeedModel) dom.simSpeedModel.value = state.pipelineConfig.speedModel;
-    if (dom.simConflictModel) dom.simConflictModel.value = state.pipelineConfig.conflictModel;
-    if (dom.toggleStitching) dom.toggleStitching.checked = Boolean(state.pipelineConfig.stitching);
-    if (dom.toggleCyclistVru) dom.toggleCyclistVru.checked = Boolean(state.pipelineConfig.cyclistVru);
+    var simEditable = state.mode === "simulation";
+    if (dom.simSpeedModel) {
+      dom.simSpeedModel.value = state.pipelineConfig.speedModel;
+      dom.simSpeedModel.disabled = !simEditable;
+    }
+    if (dom.simConflictModel) {
+      dom.simConflictModel.value = state.pipelineConfig.conflictModel;
+      dom.simConflictModel.disabled = !simEditable;
+    }
+    if (dom.toggleStitching) {
+      dom.toggleStitching.checked = Boolean(state.pipelineConfig.stitching);
+      dom.toggleStitching.disabled = !simEditable;
+    }
+    if (dom.toggleCyclistVru) {
+      dom.toggleCyclistVru.checked = Boolean(state.pipelineConfig.cyclistVru);
+      dom.toggleCyclistVru.disabled = !simEditable;
+    }
   }
 
   function applyPipelineConfigChange() {
+    var activeCfg = getActivePipelineConfig();
     updateAlgorithmBadges();
     updatePipelineStageDetail();
     if (widgets.pipeline && typeof widgets.pipeline.setConfig === "function") {
-      widgets.pipeline.setConfig(state.pipelineConfig);
+      widgets.pipeline.setConfig(activeCfg);
     }
-    if (widgets.roadTwin && typeof widgets.roadTwin.setConfig === "function") {
+    if (state.mode === "simulation" && widgets.roadTwin && typeof widgets.roadTwin.setConfig === "function") {
       widgets.roadTwin.setConfig(state.pipelineConfig);
     }
   }
@@ -1054,13 +1106,19 @@
         widgets.roadTwin.setMode("replay");
       }
     }
+    syncPipelineControls();
+    applyPipelineConfigChange();
   }
 
   function stopReplayPlayback() {
     state.replay.playing = false;
     if (state.replay.timerId !== null) {
-      window.clearInterval(state.replay.timerId);
+      window.clearTimeout(state.replay.timerId);
       state.replay.timerId = null;
+    }
+    if (state.replay.videoRafId !== null) {
+      window.cancelAnimationFrame(state.replay.videoRafId);
+      state.replay.videoRafId = null;
     }
     if (dom.replayVideo && !dom.replayVideo.paused) {
       try {
@@ -1074,6 +1132,36 @@
     }
   }
 
+  var REPLAY_CHUNK_SIZE = 250;
+
+  function mergeLoadedRange(ranges, startIdx, endIdx) {
+    if (startIdx > endIdx) return ranges;
+    var next = ranges.concat([[startIdx, endIdx]]);
+    next.sort(function (a, b) { return a[0] - b[0]; });
+    var merged = [];
+    for (var i = 0; i < next.length; i += 1) {
+      var cur = next[i];
+      if (!merged.length || cur[0] > merged[merged.length - 1][1] + 1) {
+        merged.push([cur[0], cur[1]]);
+      } else if (cur[1] > merged[merged.length - 1][1]) {
+        merged[merged.length - 1][1] = cur[1];
+      }
+    }
+    return merged;
+  }
+
+  function isReplayFrameLoaded(dataset, frameIdx) {
+    if (!dataset) return false;
+    if (dataset.allFramesLoaded) return true;
+    var ranges = dataset.loadedRanges || [];
+    for (var i = 0; i < ranges.length; i += 1) {
+      if (frameIdx >= ranges[i][0] && frameIdx <= ranges[i][1]) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   function buildRunDataset(runId, summary, eventsRes, conflictsRes, speedsRes) {
     var conflicts = (conflictsRes && conflictsRes.conflicts) || [];
     var events = (eventsRes && eventsRes.events) || [];
@@ -1085,14 +1173,22 @@
     var maxX = -Infinity;
     var minY = Infinity;
     var maxY = -Infinity;
+    var maxSpeedFrameIdx = -1;
+    var maxConflictFrameIdx = -1;
     var maxFrameIdx = 0;
+    var frameTimes = {};
 
     speedRows.forEach(function (row) {
       var fIdx = parseInt(row.frame_idx, 10);
       if (!Number.isFinite(fIdx)) return;
+      if (fIdx > maxSpeedFrameIdx) maxSpeedFrameIdx = fIdx;
       if (fIdx > maxFrameIdx) maxFrameIdx = fIdx;
       if (!speedsByFrame[fIdx]) speedsByFrame[fIdx] = [];
       speedsByFrame[fIdx].push(row);
+      var tVal = parseFloat(row.timestamp_s);
+      if (Number.isFinite(tVal) && frameTimes[fIdx] === undefined) {
+        frameTimes[fIdx] = tVal;
+      }
 
       var x = parseFloat(row.x_m);
       var y = parseFloat(row.y_m);
@@ -1109,9 +1205,13 @@
     conflicts.forEach(function (rec) {
       var fIdx = typeof rec.frame_index === "number" ? rec.frame_index : parseInt(rec.frame_index, 10);
       if (!Number.isFinite(fIdx)) return;
+      if (fIdx > maxConflictFrameIdx) maxConflictFrameIdx = fIdx;
       if (fIdx > maxFrameIdx) maxFrameIdx = fIdx;
       if (!conflictsByFrame[fIdx]) conflictsByFrame[fIdx] = [];
       conflictsByFrame[fIdx].push(rec);
+      if (typeof rec.timestamp_s === "number" && Number.isFinite(rec.timestamp_s) && frameTimes[fIdx] === undefined) {
+        frameTimes[fIdx] = rec.timestamp_s;
+      }
     });
 
     if (!Number.isFinite(minX) || !Number.isFinite(maxX)) {
@@ -1129,13 +1229,53 @@
       maxY = Math.ceil((maxY + 2.0) * 2) / 2;
     }
 
+    var sortedTimeFrames = Object.keys(frameTimes).map(Number).sort(function (a, b) { return a - b; });
+    var dtSamples = [];
+    for (var ti = 1; ti < sortedTimeFrames.length; ti += 1) {
+      var fA = sortedTimeFrames[ti - 1];
+      var fB = sortedTimeFrames[ti];
+      if (fB > fA) {
+        var stepDt = (frameTimes[fB] - frameTimes[fA]) / (fB - fA);
+        if (Number.isFinite(stepDt) && stepDt >= 0.005 && stepDt <= 1.0) {
+          dtSamples.push(stepDt);
+        }
+      }
+    }
+    var nominalFrameMs = 40;
+    if (dtSamples.length > 0) {
+      dtSamples.sort(function (a, b) { return a - b; });
+      nominalFrameMs = Math.round(dtSamples[Math.floor(dtSamples.length / 2)] * 1000);
+    } else if (summary && summary.configuration && typeof summary.configuration.fps === "number" && summary.configuration.fps > 0) {
+      nominalFrameMs = Math.round(1000 / summary.configuration.fps);
+    }
+    nominalFrameMs = Math.max(25, Math.min(500, nominalFrameMs));
+
     var totalFrames = Math.max(
       (summary && typeof summary.frames_processed === "number" ? summary.frames_processed : 0),
       maxFrameIdx + 1
     );
     var speedsTotalRows = speedsRes && typeof speedsRes.total_rows === "number" ? speedsRes.total_rows : speedRows.length;
     var speedsTruncated = Boolean(speedsRes && speedsRes.truncated);
-    var conflictsTruncated = conflicts.length >= 5000;
+    var conflictsTotalCount = conflictsRes && typeof conflictsRes.total_count === "number"
+      ? conflictsRes.total_count
+      : conflicts.length;
+    var conflictsTruncated = Boolean(
+      (conflictsRes && conflictsRes.truncated) ||
+      (conflictsRes && typeof conflictsRes.total_count === "number" ? conflictsRes.total_count > conflicts.length : conflicts.length >= 5000)
+    );
+    var allFramesLoaded = !speedsTruncated && !conflictsTruncated;
+    var loadedRanges = [];
+    if (allFramesLoaded) {
+      loadedRanges = [[0, Math.max(0, totalFrames - 1)]];
+    } else {
+      // 截断预览末帧可能只含前半部分目标，保守退一帧作为已完整装载上界
+      var speedCompleteMax = speedsTruncated ? (maxSpeedFrameIdx - 1) : (totalFrames - 1);
+      var conflictCompleteMax = conflictsTruncated ? (maxConflictFrameIdx - 1) : (totalFrames - 1);
+      var initMax = Math.min(speedCompleteMax, conflictCompleteMax);
+      if (initMax >= 0) {
+        loadedRanges = [[0, initMax]];
+      }
+    }
 
     return {
       runId: runId,
@@ -1145,7 +1285,12 @@
       speedRows: speedRows,
       speedsTotalRows: speedsTotalRows,
       speedsTruncated: speedsTruncated,
+      conflictsTotalCount: conflictsTotalCount,
       conflictsTruncated: conflictsTruncated,
+      allFramesLoaded: allFramesLoaded,
+      loadedRanges: loadedRanges,
+      loadingChunks: {},
+      nominalFrameMs: nominalFrameMs,
       speedsByFrame: speedsByFrame,
       conflictsByFrame: conflictsByFrame,
       totalFrames: totalFrames,
@@ -1244,7 +1389,8 @@
     } else if (conflictRecords.length && typeof conflictRecords[0].timestamp_s === "number") {
       timestampS = conflictRecords[0].timestamp_s;
     } else {
-      timestampS = frameIndex * 0.1;
+      var nomSec = (dataset && dataset.nominalFrameMs ? dataset.nominalFrameMs : 40) / 1000;
+      timestampS = frameIndex * nomSec;
     }
 
     var vehicles = [];
@@ -1269,7 +1415,8 @@
         var prevFrameNum = parseInt(prev.frame_idx, 10);
         var frameGap = Number.isFinite(prevFrameNum) ? Math.max(1, frameIndex - prevFrameNum) : 1;
         var rawDt = parseFloat(row.timestamp_s) - parseFloat(prev.timestamp_s);
-        var dt = (Number.isFinite(rawDt) && rawDt > 0.03) ? rawDt : Math.max(0.03, frameGap * 0.1);
+        var fallbackStep = (dataset && dataset.nominalFrameMs ? dataset.nominalFrameMs : 40) / 1000;
+        var dt = (Number.isFinite(rawDt) && rawDt > 0.015) ? rawDt : Math.max(0.02, frameGap * fallbackStep);
         if (Number.isFinite(px) && Number.isFinite(py) && Number.isFinite(x) && Number.isFinite(y)) {
           vx = (x - px) / dt;
           vy = (y - py) / dt;
@@ -1280,10 +1427,12 @@
       }
 
       var riskLvl = parseRiskLevel(row.risk_level);
-      var cat = row.category || "vehicle";
+      var coarseCat = String(row.category || "vehicle").trim().toLowerCase();
+      var fineKind = String(row.object_kind || row.class_name || coarseCat || "vehicle").trim().toLowerCase();
       if (!Number.isFinite(x) || !Number.isFinite(y)) return;
 
-      if (isVruCategory(cat)) {
+      if (isVruCategory(fineKind) || isVruCategory(coarseCat)) {
+        var vruKind = isVruCategory(fineKind) ? fineKind : coarseCat;
         vrus.push({
           id: tid,
           trackId: tid,
@@ -1292,10 +1441,22 @@
           vx: vx,
           vy: vy,
           speedMs: speedKmh / 3.6,
-          category: cat,
+          category: vruKind,
+          kind: vruKind,
+          radiusM: vruKind === "motorcycle" ? 0.65 : (vruKind === "bicycle" ? 0.50 : 0.40),
+          lengthM: vruKind === "motorcycle" ? 2.1 : (vruKind === "bicycle" ? 1.8 : 0.8),
+          widthM: vruKind === "motorcycle" ? 0.8 : (vruKind === "bicycle" ? 0.7 : 0.8),
           riskLevel: riskLvl
         });
       } else {
+        var parsedLen = parseFloat(row.length_m);
+        var parsedWid = parseFloat(row.width_m);
+        var vehLen = Number.isFinite(parsedLen) && parsedLen > 0
+          ? parsedLen
+          : (fineKind === "bus" ? 10.0 : (fineKind === "truck" ? 8.0 : 4.5));
+        var vehWid = Number.isFinite(parsedWid) && parsedWid > 0
+          ? parsedWid
+          : (fineKind === "bus" ? 2.55 : (fineKind === "truck" ? 2.5 : 1.9));
         vehicles.push({
           id: tid,
           trackId: tid,
@@ -1305,9 +1466,10 @@
           vy: vy,
           speedKmh: speedKmh,
           headingDeg: headingDeg,
-          lengthM: cat === "bus" ? 8.0 : (cat === "truck" ? 6.2 : 4.2),
-          widthM: cat === "bus" || cat === "truck" ? 2.2 : 1.85,
-          category: cat,
+          lengthM: vehLen,
+          widthM: vehWid,
+          kind: fineKind,
+          category: fineKind,
           riskLevel: riskLvl
         });
       }
@@ -1346,6 +1508,103 @@
     };
   }
 
+  function ensureReplayFrameWindow(dataset, frameIdx, reqToken) {
+    if (!dataset || dataset.allFramesLoaded) return Promise.resolve();
+    var totalF = Math.max(1, dataset.totalFrames || 1);
+    var clamped = Math.max(0, Math.min(totalF - 1, Math.round(frameIdx)));
+    if (isReplayFrameLoaded(dataset, clamped)) return Promise.resolve();
+
+    var chunkStart = Math.floor(clamped / REPLAY_CHUNK_SIZE) * REPLAY_CHUNK_SIZE;
+    var chunkEnd = Math.min(totalF - 1, chunkStart + REPLAY_CHUNK_SIZE - 1);
+    var chunkKey = chunkStart + ":" + chunkEnd;
+    if (dataset.loadingChunks[chunkKey]) {
+      return dataset.loadingChunks[chunkKey];
+    }
+
+    var base = "/api/runs/" + encodeURIComponent(dataset.runId);
+    var promise = Promise.all([
+      fetchJson(base + "/speeds?frame_start=" + chunkStart + "&frame_end=" + chunkEnd + "&limit=20000"),
+      fetchJson(base + "/conflicts?frame_start=" + chunkStart + "&frame_end=" + chunkEnd + "&limit=20000")
+    ])
+      .then(function (results) {
+        if (state.replay.data !== dataset) return;
+        for (var fi = chunkStart; fi <= chunkEnd; fi += 1) {
+          delete dataset.speedsByFrame[fi];
+          delete dataset.conflictsByFrame[fi];
+        }
+        var spRows = (results[0] && results[0].rows) || [];
+        var cfRows = (results[1] && results[1].conflicts) || [];
+        spRows.forEach(function (row) {
+          var idx = parseInt(row.frame_idx, 10);
+          if (!Number.isFinite(idx)) return;
+          if (!dataset.speedsByFrame[idx]) dataset.speedsByFrame[idx] = [];
+          dataset.speedsByFrame[idx].push(row);
+          var rx = parseFloat(row.x_m);
+          var ry = parseFloat(row.y_m);
+          if (Number.isFinite(rx)) {
+            dataset.bounds.xMin = Math.min(dataset.bounds.xMin, Math.floor((rx - 1.2) * 2) / 2);
+            dataset.bounds.xMax = Math.max(dataset.bounds.xMax, Math.ceil((rx + 1.2) * 2) / 2);
+          }
+          if (Number.isFinite(ry)) {
+            dataset.bounds.yMin = Math.max(0, Math.min(dataset.bounds.yMin, Math.floor((ry - 1.8) * 2) / 2));
+            dataset.bounds.yMax = Math.max(dataset.bounds.yMax, Math.ceil((ry + 2.0) * 2) / 2);
+          }
+        });
+        cfRows.forEach(function (rec) {
+          var idx = typeof rec.frame_index === "number" ? rec.frame_index : parseInt(rec.frame_index, 10);
+          if (!Number.isFinite(idx)) return;
+          if (!dataset.conflictsByFrame[idx]) dataset.conflictsByFrame[idx] = [];
+          dataset.conflictsByFrame[idx].push(rec);
+        });
+        dataset.loadedRanges = mergeLoadedRange(dataset.loadedRanges, chunkStart, chunkEnd);
+        dom.twinModeLabel.textContent =
+          "x[" + dataset.bounds.xMin + "," + dataset.bounds.xMax + "] y[" + dataset.bounds.yMin + "," + dataset.bounds.yMax + "]";
+
+        if (reqToken === state.replayReqToken && state.mode === "replay" && state.replay.runId === dataset.runId) {
+          if (state.replay.currentIndex >= chunkStart && state.replay.currentIndex <= chunkEnd) {
+            renderReplayFrame(state.replay.currentIndex);
+          }
+          if (state.replay.playing && state.replay.useJpegFallback && state.replay.timerId === null) {
+            scheduleNextReplayTick();
+          }
+        }
+      })
+      .catch(function (err) {
+        if (reqToken === state.replayReqToken && state.mode === "replay" && state.replay.runId === dataset.runId) {
+          dom.replayMediaCaption.textContent = "加载帧区间失败: " + err.message;
+        }
+      })
+      .finally(function () {
+        delete dataset.loadingChunks[chunkKey];
+      });
+
+    dataset.loadingChunks[chunkKey] = promise;
+    return promise;
+  }
+
+  function nextFrameDeltaMs(dataset, curIdx) {
+    var fallbackMs = (dataset && dataset.nominalFrameMs) ? dataset.nominalFrameMs : 40;
+    if (!dataset) return fallbackMs;
+    var maxIdx = Math.max(0, dataset.totalFrames - 1);
+    if (curIdx >= maxIdx) return fallbackMs;
+    var rCur = dataset.speedsByFrame[curIdx] || [];
+    var rNext = dataset.speedsByFrame[curIdx + 1] || [];
+    var tCur = rCur.length ? parseFloat(rCur[0].timestamp_s) : NaN;
+    var tNext = rNext.length ? parseFloat(rNext[0].timestamp_s) : NaN;
+    if (!Number.isFinite(tCur)) {
+      var cCur = dataset.conflictsByFrame[curIdx] || [];
+      if (cCur.length && typeof cCur[0].timestamp_s === "number") tCur = cCur[0].timestamp_s;
+    }
+    if (!Number.isFinite(tNext)) {
+      var cNext = dataset.conflictsByFrame[curIdx + 1] || [];
+      if (cNext.length && typeof cNext[0].timestamp_s === "number") tNext = cNext[0].timestamp_s;
+    }
+    if (Number.isFinite(tCur) && Number.isFinite(tNext) && tNext > tCur) {
+      return Math.max(25, Math.min(1000, Math.round((tNext - tCur) * 1000)));
+    }
+    return fallbackMs;
+  }
+
   function renderReplayFrame(frameIndex) {
     var dataset = state.replay.data;
     if (!dataset) return;
@@ -1354,10 +1613,26 @@
     var idx = Math.max(0, Math.min(maxIdx, Math.round(frameIndex)));
     state.replay.currentIndex = idx;
 
-    var framePayload = buildReplayFramePayload(dataset, idx);
-
     dom.replayScrubber.max = String(maxIdx);
     dom.replayScrubber.value = String(idx);
+
+    if (!isReplayFrameLoaded(dataset, idx)) {
+      var loadingTs = idx * ((dataset.nominalFrameMs || 40) / 1000);
+      dom.replayFrameLabel.textContent = idx + " / " + maxIdx + " (加载中...)";
+      dom.replayMediaCaption.textContent =
+        dataset.runId + " · 帧 #" + idx + " · 正在按帧区间加载轨迹与风险数据...";
+      dom.twinCounts.textContent = "帧 #" + idx + " 轨迹区间加载中...";
+      dom.kpiFramesMeta.textContent = "回放总帧数 " + dataset.totalFrames + " · " + formatNumber(loadingTs, 1, "0.0") + " s (区间加载)";
+      ensureReplayFrameWindow(dataset, idx, state.replayReqToken);
+      return;
+    }
+
+    if (state.replay.playing && !dataset.allFramesLoaded && idx + 40 <= maxIdx && !isReplayFrameLoaded(dataset, idx + 40)) {
+      ensureReplayFrameWindow(dataset, idx + 40, state.replayReqToken);
+    }
+
+    var framePayload = buildReplayFramePayload(dataset, idx);
+
     dom.replayFrameLabel.textContent =
       idx + " / " + maxIdx + " (" + formatNumber(framePayload.timestampS, 1, "0.0") + "s)";
     dom.replayMediaCaption.textContent =
@@ -1420,19 +1695,86 @@
     updateDualEndMirrors(dualAlerts);
   }
 
+  function scheduleNextReplayTick() {
+    if (!state.replay.playing || !state.replay.data) {
+      state.replay.timerId = null;
+      return;
+    }
+    var dataset = state.replay.data;
+    var delayMs = nextFrameDeltaMs(dataset, state.replay.currentIndex);
+    state.replay.timerId = window.setTimeout(function () {
+      state.replay.timerId = null;
+      if (!state.replay.playing || !state.replay.data) return;
+      if (!state.replay.noVideo && dom.replayFrameImg && !dom.replayFrameImg.complete) {
+        state.replay.timerId = window.setTimeout(function () {
+          state.replay.timerId = null;
+          scheduleNextReplayTick();
+        }, 40);
+        return;
+      }
+      var maxIdx = Math.max(0, state.replay.data.totalFrames - 1);
+      var nextIdx = state.replay.currentIndex + 1;
+      if (nextIdx > maxIdx) nextIdx = 0;
+      if (!isReplayFrameLoaded(state.replay.data, nextIdx)) {
+        renderReplayFrame(nextIdx);
+        return;
+      }
+      renderReplayFrame(nextIdx);
+      if (state.replay.playing) {
+        scheduleNextReplayTick();
+      }
+    }, delayMs);
+  }
+
+  function syncVideoReplayFrameLoop() {
+    if (!state.replay.playing || state.replay.useJpegFallback || !state.replay.data || !dom.replayVideo) {
+      state.replay.videoRafId = null;
+      return;
+    }
+    var dataset = state.replay.data;
+    var stepSec = (dataset.nominalFrameMs || 40) / 1000;
+    var estIdx = Math.min(
+      Math.max(0, dataset.totalFrames - 1),
+      Math.max(0, Math.round((dom.replayVideo.currentTime || 0) / stepSec))
+    );
+    if (estIdx !== state.replay.currentIndex) {
+      renderReplayFrame(estIdx);
+    }
+    state.replay.videoRafId = window.requestAnimationFrame(syncVideoReplayFrameLoop);
+  }
+
   function startReplayPlayback() {
     if (!state.replay.data) return;
     stopReplayPlayback();
     state.replay.playing = true;
     dom.btnReplayToggle.textContent = "暂停回放";
 
-    if (!state.replay.useJpegFallback && dom.replayVideo && dom.replayVideo.readyState >= 2 && dom.replayVideo.videoWidth > 0) {
+    if (
+      !state.replay.useJpegFallback &&
+      !state.replay.noVideo &&
+      !state.replay.hasVideoFrameMap &&
+      dom.replayVideo &&
+      dom.replayVideo.readyState >= 2 &&
+      dom.replayVideo.videoWidth > 0
+    ) {
       dom.replayVideo.hidden = false;
       dom.replayFrameImg.hidden = true;
-      dom.replayVideo.play().catch(function () {
-        state.replay.useJpegFallback = true;
-        startJpegReplayLoop();
-      });
+      var stepSec = ((state.replay.data.nominalFrameMs || 40) / 1000);
+      try {
+        dom.replayVideo.currentTime = state.replay.currentIndex * stepSec;
+      } catch (_err) {
+        // ignore seek error before play
+      }
+      dom.replayVideo.play()
+        .then(function () {
+          if (state.replay.playing && !state.replay.useJpegFallback) {
+            state.replay.videoRafId = window.requestAnimationFrame(syncVideoReplayFrameLoop);
+          }
+        })
+        .catch(function () {
+          state.replay.useJpegFallback = true;
+          startJpegReplayLoop();
+        });
       return;
     }
     startJpegReplayLoop();
@@ -1440,18 +1782,10 @@
 
   function startJpegReplayLoop() {
     state.replay.useJpegFallback = true;
-    dom.replayVideo.hidden = true;
-    dom.replayFrameImg.hidden = Boolean(state.replay.noVideo);
+    if (dom.replayVideo) dom.replayVideo.hidden = true;
+    if (dom.replayFrameImg) dom.replayFrameImg.hidden = Boolean(state.replay.noVideo);
     if (dom.replaySimCanvas) dom.replaySimCanvas.hidden = !state.replay.noVideo;
-
-    state.replay.timerId = window.setInterval(function () {
-      if (!state.replay.playing || !state.replay.data) return;
-      if (!state.replay.noVideo && dom.replayFrameImg && !dom.replayFrameImg.complete) return;
-      var maxIdx = Math.max(0, state.replay.data.totalFrames - 1);
-      var nextIdx = state.replay.currentIndex + 1;
-      if (nextIdx > maxIdx) nextIdx = 0;
-      renderReplayFrame(nextIdx);
-    }, 180);
+    scheduleNextReplayTick();
   }
 
   function enterReplayMode(runId, initialFrame) {
@@ -1463,9 +1797,16 @@
     state.replay.currentIndex = 0;
     state.replay.useJpegFallback = true;
     state.replay.noVideo = false;
+    state.replay.hasVideoFrameMap = false;
     state.replay.isFixture = false;
     if (dom.replaySimCanvas) {
       dom.replaySimCanvas.hidden = true;
+    }
+    if (dom.replayVideo) {
+      dom.replayVideo.onerror = null;
+      dom.replayVideo.onloadedmetadata = null;
+      dom.replayVideo.hidden = true;
+      dom.replayVideo.removeAttribute("src");
     }
     if (dom.replayFrameImg) {
       dom.replayFrameImg.hidden = false;
@@ -1509,12 +1850,26 @@
         var srcVid = String(summaryObj.source_video || "");
         state.replay.isFixture = srcVid.indexOf("tracking-fixtures") >= 0 || /sample_[ab]\.mp4/i.test(srcVid);
         state.replay.noVideo = summaryObj.has_video === false;
+        state.replay.hasVideoFrameMap = Boolean(summaryObj.has_video_frame_map);
         state.replay.data = dataset;
         state.replay.framesCount = dataset.totalFrames;
+        applyPipelineConfigChange();
         dom.twinModeLabel.textContent =
           "x[" + dataset.bounds.xMin + "," + dataset.bounds.xMax + "] y[" + dataset.bounds.yMin + "," + dataset.bounds.yMax + "]";
 
-        if (dom.replayVideo) {
+        if (dom.replayVideo && !state.replay.noVideo && !state.replay.hasVideoFrameMap) {
+          dom.replayVideo.hidden = true;
+          dom.replayVideo.onloadedmetadata = function () {
+            if (reqToken !== state.replayReqToken || state.mode !== "replay" || state.replay.runId !== runId) return;
+            if (dom.replayVideo.videoWidth > 0) {
+              state.replay.useJpegFallback = false;
+            }
+          };
+          dom.replayVideo.onerror = function () {
+            state.replay.useJpegFallback = true;
+          };
+          dom.replayVideo.src = "/api/runs/" + encodeURIComponent(runId) + "/video";
+        } else if (dom.replayVideo) {
           dom.replayVideo.hidden = true;
         }
 
@@ -1532,8 +1887,9 @@
   }
 
   function stopLiveJobPolling(options) {
+    state.liveJob.pollToken += 1;
     if (state.liveJob.pollTimerId !== null) {
-      window.clearInterval(state.liveJob.pollTimerId);
+      window.clearTimeout(state.liveJob.pollTimerId);
       state.liveJob.pollTimerId = null;
     }
     if (dom.liveMjpegImg && !(options && options.preserveFrame)) {
@@ -1542,16 +1898,26 @@
     }
   }
 
-  function enterLiveJobMode(job) {
+  function enterLiveJobMode(job, submittedConfig) {
     if (!job || !job.job_id) return;
     stopLiveJobPolling();
     var fallbackLimit = parseFloat(dom.jobSpeedLimit ? dom.jobSpeedLimit.value : "");
     var jobLimit = (typeof job.speed_limit_kmh === "number" && Number.isFinite(job.speed_limit_kmh))
       ? job.speed_limit_kmh
       : (Number.isFinite(fallbackLimit) && fallbackLimit > 0 ? fallbackLimit : 30);
+    var cfgBase = submittedConfig || state.pipelineConfig || {};
+    state.liveJob.config = {
+      speedModel: String(job.speed_model || cfgBase.speedModel || "ema"),
+      conflictModel: String(job.conflict_model || cfgBase.conflictModel || "cvm_circle"),
+      stitching: job.enable_stitching !== undefined ? Boolean(job.enable_stitching) : Boolean(cfgBase.stitching),
+      cyclistVru: job.include_cyclist_vru !== undefined ? Boolean(job.include_cyclist_vru) : Boolean(cfgBase.cyclistVru)
+    };
     state.liveJob.jobId = job.job_id;
     state.liveJob.status = job.status || "queued";
     state.liveJob.sinceSeq = 0;
+    state.liveJob.pollSeq = 0;
+    state.liveJob.lastAppliedPollSeq = 0;
+    state.liveJob.lastFramesProcessed = -1;
     state.liveJob.lastMaxSpeed = null;
     state.liveJob.lastMinTtc = null;
     state.liveJob.speedLimitKmh = jobLimit;
@@ -1560,6 +1926,7 @@
     state.liveJob.notifiedDone = false;
 
     setMonitorMode("live");
+    applyPipelineConfigChange();
     if (dom.liveMjpegImg) {
       dom.liveMjpegImg.hidden = false;
       dom.liveMjpegImg.onerror = function () {
@@ -1603,25 +1970,45 @@
       pedestrianAlerts: []
     });
 
-    state.liveJob.pollTimerId = window.setInterval(pollLiveJobState, 700);
     pollLiveJobState();
   }
 
   function pollLiveJobState() {
     var jobId = state.liveJob.jobId;
-    if (!jobId || state.mode !== "live") return;
+    if (!jobId || state.mode !== "live") return Promise.resolve();
+    var token = state.liveJob.pollToken;
+    var seq = ++state.liveJob.pollSeq;
+    var finished = false;
 
-    Promise.all([
+    return Promise.all([
       fetchJson("/api/jobs/" + encodeURIComponent(jobId)),
       fetchJson("/api/jobs/" + encodeURIComponent(jobId) + "/alerts?since=" + state.liveJob.sinceSeq + "&limit=100")
     ])
       .then(function (results) {
         var statusObj = results[0];
         var alertsObj = results[1];
-        if (!statusObj || state.mode !== "live" || state.liveJob.jobId !== jobId) return;
+        if (
+          !statusObj ||
+          token !== state.liveJob.pollToken ||
+          seq < state.liveJob.lastAppliedPollSeq ||
+          state.mode !== "live" ||
+          state.liveJob.jobId !== jobId
+        ) {
+          return;
+        }
+        var isDone =
+          statusObj.status === "completed" ||
+          statusObj.status === "stopped" ||
+          statusObj.status === "failed";
+        var curFrames = typeof statusObj.frames_processed === "number" ? statusObj.frames_processed : 0;
+        if (!isDone && curFrames < state.liveJob.lastFramesProcessed) {
+          return;
+        }
+        state.liveJob.lastAppliedPollSeq = seq;
+        state.liveJob.lastFramesProcessed = curFrames;
 
         state.liveJob.status = statusObj.status;
-        widgets.kpiFrames.setValue(statusObj.frames_processed || 0);
+        widgets.kpiFrames.setValue(curFrames);
         dom.kpiFramesMeta.textContent =
           "最新时间戳 " + formatNumber(statusObj.latest_timestamp_s, 1, "0.0") + " s";
         if (dom.kpiSpeedMeta) {
@@ -1632,9 +2019,16 @@
         }
 
         dom.liveJobStatusText.textContent =
-          "作业 " + statusObj.job_id + " · " + statusObj.status + " · " + (statusObj.frames_processed || 0) + " 帧";
+          "作业 " + statusObj.job_id + " · " + statusObj.status + " · " + curFrames + " 帧";
 
-        var receivedAlerts = alertsObj && Array.isArray(alertsObj.alerts) ? alertsObj.alerts : [];
+        var rawAlerts = alertsObj && Array.isArray(alertsObj.alerts) ? alertsObj.alerts : [];
+        var receivedAlerts = rawAlerts.filter(function (batch) {
+          if (typeof batch.seq === "number") {
+            return batch.seq > state.liveJob.sinceSeq;
+          }
+          return true;
+        });
+
         var hasTwinSnap = Boolean(statusObj.latest_twin);
         if (hasTwinSnap) {
           var lv = statusObj.latest_twin;
@@ -1721,10 +2115,6 @@
           });
         } else {
           state.liveJob.quietPolls += 1;
-          var isDone =
-            statusObj.status === "completed" ||
-            statusObj.status === "stopped" ||
-            statusObj.status === "failed";
           if ((isDone || state.liveJob.quietPolls >= 3) && state.liveJob.activeAlertsCount > 0) {
             state.liveJob.activeAlertsCount = 0;
             widgets.kpiActiveAlerts.setValue(0);
@@ -1742,7 +2132,8 @@
           }
         }
 
-        if (statusObj.status === "completed" || statusObj.status === "stopped" || statusObj.status === "failed") {
+        if (isDone) {
+          finished = true;
           if (!hasTwinSnap && statusObj.summary && typeof statusObj.summary.max_observed_speed_kmh === "number") {
             widgets.kpiMaxSpeed.setValue(statusObj.summary.max_observed_speed_kmh);
           }
@@ -1753,14 +2144,14 @@
           if (statusObj.error) {
             dom.liveMediaCaption.textContent = "作业失败: " + statusObj.error;
           } else {
-            dom.liveMediaCaption.textContent = "作业已结束 (" + statusObj.status + " · " + (statusObj.frames_processed || 0) + " 帧)";
+            dom.liveMediaCaption.textContent = "作业已结束 (" + statusObj.status + " · " + curFrames + " 帧)";
           }
           stopLiveJobPolling({ preserveFrame: true });
           if (!state.liveJob.notifiedDone) {
             state.liveJob.notifiedDone = true;
             if (statusObj.status === "completed") {
               showToast(
-                "检测任务已完成 (" + (statusObj.frames_processed || 0) + " 帧)",
+                "检测任务已完成 (" + curFrames + " 帧)",
                 {
                   label: "查看档案",
                   onClick: function () {
@@ -1780,6 +2171,11 @@
       })
       .catch(function (_err) {
         // Keep polling resiliently unless stopped
+      })
+      .finally(function () {
+        if (!finished && token === state.liveJob.pollToken && state.mode === "live" && state.liveJob.jobId === jobId) {
+          state.liveJob.pollTimerId = window.setTimeout(pollLiveJobState, 700);
+        }
       });
   }
 
@@ -2197,6 +2593,22 @@
     return tr;
   }
 
+  function makeJumpRowHeader(text, ariaLabel, onJump) {
+    var th = document.createElement("th");
+    th.setAttribute("scope", "row");
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "table-jump-btn mono tabular";
+    btn.textContent = text;
+    if (ariaLabel) btn.setAttribute("aria-label", ariaLabel);
+    btn.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      onJump();
+    });
+    th.appendChild(btn);
+    return th;
+  }
+
   function renderHistoryTables(dataset) {
     // 1. Conflicts table
     dom.conflictsTbody.textContent = "";
@@ -2209,13 +2621,21 @@
         var fIdx = rec.frame_index != null ? rec.frame_index : 0;
         var lvl = parseRiskLevel(a.risk_level);
 
-        var tr = document.createElement("tr");
-        tr.addEventListener("click", function () {
+        function jumpConflict() {
           enterReplayMode(dataset.runId, fIdx);
           switchView("monitor");
-        });
+        }
 
-        tr.appendChild(makeCell("th", "#" + fIdx + " · " + formatNumber(rec.timestamp_s, 1, "0.0") + "s", "mono tabular", "row"));
+        var tr = document.createElement("tr");
+        tr.addEventListener("click", jumpConflict);
+
+        tr.appendChild(
+          makeJumpRowHeader(
+            "#" + fIdx + " · " + formatNumber(rec.timestamp_s, 1, "0.0") + "s",
+            "跳转到第 " + fIdx + " 帧冲突回放",
+            jumpConflict
+          )
+        );
 
         var targetPart = a.ped_track_id != null
           ? ("车辆 #" + a.veh_track_id + " / 目标 #" + a.ped_track_id)
@@ -2255,13 +2675,22 @@
       var eFrag = document.createDocumentFragment();
       dataset.events.forEach(function (ev) {
         var lvl = parseRiskLevel(ev.peak_risk_level);
-        var tr = document.createElement("tr");
-        tr.addEventListener("click", function () {
-          enterReplayMode(dataset.runId, ev.start_frame || 0);
+        var startF = ev.start_frame || 0;
+        function jumpEvent() {
+          enterReplayMode(dataset.runId, startF);
           switchView("monitor");
-        });
+        }
 
-        tr.appendChild(makeCell("th", "EV-" + ev.event_id, "mono tabular", "row"));
+        var tr = document.createElement("tr");
+        tr.addEventListener("click", jumpEvent);
+
+        tr.appendChild(
+          makeJumpRowHeader(
+            "EV-" + ev.event_id,
+            "跳转到事件 EV-" + ev.event_id + " 起始帧 #" + startF + " 回放",
+            jumpEvent
+          )
+        );
 
         var actors = (ev.kind === "speeding" ? "超速" : "冲突") +
           " · V#" + ev.veh_track_id +
@@ -2301,14 +2730,22 @@
       displaySpeedRows.forEach(function (row) {
         var fIdx = parseInt(row.frame_idx, 10) || 0;
         var lvl = parseRiskLevel(row.risk_level);
-        var tr = document.createElement("tr");
-        tr.addEventListener("click", function () {
+        function jumpSpeed() {
           enterReplayMode(dataset.runId, fIdx);
           switchView("monitor");
-        });
+        }
 
-        tr.appendChild(makeCell("th", "#" + fIdx + " · T#" + (row.track_id || "--"), "mono tabular", "row"));
-        tr.appendChild(makeCell("td", categoryLabel(row.category)));
+        var tr = document.createElement("tr");
+        tr.addEventListener("click", jumpSpeed);
+
+        tr.appendChild(
+          makeJumpRowHeader(
+            "#" + fIdx + " · T#" + (row.track_id || "--"),
+            "跳转到第 " + fIdx + " 帧目标 #" + (row.track_id || "--") + " 回放",
+            jumpSpeed
+          )
+        );
+        tr.appendChild(makeCell("td", categoryLabel(row.object_kind || row.category)));
         tr.appendChild(makeCell("td", formatNumber(parseFloat(row.timestamp_s), 2, "--"), "mono tabular"));
 
         var xyTxt = "(" + formatNumber(parseFloat(row.x_m), 2, "--") + ", " + formatNumber(parseFloat(row.y_m), 2, "--") + ")";
@@ -2345,18 +2782,18 @@
       var metaMsg = "";
       if (tab === "conflicts") {
         metaMsg = hd.conflictsTruncated
-          ? ("已加载前 " + hd.conflicts.length + " 条碰撞评估（点击行跳转回放）")
-          : ("共 " + hd.conflicts.length + " 条记录（点击行跳转回放）");
+          ? ("已加载前 " + hd.conflicts.length + " 条冲突评估 / 共 " + hd.conflictsTotalCount + " 条（回放滑块按帧区间自动续载）")
+          : ("共 " + hd.conflicts.length + " 条记录（可点击或 Tab 聚焦跳转回放）");
       } else if (tab === "events") {
-        metaMsg = "共 " + hd.events.length + " 条记录（点击行跳转回放）";
+        metaMsg = "共 " + hd.events.length + " 条记录（可点击或 Tab 聚焦跳转回放）";
       } else {
         var shownSpeed = Math.min(hd.speedRows.length, 500);
         if (hd.speedsTruncated) {
-          metaMsg = "展示前 " + shownSpeed + " 条 / CSV 总计 " + hd.speedsTotalRows + " 行（已加载前 " + hd.speedRows.length + " 行用于时间轴与孪生）";
+          metaMsg = "展示前 " + shownSpeed + " 条 / CSV 总计 " + hd.speedsTotalRows + " 行（回放滑块支持按帧区间按需续载完整轨迹）";
         } else if (hd.speedRows.length > shownSpeed) {
-          metaMsg = "表内展示前 " + shownSpeed + " / " + hd.speedRows.length + " 条（点击行跳转回放）";
+          metaMsg = "表内展示前 " + shownSpeed + " / " + hd.speedRows.length + " 条（可点击或 Tab 聚焦跳转回放）";
         } else {
-          metaMsg = "共 " + hd.speedRows.length + " 条记录（点击行跳转回放）";
+          metaMsg = "共 " + hd.speedRows.length + " 条记录（可点击或 Tab 聚焦跳转回放）";
         }
       }
       dom.historyTableMeta.textContent = metaMsg;
@@ -2567,6 +3004,7 @@
   }
 
   function resetCalibValidationBadge() {
+    state.calibVersion += 1;
     state.calibPreview = null;
     if (dom.calibValidBadge) {
       dom.calibValidBadge.textContent = "待校验";
@@ -2837,8 +3275,8 @@
             if (typeof widgets.calibCanvas.clearParkingZones === "function") {
               widgets.calibCanvas.clearParkingZones();
             }
-            resetCalibValidationBadge();
           }
+          resetCalibValidationBadge();
         }
         showToast("已提取标定帧 #" + (res.frame_index != null ? res.frame_index : frameIdx));
       })
@@ -2938,18 +3376,23 @@
       return;
     }
 
+    var ver = state.calibVersion;
+    var reqId = ++state.calibPreviewReqId;
     showCalibError("");
     if (dom.btnCalibPreview) {
       dom.btnCalibPreview.disabled = true;
       dom.btnCalibPreview.textContent = "求解中...";
     }
 
-    fetchJson("/api/calibration/preview", {
+    return fetchJson("/api/calibration/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8" },
       body: JSON.stringify(payload)
     })
       .then(function (res) {
+        if (ver !== state.calibVersion || reqId !== state.calibPreviewReqId) {
+          return;
+        }
         state.calibPreview = res;
         if (dom.calibValidBadge) {
           dom.calibValidBadge.textContent = res.valid ? "单应矩阵有效" : "校验异常";
@@ -2965,6 +3408,9 @@
         }
       })
       .catch(function (err) {
+        if (ver !== state.calibVersion || reqId !== state.calibPreviewReqId) {
+          return;
+        }
         if (dom.calibValidBadge) {
           dom.calibValidBadge.textContent = "校验失败";
           dom.calibValidBadge.className = "status-badge-fail mono";
@@ -2972,7 +3418,7 @@
         showCalibError("单应矩阵校验失败: " + err.message);
       })
       .finally(function () {
-        if (dom.btnCalibPreview) {
+        if (reqId === state.calibPreviewReqId && dom.btnCalibPreview) {
           dom.btnCalibPreview.disabled = false;
           dom.btnCalibPreview.textContent = "校验单应矩阵";
         }
@@ -3395,12 +3841,12 @@
       payload.max_frames = parsedMax;
     }
 
-    state.pipelineConfig.speedModel = payload.speed_model;
-    state.pipelineConfig.conflictModel = payload.conflict_model;
-    state.pipelineConfig.stitching = payload.enable_stitching;
-    state.pipelineConfig.cyclistVru = payload.include_cyclist_vru;
-    syncPipelineControls();
-    applyPipelineConfigChange();
+    var submittedConfig = {
+      speedModel: payload.speed_model,
+      conflictModel: payload.conflict_model,
+      stitching: payload.enable_stitching,
+      cyclistVru: payload.include_cyclist_vru
+    };
 
     dom.jobDialogSubmit.disabled = true;
     dom.jobDialogSubmit.textContent = "启动中...";
@@ -3416,7 +3862,7 @@
         if (job && typeof job === "object") {
           job.speed_limit_kmh = payload.speed_limit_kmh;
         }
-        enterLiveJobMode(job);
+        enterLiveJobMode(job, submittedConfig);
       })
       .catch(function (err) {
         dom.jobDialogError.textContent = "启动失败: " + err.message;
@@ -3617,6 +4063,7 @@
 
     if (dom.simSpeedModel) {
       dom.simSpeedModel.addEventListener("change", function () {
+        if (state.mode !== "simulation") return;
         state.pipelineConfig.speedModel = dom.simSpeedModel.value || "ctrv";
         applyPipelineConfigChange();
       });
@@ -3624,17 +4071,20 @@
 
     if (dom.simConflictModel) {
       dom.simConflictModel.addEventListener("change", function () {
+        if (state.mode !== "simulation") return;
         state.pipelineConfig.conflictModel = dom.simConflictModel.value || "obb_ssm";
         applyPipelineConfigChange();
       });
     }
 
     dom.toggleStitching.addEventListener("change", function () {
+      if (state.mode !== "simulation") return;
       state.pipelineConfig.stitching = Boolean(dom.toggleStitching.checked);
       applyPipelineConfigChange();
     });
 
     dom.toggleCyclistVru.addEventListener("change", function () {
+      if (state.mode !== "simulation") return;
       state.pipelineConfig.cyclistVru = Boolean(dom.toggleCyclistVru.checked);
       applyPipelineConfigChange();
     });
@@ -3874,6 +4324,28 @@
     loadSystemInfo();
     loadRunsList();
     loadPresets();
+  }
+
+  if (typeof window !== "undefined") {
+    window.__CampusMotionAppTestHook = {
+      state: state,
+      dom: dom,
+      getActivePipelineConfig: getActivePipelineConfig,
+      updateAlgorithmBadges: updateAlgorithmBadges,
+      setMonitorMode: setMonitorMode,
+      buildRunDataset: buildRunDataset,
+      isReplayFrameLoaded: isReplayFrameLoaded,
+      ensureReplayFrameWindow: ensureReplayFrameWindow,
+      buildReplayFramePayload: buildReplayFramePayload,
+      renderReplayFrame: renderReplayFrame,
+      enterReplayMode: enterReplayMode,
+      enterLiveJobMode: enterLiveJobMode,
+      pollLiveJobState: pollLiveJobState,
+      stopLiveJobPolling: stopLiveJobPolling,
+      resetCalibValidationBadge: resetCalibValidationBadge,
+      previewCalibration: previewCalibration,
+      renderHistoryTables: renderHistoryTables
+    };
   }
 
   if (document.readyState === "loading") {

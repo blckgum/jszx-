@@ -436,6 +436,7 @@ class RoadCalibrator:
         self._init_intrinsics_attrs(cam_list, cam_np, cam_inv_np, dist_list, dist_np)
         self._used_ransac = False
         self._ransac_reproj_threshold_m = 0.5
+        self._inlier_indices: Optional[List[int]] = [0, 1, 2, 3]
 
         # 定义地面标准矩形（顺时针：左上 -> 右上 -> 右下 -> 左下）
         self.ground_points = [
@@ -584,6 +585,7 @@ class RoadCalibrator:
 
         obj.reprojection_rmse_m = math.sqrt(sum(sq_errors) / len(sq_errors))
         obj.inlier_count = len(inlier_indices)
+        obj._inlier_indices = list(inlier_indices)
         return obj
 
     @classmethod
@@ -1033,6 +1035,14 @@ class RoadCalibrator:
         img_pts = getattr(self, "image_points", None)
         if not isinstance(gd_pts, (list, tuple)) or not isinstance(img_pts, (list, tuple)) or len(gd_pts) < 4 or len(img_pts) < 4:
             return None
+        inlier_idx = getattr(self, "_inlier_indices", None)
+        if (
+            isinstance(inlier_idx, (list, tuple))
+            and len(inlier_idx) >= 4
+            and all(isinstance(i, int) and 0 <= i < min(len(gd_pts), len(img_pts)) for i in inlier_idx)
+        ):
+            gd_pts = [gd_pts[i] for i in inlier_idx]
+            img_pts = [img_pts[i] for i in inlier_idx]
         if not all(_is_finite_real(px) and _is_finite_real(py) for px, py in gd_pts):
             return None
         g_cx = sum(float(px) for px, _ in gd_pts) / len(gd_pts)

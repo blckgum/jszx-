@@ -606,8 +606,9 @@ def evaluate_mot(
             for r_i, c_i in zip(nz_rows.tolist(), nz_cols.tolist()):
                 idf1_pair_counts[(g_ids[r_i], p_ids[c_i])] += 1
 
-        # CLEAR 边权 = 1.0 + IoU，确保先最大化匹配对数量，再在同基数下选最大 IoU 总和
-        clear_pairs = _solve_max_weight_assignment(1.0 + iou_mat, valid, use_lap=_use_lap)
+        # CLEAR 边权 = (min(N, M) + 1) + IoU，确保绝对优先最大化匹配对基数，再在同基数下选最大 IoU 总和
+        card_bonus = float(min(len(g_ids), len(p_ids)) + 1)
+        clear_pairs = _solve_max_weight_assignment(card_bonus + iou_mat, valid, use_lap=_use_lap)
         matched_gt_set: set[int] = set()
         for r_i, c_i in clear_pairs:
             gid = g_ids[r_i]

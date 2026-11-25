@@ -11,7 +11,10 @@ from collections import Counter
 from pathlib import Path
 from statistics import fmean
 
+import numpy as np
 import yaml
+
+from .mot_eval import _hungarian_max_weight
 
 
 def _is_blank_path(value) -> bool:
@@ -293,50 +296,64 @@ def evaluate_ground_truth(
         "items": speed_items,
     }
 
-    # 2) 事件级 1-to-1 贪心匹配：按种类、可选 ID 约束及容差扩展区间 [p_start-tol, p_end+tol]
-    # 与真值区间的重叠时长降序配对（重叠相同时优先匹配起始时刻更接近者），计算 TP/FP/FN 与提前量。
+    # 2) 事件级 1-to-1 最大基数最优匹配：先最大化 TP 匹配数量，再最大化区间重叠时长并最小化起始时刻差。
     gt_events = parsed["expected_events"]
-    candidates = []
-    for gi, g in enumerate(gt_events):
-        for pi, p in enumerate(events):
-            if not isinstance(p, dict) or p.get("kind") != g["kind"]:
-                continue
-            # 用精确布尔排除，防止 Python 中 True == 1 把布尔 track_id 误配为 1 号目标。
-            p_veh = p.get("veh_track_id")
-            p_ped = p.get("ped_track_id")
-            if g["veh_track_id"] is not None and (type(p_veh) is bool or p_veh != g["veh_track_id"]):
-                continue
-            if g["ped_track_id"] is not None and (type(p_ped) is bool or p_ped != g["ped_track_id"]):
-                continue
-            raw_start = p.get("start_timestamp_s")
-            raw_end = p.get("end_timestamp_s")
-            if type(raw_start) is bool or type(raw_end) is bool:
-                continue
-            try:
-                p_start = float(raw_start)
-                p_end = float(raw_end)
-            except (TypeError, ValueError):
-                continue
-            # 忽略非有限、负时间戳或起止倒挂的无效预测事件，防止异常区间产生伪匹配。
-            if not (math.isfinite(p_start) and math.isfinite(p_end)) or p_start < 0 or p_end < p_start:
-                continue
-            ov_start = max(p_start - tol, g["start_timestamp_s"])
-            ov_end = min(p_end + tol, g["end_timestamp_s"])
-            if ov_end >= ov_start:
-                overlap = ov_end - ov_start
-                start_diff = abs(p_start - g["start_timestamp_s"])
-                candidates.append((overlap, -start_diff, gi, pi))
-
-    candidates.sort(reverse=True)
-    matched_gt: set[int] = set()
-    matched_pred: set[int] = set()
+    n_gt = len(gt_events)
+    n_pred = len(events)
     matched_pairs = []
-    for _, _, gi, pi in candidates:
-        if gi in matched_gt or pi in matched_pred:
-            continue
-        matched_gt.add(gi)
-        matched_pred.add(pi)
-        matched_pairs.append((gt_events[gi], events[pi]))
+    if n_gt > 0 and n_pred > 0:
+        valid = np.zeros((n_gt, n_pred), dtype=bool)
+        ov_mat = np.zeros((n_gt, n_pred), dtype=np.float64)
+        sd_mat = np.zeros((n_gt, n_pred), dtype=np.float64)
+        max_ov = 0.0
+        max_sd = 0.0
+        for gi, g in enumerate(gt_events):
+            for pi, p in enumerate(events):
+                if not isinstance(p, dict) or p.get("kind") != g["kind"]:
+                    continue
+                # 用精确布尔排除，防止 Python 中 True == 1 把布尔 track_id 误配为 1 号目标。
+                p_veh = p.get("veh_track_id")
+                p_ped = p.get("ped_track_id")
+                if g["veh_track_id"] is not None and (type(p_veh) is bool or p_veh != g["veh_track_id"]):
+                    continue
+                if g["ped_track_id"] is not None and (type(p_ped) is bool or p_ped != g["ped_track_id"]):
+                    continue
+                raw_start = p.get("start_timestamp_s")
+                raw_end = p.get("end_timestamp_s")
+                if type(raw_start) is bool or type(raw_end) is bool:
+                    continue
+                try:
+                    p_start = float(raw_start)
+                    p_end = float(raw_end)
+                except (TypeError, ValueError):
+                    continue
+                # 忽略非有限、负时间戳或起止倒挂的无效预测事件，防止异常区间产生伪匹配。
+                if not (math.isfinite(p_start) and math.isfinite(p_end)) or p_start < 0 or p_end < p_start:
+                    continue
+                ov_start = max(p_start - tol, g["start_timestamp_s"])
+                ov_end = min(p_end + tol, g["end_timestamp_s"])
+                if ov_end >= ov_start:
+                    overlap = ov_end - ov_start
+                    start_diff = abs(p_start - g["start_timestamp_s"])
+                    valid[gi, pi] = True
+                    ov_mat[gi, pi] = overlap
+                    sd_mat[gi, pi] = start_diff
+                    if overlap > max_ov:
+                        max_ov = overlap
+                    if start_diff > max_sd:
+                        max_sd = start_diff
+
+        if bool(np.any(valid)):
+            ov_cap = max(1.0, max_ov)
+            sd_cap = max(1.0, max_sd)
+            card_bonus = float(min(n_gt, n_pred) + 1) * (ov_cap + 2.0)
+            weights = np.where(
+                valid,
+                card_bonus + ov_mat - 1e-4 * (sd_mat / sd_cap),
+                0.0,
+            )
+            pairs = _hungarian_max_weight(weights, valid)
+            matched_pairs = [(gt_events[gi], events[pi]) for gi, pi in pairs]
 
     tp = len(matched_pairs)
     fp = len(events) - tp

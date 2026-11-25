@@ -1179,6 +1179,32 @@ class TestStandaloneDesktopHost(unittest.TestCase):
                 with self.assertRaises(OSError):
                     desktop_mod._bind_server_with_port_scan(service, "127.0.0.1", occupied_port)
 
+    def test_desktop_startup_lock_serializes_concurrent_checks(self):
+        import threading
+        import time as time_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "instance.lock"
+            active = {"cnt": 0, "max_active": 0}
+            guard = threading.Lock()
+
+            def _worker():
+                with desktop_mod._startup_lock(lock_path, timeout_s=5.0):
+                    with guard:
+                        active["cnt"] += 1
+                        active["max_active"] = max(active["max_active"], active["cnt"])
+                    time_mod.sleep(0.05)
+                    with guard:
+                        active["cnt"] -= 1
+
+            t1 = threading.Thread(target=_worker)
+            t2 = threading.Thread(target=_worker)
+            t1.start()
+            t2.start()
+            t1.join(timeout=5.0)
+            t2.join(timeout=5.0)
+            self.assertEqual(active["max_active"], 1)
+
     def test_frontend_web_contract_and_zero_emoji(self):
         web_dir = REPO_ROOT / "analysis" / "web"
         html = (web_dir / "index.html").read_text(encoding="utf-8")
@@ -1207,9 +1233,15 @@ class TestStandaloneDesktopHost(unittest.TestCase):
         self.assertIn(".pipeline-node:focus,", styles)
         self.assertIn(".pipeline-node:focus-visible", styles)
         self.assertIn(".pipeline-node .node-focus-ring", styles)
+        self.assertIn("--surface-hairline-top: inset 0 1px 0 var(--surface-hairline-top-color);", styles)
+        self.assertIn("light-dark(rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.06))", styles)
+        self.assertIn(".table-jump-btn", styles)
 
         self.assertIn("widgets.roadTwin.setConfig", app_js)
         self.assertIn("getPipelineStageDetail", app_js)
+        self.assertIn("getActivePipelineConfig", app_js)
+        self.assertIn("ensureReplayFrameWindow", app_js)
+        self.assertIn("makeJumpRowHeader", app_js)
         self.assertIn("dom.replayFrameImg.onerror", app_js)
         self.assertIn("clearHistoryDisplay", app_js)
         self.assertIn("isPlayableRun", app_js)
@@ -1221,6 +1253,8 @@ class TestStandaloneDesktopHost(unittest.TestCase):
         self.assertIn("CampusRoadTwinCanvas.prototype.setConfig", motion_js)
         self.assertIn("computeCvmCircleTtc", motion_js)
         self.assertIn("SCENARIO_CYCLE_S", motion_js)
+        self.assertIn("rolloutVehicleTrajectory", motion_js)
+        self.assertIn("resolveHeadingRad", motion_js)
 
         emoji_re = re.compile(
             "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0000FE0F]"
@@ -1316,6 +1350,7 @@ function obbClearance(veh, vru) {
 
 const scenarios = ["crosswalk_braking", "cyclist_vru_cutin", "ctrv_curve_yield"];
 const scenarioSummary = {};
+const cycleSteps = Math.round(CM._SCENARIO_CYCLE_S * 25);
 
 for (const sc of scenarios) {
   const twin = new CM.CampusRoadTwinCanvas(mkEl(), {
@@ -1323,22 +1358,23 @@ for (const sc of scenarios) {
   });
   twin.setScenario(sc);
   twin._petCells = Object.create(null);
+  twin._lastPetTimeS = null;
   twin._vehTrails = Object.create(null);
 
   let minClear = Infinity;
   let minX = Infinity;
   let maxX = -Infinity;
   let minY = Infinity;
-  let maxY = -Infinity;
   let parkClips = 0;
   let l2Steps = 0;
   let l3Steps = 0;
   let sawL3 = false;
   let departureAlerts = 0;
   let lastRisk = -1;
+  let endActiveVeh = 0;
 
-  for (let i = 0; i < 160; i += 1) {
-    const t = i * 0.05;
+  for (let i = 0; i < cycleSteps; i += 1) {
+    const t = i * 0.04;
     const st = CM._buildScenarioState(sc, t, twin._config);
     twin._evaluateSimulation(st, t, 0);
     const snap = twin._latestSimSnapshot;
@@ -1348,15 +1384,17 @@ for (const sc of scenarios) {
       l3Steps += 1;
       sawL3 = true;
     }
-    if (sawL3 && t >= 5.2 && snap.riskLevel >= 2) {
+    if (sawL3 && t >= 5.6 && snap.riskLevel >= 2) {
       departureAlerts += 1;
+    }
+    if (t >= CM._SCENARIO_CYCLE_S - 0.12) {
+      endActiveVeh = st.vehicles.filter((v) => !v.inParkingZone).length;
     }
 
     for (const v of st.vehicles) {
       minX = Math.min(minX, v.x);
       maxX = Math.max(maxX, v.x);
       minY = Math.min(minY, v.y);
-      maxY = Math.max(maxY, v.y);
       if (!v.inParkingZone) {
         const c = Math.cos(v.headingRad);
         const s = Math.sin(v.headingRad);
@@ -1389,8 +1427,11 @@ for (const sc of scenarios) {
   if (minClear < 0.30) {
     throw new Error(`${sc}: collision or tight pass minClear=${minClear}`);
   }
-  if (minX < -2.9 || maxX > 2.9 || minY < 0.5 || maxY > 14.95) {
-    throw new Error(`${sc}: out of road bounds x=[${minX},${maxX}] y=[${minY},${maxY}]`);
+  if (minX < -2.9 || maxX > 2.9 || minY < 0.4) {
+    throw new Error(`${sc}: out of road bounds x=[${minX},${maxX}] minY=${minY}`);
+  }
+  if (endActiveVeh !== 0) {
+    throw new Error(`${sc}: expected ego vehicle off-screen before wrap, got ${endActiveVeh}`);
   }
   if (parkClips !== 0) {
     throw new Error(`${sc}: active vehicle clipped parking zone (${parkClips} hits)`);
@@ -1401,8 +1442,68 @@ for (const sc of scenarios) {
   if (departureAlerts !== 0 || lastRisk !== 0) {
     throw new Error(`${sc}: unexpected departure alert depAlerts=${departureAlerts} lastRisk=${lastRisk}`);
   }
-  scenarioSummary[sc] = { minClear, l2Steps, l3Steps, lastRisk };
+  scenarioSummary[sc] = { minClear, l2Steps, l3Steps, lastRisk, endActiveVeh };
 }
+
+// 验证 predictCtrvArc 与 computeCpaAndTtc 使用完全同一的外推点（无 0.72 分裂）
+const sampleVeh = { x: 0, y: 2, vx: 0, vy: 6, accelMs2: -3.0, headingRad: Math.PI * 0.5, yawRate: 0, lengthM: 4.5, widthM: 1.9 };
+const arc = CM._predictCtrvArc(sampleVeh, 2.5, 50, "ctrv");
+const pt2s = arc[40]; // t = 2.0s
+const stationaryVruAt2s = { x: pt2s.x, y: pt2s.y + 2.25, vx: 0, vy: 0, radiusM: 0.40 };
+const cpaAligned = CM._computeCpaAndTtc(sampleVeh, stationaryVruAt2s, 3.5, "ctrv");
+if (cpaAligned.ttcSeconds === null || cpaAligned.ttcSeconds > 2.05) {
+  throw new Error(`Expected aligned arc & TTC <= 2.05s, got ${JSON.stringify(cpaAligned)}`);
+}
+
+// 验证 PET 网格：同步占用同格返回 null，先出后进才生成正值 PET
+const petTwin = new CM.CampusRoadTwinCanvas(mkEl(), {});
+petTwin._petCells = Object.create(null);
+petTwin._lastPetTimeS = null;
+petTwin._recordPetGrid(
+  [{ trackId: 1, x: 0, y: 5, speedKmh: 20, headingRad: 0, lengthM: 4.0, widthM: 2.0, inParkingZone: false }],
+  [{ trackId: 2, x: 0.1, y: 5.1 }],
+  1.0
+);
+const overlapPets = Object.values(petTwin._petCells).map((c) => c.petS).filter((v) => v !== null);
+if (overlapPets.length !== 0) {
+  throw new Error(`Simultaneous PET must be null, got ${JSON.stringify(overlapPets)}`);
+}
+petTwin._recordPetGrid(
+  [{ trackId: 1, x: 10, y: 5, speedKmh: 20, headingRad: 0, lengthM: 4.0, widthM: 2.0, inParkingZone: false }],
+  [],
+  1.4
+);
+petTwin._recordPetGrid([], [{ trackId: 2, x: 0.1, y: 5.1 }], 1.8);
+const exitPets = Object.values(petTwin._petCells).map((c) => c.petS).filter((v) => v !== null);
+if (exitPets.length === 0 || Math.abs(exitPets[0] - 0.8) > 1e-6) {
+  throw new Error(`Expected PET=0.8s after exit, got ${JSON.stringify(exitPets)}`);
+}
+petTwin.destroy();
+
+// 验证 headingDeg=0 (headingRad=0) 在 BEV _renderCurrent 中的 rotate 角精确为 0（不被拧成 Math.PI/2）
+const rotAngles = [];
+const rotEl = mkEl();
+const baseCtx = rotEl.getContext();
+const spyCtx = new Proxy(baseCtx, {
+  get(t, p) {
+    if (p === "rotate") return (ang) => { rotAngles.push(ang); };
+    return t[p];
+  }
+});
+rotEl.getContext = () => spyCtx;
+const h0Twin = new CM.CampusRoadTwinCanvas(rotEl, {});
+h0Twin.setMode("replay");
+h0Twin.setReplayFrame({
+  frameIndex: 0,
+  timestampS: 0.0,
+  vehicles: [{ track_id: 1, category: "car", x_m: 0, y_m: 3, vx_ms: 4, vy_ms: 0, speed_kmh: 14.4 }],
+  vrus: [],
+  conflicts: []
+});
+if (Math.abs(h0Twin._currentRenderState.vehicles[0].headingRad - 0) > 1e-9 || !rotAngles.some((a) => Math.abs(a) < 1e-9)) {
+  throw new Error(`Expected 0 rad rotation for headingDeg=0, got angles=${JSON.stringify(rotAngles)}`);
+}
+h0Twin.destroy();
 
 const replayTwin = new CM.CampusRoadTwinCanvas(mkEl(), {});
 replayTwin.setMode("replay");
@@ -1488,6 +1589,336 @@ console.log(JSON.stringify({ scenarioSummary, replayCriticalRisk, replaySafeRisk
         self.assertEqual(summary["replayCriticalRisk"], 3)
         self.assertEqual(summary["replaySafeRisk"], 0)
         self.assertEqual(set(summary["scenarioSummary"].keys()), {"crosswalk_braking", "cyclist_vru_cutin", "ctrv_curve_yield"})
+
+    def test_app_js_replay_polling_calibration_and_table_contracts(self):
+        node_bin = shutil.which("node")
+        if node_bin is None:
+            self.skipTest("node runtime not available")
+
+        app_path = REPO_ROOT / "analysis" / "web" / "assets" / "app.js"
+        node_script = r"""
+const fs = require("fs");
+const vm = require("vm");
+
+function makeNode(tag) {
+  const listeners = {};
+  const attrs = {};
+  const classes = new Set();
+  const node = {
+    tagName: String(tag || "div").toUpperCase(),
+    id: "",
+    textContent: "",
+    value: "",
+    checked: true,
+    disabled: false,
+    hidden: false,
+    title: "",
+    className: "",
+    dataset: {},
+    children: [],
+    style: { setProperty: () => {} },
+    classList: {
+      add: (...c) => c.forEach((x) => classes.add(x)),
+      remove: (...c) => c.forEach((x) => classes.delete(x)),
+      toggle: (c, f) => { if (f === undefined ? !classes.has(c) : f) classes.add(c); else classes.delete(c); },
+      contains: (c) => classes.has(c)
+    },
+    setAttribute: (k, v) => { attrs[k] = String(v); },
+    getAttribute: (k) => (k in attrs ? attrs[k] : null),
+    removeAttribute: (k) => { delete attrs[k]; },
+    appendChild: (ch) => {
+      if (ch && ch._isFrag) node.children.push(...ch.children);
+      else node.children.push(ch);
+      return ch;
+    },
+    removeChild: (ch) => {
+      node.children = node.children.filter((x) => x !== ch);
+    },
+    addEventListener: (ev, fn) => { (listeners[ev] = listeners[ev] || []).push(fn); },
+    dispatchEvent: (ev) => { (listeners[ev.type] || []).forEach((fn) => fn(ev)); },
+    querySelectorAll: () => [],
+    closest: () => null,
+    focus: () => {}
+  };
+  return node;
+}
+
+const byId = {};
+const getEl = (id) => (byId[id] = byId[id] || Object.assign(makeNode("div"), { id }));
+
+const simSpd = getEl("sim-speed-model"); simSpd.value = "ctrv";
+const simConf = getEl("sim-conflict-model"); simConf.value = "obb_ssm";
+const togStitch = getEl("toggle-stitching"); togStitch.checked = true;
+const togVru = getEl("toggle-cyclist-vru"); togVru.checked = true;
+for (const nid of [
+  "sidebar-nav", "view-title", "view-subtitle", "replay-scrubber",
+  "replay-frame-label", "replay-media-caption", "replay-frame-img", "replay-video",
+  "replay-sim-canvas", "twin-counts", "kpi-frames-meta", "kpi-speed-meta",
+  "live-mjpeg-img", "live-media-caption", "live-job-status-text", "btn-stop-job",
+  "badge-speed-model", "badge-conflict-model", "badge-vru-model", "twin-mode-label",
+  "calib-valid-badge", "calib-rmse-val", "calib-inliers-val", "btn-calib-preview",
+  "calib-width-m", "calib-length-m", "calib-name", "calib-use-ransac", "calib-error",
+  "conflicts-tbody", "events-tbody", "speeds-tbody",
+  "conflicts-table-region", "events-table-region", "speeds-table-region", "history-table-meta",
+  "viewport-sim-panel", "viewport-replay-panel", "viewport-live-panel",
+  "sim-controls", "replay-controls", "live-controls", "scenario-select",
+  "viewport-mode-badge", "sidebar-mode-text", "sidebar-target-text", "btn-twin-pause",
+  "pipeline-stage-detail", "driver-alert-banner", "driver-alert-list",
+  "ped-alert-banner", "ped-alert-list", "alert-log-list", "alert-log-count"
+]) {
+  getEl(nid);
+}
+byId["calib-width-m"].value = "6";
+byId["calib-length-m"].value = "15";
+byId["calib-name"].value = "campus";
+
+let fetchRoutes = {};
+const fetchCalls = [];
+const sandbox = {
+  console,
+  document: {
+    readyState: "loading",
+    documentElement: makeNode("html"),
+    getElementById: getEl,
+    querySelector: (sel) => (sel.startsWith("#") ? getEl(sel.slice(1)) : makeNode("div")),
+    querySelectorAll: () => [],
+    createElement: makeNode,
+    createDocumentFragment: () => ({ _isFrag: true, children: [], appendChild(c) { this.children.push(c); } }),
+    addEventListener: () => {}
+  },
+  localStorage: { getItem: () => null, setItem: () => {} },
+  navigator: {},
+  requestAnimationFrame: (fn) => { fn(); return 1; },
+  cancelAnimationFrame: () => {},
+  setTimeout: () => 1,
+  clearTimeout: () => {},
+  setInterval: () => 1,
+  clearInterval: () => {},
+  fetch: (url) => {
+    fetchCalls.push(url);
+    const handler = fetchRoutes[url];
+    if (typeof handler === "function") return handler(url);
+    return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve("{}") });
+  },
+  CampusMotion: {
+    RollingCounter: function () { this.val = null; this.setValue = (v) => { this.val = v; }; },
+    AnimatedSignalPipeline: function () { this.setConfig = () => {}; this.setRiskLevel = () => {}; this.setPaused = () => {}; },
+    CampusRoadTwinCanvas: function () {
+      this.frames = [];
+      this.setConfig = () => {};
+      this.setMode = () => {};
+      this.setScenario = () => {};
+      this.setPaused = () => {};
+      this.setReplayFrame = (f) => { this.frames.push(f); };
+      this.refreshTheme = () => {};
+    },
+    SimulatedCameraCanvas: function () { this.renderState = () => {}; this.refreshTheme = () => {}; },
+    SpeedTimelineChart: function () { this.setData = () => {}; this.setActiveFrame = () => {}; },
+    CalibrationCanvas: function () {
+      this.getState = () => ({
+        imagePoints: [[0,0],[100,0],[100,100],[0,100]],
+        parkingZonesImage: [],
+        currentParkingDraft: []
+      });
+    },
+    AlertAudioSynth: function () { this.trigger = () => {}; }
+  }
+};
+sandbox.window = sandbox;
+sandbox.globalThis = sandbox;
+vm.runInNewContext(fs.readFileSync(process.env.APP_JS_PATH, "utf8"), sandbox);
+
+const hook = sandbox.window.__CampusMotionAppTestHook;
+if (!hook) throw new Error("Missing __CampusMotionAppTestHook");
+
+// 初始化引用 dom 并设置轻量 widgets
+const dom = hook.dom;
+dom.badgeSpeedModel = byId["badge-speed-model"];
+dom.badgeConflictModel = byId["badge-conflict-model"];
+dom.badgeVruModel = byId["badge-vru-model"];
+dom.simSpeedModel = simSpd;
+dom.simConflictModel = simConf;
+dom.toggleStitching = togStitch;
+dom.toggleCyclistVru = togVru;
+dom.replayScrubber = byId["replay-scrubber"];
+dom.replayFrameLabel = byId["replay-frame-label"];
+dom.replayMediaCaption = byId["replay-media-caption"];
+dom.replayFrameImg = byId["replay-frame-img"];
+dom.replayVideo = byId["replay-video"];
+dom.twinCounts = byId["twin-counts"];
+dom.twinModeLabel = byId["twin-mode-label"];
+dom.kpiFramesMeta = byId["kpi-frames-meta"];
+dom.kpiSpeedMeta = byId["kpi-speed-meta"];
+dom.calibValidBadge = byId["calib-valid-badge"];
+dom.calibRmseVal = byId["calib-rmse-val"];
+dom.calibInliersVal = byId["calib-inliers-val"];
+dom.btnCalibPreview = byId["btn-calib-preview"];
+dom.calibWidthM = byId["calib-width-m"];
+dom.calibLengthM = byId["calib-length-m"];
+dom.calibName = byId["calib-name"];
+dom.calibUseRansac = byId["calib-use-ransac"];
+dom.calibError = byId["calib-error"];
+dom.conflictsTbody = byId["conflicts-tbody"];
+dom.eventsTbody = byId["events-tbody"];
+dom.speedsTbody = byId["speeds-tbody"];
+dom.conflictsTableRegion = byId["conflicts-table-region"];
+dom.eventsTableRegion = byId["events-table-region"];
+dom.speedsTableRegion = byId["speeds-table-region"];
+dom.historyTableMeta = byId["history-table-meta"];
+dom.viewportSimPanel = byId["viewport-sim-panel"];
+dom.viewportReplayPanel = byId["viewport-replay-panel"];
+dom.viewportLivePanel = byId["viewport-live-panel"];
+dom.simControls = byId["sim-controls"];
+dom.replayControls = byId["replay-controls"];
+dom.liveControls = byId["live-controls"];
+dom.scenarioSelect = byId["scenario-select"];
+dom.viewportModeBadge = byId["viewport-mode-badge"];
+dom.sidebarModeText = byId["sidebar-mode-text"];
+dom.sidebarTargetText = byId["sidebar-target-text"];
+dom.btnTwinPause = byId["btn-twin-pause"];
+dom.pipelineStageDetail = byId["pipeline-stage-detail"];
+dom.liveMjpegImg = byId["live-mjpeg-img"];
+dom.liveMediaCaption = byId["live-media-caption"];
+dom.liveJobStatusText = byId["live-job-status-text"];
+dom.btnStopJob = byId["btn-stop-job"];
+
+async function runChecks() {
+  // 1) 超过 5,000 行截断回放：先进入加载态并自动请求区间接口，不渲染虚假 0 目标/L0
+  const ds = hook.buildRunDataset(
+    "run-big",
+    { frames_processed: 1500, has_video: false },
+    { events: [{ event_id: 1, kind: "speeding", veh_track_id: 1, start_frame: 0, end_frame: 0, peak_risk_level: 1 }] },
+    { conflicts: [{ frame_index: 0, timestamp_s: 0.0, assessment: { veh_track_id: 1, risk_level: 0 } }], total_count: 6000, truncated: true },
+    { rows: [{ frame_idx: "0", timestamp_s: "0.0", track_id: "1", category: "vehicle", object_kind: "bus", length_m: "10.0", width_m: "2.55", x_m: "1.0", y_m: "2.0", speed_kmh: "18.0", risk_level: "LEVEL_0_SAFE" }], total_rows: 7500, truncated: true }
+  );
+  hook.state.mode = "replay";
+  hook.state.replay.runId = "run-big";
+  hook.state.replay.data = ds;
+  fetchRoutes["/api/runs/run-big/speeds?frame_start=1000&frame_end=1249&limit=20000"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      rows: [
+        { frame_idx: "1200", timestamp_s: "48.0", track_id: "7", category: "vehicle", object_kind: "bus", length_m: "10.0", width_m: "2.55", x_m: "2.0", y_m: "8.0", speed_kmh: "32.0", risk_level: "LEVEL_3_CRITICAL" },
+        { frame_idx: "1200", timestamp_s: "48.0", track_id: "8", category: "vehicle", object_kind: "bicycle", x_m: "2.5", y_m: "9.0", speed_kmh: "12.0", risk_level: "LEVEL_2_CAUTION" }
+      ]
+    }))
+  });
+  fetchRoutes["/api/runs/run-big/conflicts?frame_start=1000&frame_end=1249&limit=20000"] = () => Promise.resolve({
+    ok: true, status: 200,
+    text: () => Promise.resolve(JSON.stringify({
+      conflicts: [{ frame_index: 1200, timestamp_s: 48.0, assessment: { veh_track_id: 7, ped_track_id: 8, risk_level: 3, ttc_seconds: 1.1, veh_speed_kmh: 32.0 } }]
+    }))
+  });
+
+  hook.renderReplayFrame(1200);
+  if (dom.twinCounts.textContent.indexOf("加载中") < 0) {
+    throw new Error("Expected explicit loading status for unloaded frame 1200, got: " + dom.twinCounts.textContent);
+  }
+  await hook.ensureReplayFrameWindow(ds, 1200, hook.state.replayReqToken);
+  const frame1200 = hook.buildReplayFramePayload(ds, 1200);
+  if (frame1200.vehicles.length !== 1 || frame1200.vehicles[0].kind !== "bus" || frame1200.vehicles[0].lengthM !== 10.0) {
+    throw new Error("Expected bus fine class & lengthM=10, got: " + JSON.stringify(frame1200.vehicles));
+  }
+  if (frame1200.vrus.length !== 1 || frame1200.vrus[0].kind !== "bicycle") {
+    throw new Error("Expected bicycle routed to VRU, got: " + JSON.stringify(frame1200.vrus));
+  }
+  if (frame1200.riskLevel !== 3) {
+    throw new Error("Expected riskLevel=3 after window merge, got: " + frame1200.riskLevel);
+  }
+
+  // 2) 实时模式徽标解耦 & 串口化轮询乱序拦截
+  hook.state.liveJob.jobId = "job-1";
+  hook.state.liveJob.pollToken = 1;
+  hook.state.liveJob.pollSeq = 0;
+  hook.state.liveJob.lastAppliedPollSeq = 0;
+  hook.state.liveJob.config = { speedModel: "ctrv", conflictModel: "obb_ssm", stitching: true, cyclistVru: true };
+  hook.setMonitorMode("live");
+  hook.updateAlgorithmBadges();
+  if (dom.badgeSpeedModel.textContent !== "CTRV" || dom.badgeConflictModel.textContent !== "OBB-SSM") {
+    throw new Error("Expected CTRV/OBB-SSM live badge");
+  }
+  // 模拟下拉仍保持旧值也不会改写实时徽标
+  simSpd.value = "ema";
+  hook.updateAlgorithmBadges();
+  if (dom.badgeSpeedModel.textContent !== "CTRV") {
+    throw new Error("Simulation select leaked into live badge: " + dom.badgeSpeedModel.textContent);
+  }
+
+  // 3) 乱序轮询 B(120) 先返回、A(100) 后返回，状态保持 120 帧
+  let resA;
+  const pA = new Promise((r) => { resA = r; });
+  fetchRoutes["/api/jobs/job-1"] = (url) => {
+    if (hook.state.liveJob.pollSeq === 1) return pA;
+    return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ job_id: "job-1", status: "running", frames_processed: 120, latest_timestamp_s: 4.8 })) });
+  };
+  fetchRoutes["/api/jobs/job-1/alerts?since=0&limit=100"] = () => Promise.resolve({
+    ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ alerts: [] }))
+  });
+  const callA = hook.pollLiveJobState(); // seq=1
+  const callB = hook.pollLiveJobState(); // seq=2
+  await callB;
+  resA({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ job_id: "job-1", status: "running", frames_processed: 100, latest_timestamp_s: 4.0 })) });
+  await callA;
+  if (hook.state.liveJob.lastFramesProcessed !== 120) {
+    throw new Error("Stale poll overwrote frame count: " + hook.state.liveJob.lastFramesProcessed);
+  }
+
+  // 4) 标定预览期间清空点位 -> 旧响应必须被版本护卫丢弃
+  hook.state.calibState = {
+    imagePoints: [[0,0],[100,0],[100,100],[0,100]],
+    parkingZonesImage: [],
+    currentParkingDraft: []
+  };
+  hook.state.calibGroundPoints = [[0,0],[6,0],[6,15],[0,15]];
+  let resCalib;
+  fetchRoutes["/api/calibration/preview"] = () => new Promise((r) => { resCalib = r; });
+  const prevProm = hook.previewCalibration();
+  hook.resetCalibValidationBadge();
+  resCalib({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ valid: true, reprojection_rmse_m: 0.01, inlier_count: 4 })) });
+  await prevProm;
+  if (dom.calibValidBadge.textContent !== "待校验") {
+    throw new Error("Stale calibration response applied after reset: " + dom.calibValidBadge.textContent);
+  }
+
+  // 5) 历史表格渲染原生可聚焦 .table-jump-btn
+  hook.renderHistoryTables(ds);
+  const cBtn = dom.conflictsTbody.children[0] && dom.conflictsTbody.children[0].children[0] && dom.conflictsTbody.children[0].children[0].children[0];
+  const eBtn = dom.eventsTbody.children[0] && dom.eventsTbody.children[0].children[0] && dom.eventsTbody.children[0].children[0].children[0];
+  const sBtn = dom.speedsTbody.children[0] && dom.speedsTbody.children[0].children[0] && dom.speedsTbody.children[0].children[0].children[0];
+  if (!cBtn || cBtn.tagName !== "BUTTON" || !cBtn.className.includes("table-jump-btn")) {
+    throw new Error("Missing .table-jump-btn in conflicts table");
+  }
+  if (!eBtn || eBtn.tagName !== "BUTTON" || !eBtn.className.includes("table-jump-btn")) {
+    throw new Error("Missing .table-jump-btn in events table");
+  }
+  if (!sBtn || sBtn.tagName !== "BUTTON" || !sBtn.className.includes("table-jump-btn")) {
+    throw new Error("Missing .table-jump-btn in speeds table");
+  }
+  console.log("APP_JS_CONTRACTS_OK");
+}
+
+runChecks().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+"""
+        env = os.environ.copy()
+        env["APP_JS_PATH"] = str(app_path)
+        proc = subprocess.run(
+            [node_bin, "-"],
+            input=node_script,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=env,
+            timeout=30,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            msg=f"Node app.js check failed:\nstdout={proc.stdout}\nstderr={proc.stderr}",
+        )
+        self.assertIn("APP_JS_CONTRACTS_OK", proc.stdout)
 
 
 if __name__ == "__main__":

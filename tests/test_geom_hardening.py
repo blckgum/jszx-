@@ -390,7 +390,7 @@ class TestConflictEventsAndCalibratorCliHardening(unittest.TestCase):
                     ConflictAnalyzer(**kwargs)
 
         # ttc_caution_s=3.5 < horizon_s=5.0 且 min_dist <= critical_dist_m 时，
-        # t_cpa=4.0 > ttc_caution_s 不得再误判为 LEVEL_2_CAUTION
+        # 包络首次接触 t_contact=(23.0-3.0)/5.0=4.0 > ttc_caution_s 不得误判为 LEVEL_2_CAUTION
         analyzer = ConflictAnalyzer(ttc_critical_s=1.8, ttc_caution_s=3.5, horizon_s=5.0)
         veh = SpeedReading(
             track_id=1, category="vehicle", object_kind="car",
@@ -400,7 +400,7 @@ class TestConflictEventsAndCalibratorCliHardening(unittest.TestCase):
         )
         ped = SpeedReading(
             track_id=2, category="pedestrian", object_kind="pedestrian",
-            x_m=3.0, y_m=20.0, vx_ms=0.0, vy_ms=0.0,
+            x_m=3.0, y_m=23.0, vx_ms=0.0, vy_ms=0.0,
             speed_ms=0.0, speed_kmh=0.0, is_speeding=False,
             heading_deg=0.0, is_reliable=True,
         )

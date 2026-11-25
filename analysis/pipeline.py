@@ -758,13 +758,15 @@ class ConflictPerceptionPipeline:
                 event_ids.get((c.veh_track_id, c.ped_track_id))
                 if c is not None else None
             )
+            pol_csv = object_policy(r.object_kind, r.category, self.object_policies)
             csv_writer.writerow([
                 1,
                 frame_idx, round(timestamp_s, 3), r.track_id, r.category,
                 round(r.x_m, 2), round(r.y_m, 2), round(r.speed_kmh, 1),
                 int(r.is_speeding), risk_lvl, ttc_val,
                 csv_event_id if csv_event_id is not None else "",
-                int(r.is_reliable), int(r.is_stationary)
+                int(r.is_reliable), int(r.is_stationary),
+                pol_csv.kind, round(pol_csv.length_m, 2), round(pol_csv.width_m, 2),
             ])
 
         render_frame = None
@@ -1117,7 +1119,8 @@ class ConflictPerceptionPipeline:
                 "schema_version",
                 "frame_idx", "timestamp_s", "track_id", "category",
                 "x_m", "y_m", "speed_kmh", "is_speeding", "risk_level", "ttc_s",
-                "event_id", "is_reliable", "is_stationary"
+                "event_id", "is_reliable", "is_stationary",
+                "object_kind", "length_m", "width_m",
             ])
         except BaseException as exc:
             try:
@@ -1178,7 +1181,13 @@ class ConflictPerceptionPipeline:
                     loop_state = "max_frames"
                     break
 
-                ok, frame = cap.read()
+                from .service import LatestFrameCapture
+
+                if isinstance(cap, LatestFrameCapture):
+                    ok, frame, raw_pts_ms = cap.read_with_pts()
+                else:
+                    ok, frame = cap.read()
+                    raw_pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC) if (ok and frame is not None) else float("nan")
                 if not ok or frame is None:
                     # 仅实时流在断流后触发有界重连；本地视频文件遇 EOF 或坏帧直接结束。
                     if is_live_stream and self.live_reconnect_attempts > 0:
@@ -1188,9 +1197,8 @@ class ConflictPerceptionPipeline:
                         )
                         if not reconnected or frame_re is None:
                             break
+                        raw_pts_ms = cap_holder[0].get(cv2.CAP_PROP_POS_MSEC)
                         if self.live_drop_stale_frames:
-                            from .service import LatestFrameCapture
-
                             cap_holder[0] = LatestFrameCapture(cap_holder[0])
                         cap = cap_holder[0]
                         frame = frame_re
@@ -1202,7 +1210,6 @@ class ConflictPerceptionPipeline:
                 if not hasattr(frame, "shape") or len(frame.shape) < 2 or (frame.shape[1], frame.shape[0]) != (width, height):
                     raise RuntimeError("实际解码帧分辨率与视频元数据不一致")
 
-                raw_pts_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
                 pts_ms = (
                     float(raw_pts_ms)
                     if (
@@ -1492,7 +1499,8 @@ class ConflictPerceptionPipeline:
                 "schema_version",
                 "frame_idx", "timestamp_s", "track_id", "category",
                 "x_m", "y_m", "speed_kmh", "is_speeding", "risk_level", "ttc_s",
-                "event_id", "is_reliable", "is_stationary"
+                "event_id", "is_reliable", "is_stationary",
+                "object_kind", "length_m", "width_m",
             ])
         except BaseException as exc:
             try:
@@ -1516,6 +1524,8 @@ class ConflictPerceptionPipeline:
 
         frames_processed = 0
         next_video_frame = 0
+        written_source_frames: List[int] = []
+        frame_map_path = out_dir / "video_frame_map.json"
         t_start = time.perf_counter()
         loop_state = "eof"
         loop_error = ""
@@ -1587,6 +1597,8 @@ class ConflictPerceptionPipeline:
                 )
                 if frame_max_speed > max_observed_speed_kmh:
                     max_observed_speed_kmh = frame_max_speed
+                if writer is not None and render_frame is not None:
+                    written_source_frames.append(int(frame_idx))
 
                 frames_processed += 1
 
@@ -1628,6 +1640,21 @@ class ConflictPerceptionPipeline:
                 if not main_loop_failed:
                     loop_state = "exception"
                     loop_error = f"{type(exc).__name__}: {exc}"
+            if video_src is not None and written_source_frames:
+                try:
+                    frame_map_path.write_text(
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "source_frames": written_source_frames,
+                            },
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
             if loop_state in ("interrupt", "exception"):
                 try:
                     self._write_summary_file(out_dir, {
@@ -1639,6 +1666,7 @@ class ConflictPerceptionPipeline:
                         "source_tracks": str(tracks_file),
                         "source_video": source_video_record,
                         "annotated_output": str(out_video_path) if video_src is not None else None,
+                        "video_frame_map": str(frame_map_path) if (video_src is not None and written_source_frames) else None,
                         "conflicts_jsonl": str(jsonl_path),
                         "events_jsonl": str(events_path.resolve()),
                         "speeds_csv": str(csv_path),
@@ -1668,6 +1696,7 @@ class ConflictPerceptionPipeline:
             "source_tracks": str(tracks_file),
             "source_video": source_video_record,
             "annotated_output": str(out_video_path) if video_src is not None else None,
+            "video_frame_map": str(frame_map_path) if (video_src is not None and written_source_frames) else None,
             "conflicts_jsonl": str(jsonl_path),
             "events_jsonl": str(events_path),
             "speeds_csv": str(csv_path),
