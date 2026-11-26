@@ -2,7 +2,7 @@
 
 面向校园道路固定路侧摄像头，研究车辆与行人的视觉感知、连续跟踪、实际速度估计和冲突风险预警。系统以 YOLOv8 + ByteTrack 提供检测与连续轨迹，`analysis` 模块完成道路标定、物理测速、TTC 冲突研判、事件去抖与四级预警，形成从视频输入到风险提示和事件记录的完整技术链路。
 
-**当前阶段：全链路已实现**（检测 → 跟踪 → 短时遮挡缝合 → 标定测速 → 冲突分析 → 预警、Web 控制台与独立桌面 App-Mode 宿主）。仓库共含 **349 项**单元与集成测试（在含 `lap 0.5.12` 与基础权重的验证环境下 349/349 全部通过、0 跳过；其中 `test_io_hardening.py`、`test_tracking.py`、`test_tracking_exports.py`、`test_tracking_integration.py` 共 4 个依赖 ByteTrack/`lap` 的 I/O 加固与跟踪测试模块需配合 `lap` 运行）。在完整链路（`YOLOv8n + ByteTrack + CTRV + OBB-SSM + TrackletStitcher + 骑行者 VRU`，含渲染写盘）下，RTX 5060 Ti 16GB GPU（`device=0`，`800x600@30fps`，`imgsz=640`，120 帧）端到端实测 **42.58 FPS**（含首帧 CUDA 预热；稳态 P50 `12.30 ms` 约 **81.3 FPS**、P95 `17.82 ms` 约 **56.1 FPS**；三组 360 帧已标定路侧示范视频 `imgsz=960` 实测 **56.2~66.2 FPS**），同配置 CPU 基线（Intel Core i5-14600KF，60 帧）实测 **20.47 FPS**（稳态 P50 `32.68 ms` 约 **30.6 FPS**），纯几何测速与冲突事件模块合计仅占 `1.19 ms/帧`（GPU，5.07%）与 `1.63 ms/帧`（CPU，3.35%）。低配 CPU 仍建议定位离线分析，且校园实景标定、实测车速 MAE 与预警准确率仍待实际校园录像与人工真值验证（详见[实验结果与性能基准报告](docs/实验结果与性能基准报告.md)）。
+**当前阶段：全链路已实现**（检测 → 跟踪 → 短时遮挡缝合 → 标定测速 → 冲突分析 → 预警、Web 控制台与独立桌面 App-Mode 宿主）。仓库共含 **365 项**单元与集成测试（在含 `lap 0.5.12` 与基础权重的验证环境下 **365/365** 全部通过、0 跳过；其中 `test_io_hardening.py`、`test_tracking.py`、`test_tracking_exports.py`、`test_tracking_integration.py` 共 4 个依赖 ByteTrack/`lap` 的 I/O 加固与跟踪测试模块需配合 `lap` 运行）。在完整链路（`YOLOv8n + ByteTrack + CTRV + OBB-SSM + TrackletStitcher + 骑行者 VRU`，含渲染写盘）下，RTX 5060 Ti 16GB GPU（`device=0`，`800x600@30fps`，`imgsz=640`，120 帧）实测**稳态吞吐**（显式剔除首帧 CUDA 预热，后 119 帧）**71.30 FPS**（稳态均值 `14.02 ms`、P50 `13.75 ms`、P95 `16.00 ms`），**全样本帧内处理吞吐**（含首帧预热、不含模型加载）**29.93 FPS**，**含模型加载墙钟吞吐**（含 `1254.8 ms` 模型加载）**22.72 FPS**；三组 360 帧已标定路侧示范视频（`imgsz=960`、`iou=0.65`）实测平均帧内处理吞吐 **34.4~41.5 FPS**。同配置 CPU 基线（Intel Core i5-14600KF，60 帧）实测**稳态吞吐**（剔除首帧预热，后 59 帧）**24.99 FPS**（稳态均值 `40.01 ms`、P50 `39.90 ms`、P95 `45.10 ms`），**全样本帧内处理吞吐** **17.33 FPS**，**含模型加载墙钟吞吐**（含 `1319.1 ms` 模型加载）**12.50 FPS**。纯几何测速与冲突事件两阶段稳态合计仅占 `1.20 ms/帧`（GPU，8.55%；全样本 `1.26 ms/帧`、3.76%）与 `1.74 ms/帧`（CPU，4.34%；全样本 `1.87 ms/帧`、3.23%）。低配 CPU 仍建议定位离线分析，且校园实景标定、实测车速 MAE 与预警准确率仍待实际校园录像与人工真值验证（详见[实验结果与性能基准报告](docs/实验结果与性能基准报告.md)）。
 
 ## 技术链路
 
@@ -116,7 +116,7 @@ detection/   YOLOv8 检测、训练与评估入口
 tracking/    ByteTrack 会话、轨迹与 px/s 运动记录、平滑、可视化、批处理
 analysis/    标定与偏置补偿 · EMA/CA/CTRV 测速 · CVM/圆角OBB-SSM 冲突研判 · 断轨缝合 · 事件去抖 · 真值评测 · Web 控制台与桌面 App-Mode 宿主 · 基准与出图
 configs/     bytetrack.yaml、motion.yaml、object_policy.yaml、calibration.yaml、真值与数据配置模板
-tests/       单元、集成与异常路径测试（349 项）
+tests/       单元、集成与异常路径测试（365 项）
 docs/        课题需求、研究蓝图（含数学推导）、模块 01~05 解释文档与实验结果性能基准报告
 ```
 

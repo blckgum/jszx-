@@ -36,10 +36,10 @@
 | 顺序 | 文件或函数 | 阅读重点 |
 |---|---|---|
 | 1 | [`detection/__init__.py`](../../detection/__init__.py) | 模块定位与阅读提示 |
-| 2 | [`main()`](../../detection/__main__.py#L103) | 命令参数如何分派到 detect、train 和 val |
-| 3 | [`load_model()`](../../detection/core.py#L42) | 权重加载与模型任务检查 |
-| 4 | [`select_classes()`](../../detection/core.py#L63) | 模型类别 ID 与道路类别筛选 |
-| 5 | [`detect()`](../../detection/core.py#L99) | 一帧从读取到预测、绘图和导出的全过程 |
+| 2 | [`main()`](../../detection/__main__.py#L106) | 命令参数如何分派到 detect、train 和 val |
+| 3 | [`load_model()`](../../detection/core.py#L54) | 权重加载与模型任务检查 |
+| 4 | [`select_classes()`](../../detection/core.py#L78) | 模型类别 ID 与道路类别筛选 |
+| 5 | [`detect()`](../../detection/core.py#L147) | 一帧从读取到预测、绘图和导出的全过程 |
 | 6 | [`audit_dataset()`](../../detection/dataset.py#L17) | 标注格式、目录配对、数据划分检查 |
 | 7 | [`run_training_or_validation()`](../../detection/__main__.py#L34) | 训练、评估及指标保存 |
 | 8 | [`tests/test_detection.py`](../../tests/test_detection.py) | 哪些错误需要在运行模型前发现 |

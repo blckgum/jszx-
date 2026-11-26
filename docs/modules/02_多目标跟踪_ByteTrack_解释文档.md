@@ -271,7 +271,7 @@ with open("path/to/tracks.jsonl", encoding="utf-8") as stream:
 
 批次清单逐文件更新，最终记录 videos_discovered、results 和 videos_not_processed。`completed_with_errors` 表示至少一段失败，不能只看生成了输出目录就当作全部成功。子目录成功时有完整运行汇总；在打开源文件前失败的条目以批次错误记录为准。
 
-直接调用 Python 的单帧接口时，使用一个 `TrackingSession` 连续执行 `process(frame, timestamp, timestamp_source)`。输入要求非空 uint8 BGR 三通道图像、固定分辨率、非负严格递增时间戳；来源标记只能为 video_pts 或 fps_estimate。错误输入在调用网络前拒绝，防止悄悄推进 Kalman 状态。开始新视频应创建新会话。
+直接调用 Python 的单帧接口时，使用一个 `TrackingSession` 连续执行 `process(frame, timestamp, timestamp_source)`。输入要求非空 uint8 BGR 三通道图像、固定分辨率、非负严格递增时间戳；来源标记只能为 `video_pts`、`fps_estimate` 或 `wall_clock`（实时摄像头/流时钟）。错误输入在调用网络前拒绝，防止悄悄推进 Kalman 状态。开始新视频应创建新会话。
 
 ### 8.2 没有实拍素材也可以复现
 
