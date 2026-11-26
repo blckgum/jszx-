@@ -1918,6 +1918,54 @@ class TestPipelineIO(unittest.TestCase):
         with self.assertRaises(SystemExit):
             main(["--source", "x.mp4", "--demo", "--max-frames", "-1"])
 
+    def test_cli_iou_imgsz_zone_margin_passthrough_and_validation(self):
+        from unittest import mock
+
+        from analysis.__main__ import main
+
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("analysis.__main__.ConflictPerceptionPipeline") as m_pipe:
+                main(["--source", "x.mp4", "--demo", "--output", str(Path(d) / "o_default")])
+            kw = m_pipe.call_args.kwargs
+            self.assertEqual(kw["iou"], 0.7)
+            self.assertEqual(kw["imgsz"], 640)
+            self.assertEqual(kw["zone_margin_m"], 2.0)
+
+            with mock.patch("analysis.__main__.ConflictPerceptionPipeline") as m_pipe:
+                main([
+                    "--source", "x.mp4", "--demo",
+                    "--iou", "0.65", "--imgsz", "960", "--zone-margin", "1.0",
+                    "--output", str(Path(d) / "o_custom"),
+                ])
+            kw = m_pipe.call_args.kwargs
+            self.assertAlmostEqual(kw["iou"], 0.65, places=6)
+            self.assertEqual(kw["imgsz"], 960)
+            self.assertAlmostEqual(kw["zone_margin_m"], 1.0, places=6)
+
+            with mock.patch("analysis.__main__.ConflictPerceptionPipeline") as m_pipe:
+                main([
+                    "--source", "x.mp4", "--demo",
+                    "--zone-margin", "0",
+                    "--output", str(Path(d) / "o_zero_margin"),
+                ])
+            self.assertEqual(m_pipe.call_args.kwargs["zone_margin_m"], 0.0)
+
+        for bad_args in (
+            ["--iou", "0"],
+            ["--iou", "1.5"],
+            ["--iou", "nan"],
+            ["--imgsz", "0"],
+            ["--imgsz", "-320"],
+            ["--zone-margin", "-0.1"],
+            ["--zone-margin", "inf"],
+            ["--conf", "0"],
+            ["--conf", "1.2"],
+            ["--conf", "nan"],
+        ):
+            with self.subTest(bad_args=bad_args):
+                with self.assertRaises(SystemExit):
+                    main(["--source", "x.mp4", "--demo", *bad_args])
+
     def test_legacy_calib_rejected_without_flag(self):
         # 无 synthetic 溯源字段的旧版文件无法区分实测/占位：默认拒绝
         from analysis.__main__ import main

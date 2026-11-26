@@ -83,6 +83,24 @@ def main(argv: list[str] | None = None):
         help="检测置信度阈值",
     )
     parser.add_argument(
+        "--iou",
+        type=float,
+        default=0.7,
+        help="NMS IoU 阈值 (0~1]，默认 0.7",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=640,
+        help="YOLOv8 推理输入尺寸 (像素)，默认 640",
+    )
+    parser.add_argument(
+        "--zone-margin",
+        type=float,
+        default=2.0,
+        help="标定监测区外推边界裕度 (米)，默认 2.0",
+    )
+    parser.add_argument(
         "--max-frames",
         type=int,
         default=None,
@@ -247,6 +265,14 @@ def main(argv: list[str] | None = None):
     )
     args = parser.parse_args(argv)
 
+    if args.conf is not None and (not math.isfinite(args.conf) or not (0 < args.conf <= 1)):
+        parser.error("--conf 必须在 (0, 1] 区间")
+    if not math.isfinite(args.iou) or not (0 < args.iou <= 1):
+        parser.error("--iou 必须在 (0, 1] 区间")
+    if args.imgsz <= 0:
+        parser.error("--imgsz 必须是正整数")
+    if not math.isfinite(args.zone_margin) or args.zone_margin < 0:
+        parser.error("--zone-margin 必须为有限非负数")
     if not math.isfinite(args.ema_alpha) or not (0 < args.ema_alpha <= 1):
         parser.error("--ema-alpha 必须在 (0, 1] 区间")
     if args.window < 3:
@@ -390,9 +416,12 @@ def main(argv: list[str] | None = None):
         speed_limit_kmh=args.speed_limit,
         device=args.device,
         conf=args.conf,
+        iou=args.iou,
+        imgsz=args.imgsz,
         ema_alpha=args.ema_alpha,
         window_size=args.window,
         window_seconds=args.window_s,
+        zone_margin_m=args.zone_margin,
         ttc_critical_s=args.ttc_critical,
         ttc_caution_s=args.ttc_caution,
         horizon_s=args.horizon,

@@ -255,6 +255,45 @@ class TestBenchmark(unittest.TestCase):
             self.assertEqual(rc_md, 0)
             self.assertIn("| total_frame |", out_md.read_text(encoding="utf-8"))
 
+    def test_benchmark_cli_iou_and_imgsz_passthrough_and_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_json = Path(d) / "bench_passthrough.json"
+            minimal_report = {
+                "schema_version": 1,
+                "source": "demo",
+                "frames_profiled": 0,
+                "model_load_ms": 0.0,
+                "wall_elapsed_ms": 0.0,
+                "end_to_end_fps": 0.0,
+                "frame_processing_fps": 0.0,
+                "wall_fps": 0.0,
+                "stages": {},
+                "steady_state": {"warmup_frames_excluded": 0, "frames_evaluated": 0, "steady_state_fps": None, "stages": {}},
+            }
+            with mock.patch(
+                "analysis.benchmark.profile_pipeline_stages",
+                return_value=minimal_report,
+            ) as m_prof:
+                rc = bench_main([
+                    "--demo", "--iou", "0.65", "--imgsz", "960",
+                    "--output", str(out_json),
+                ])
+            self.assertEqual(rc, 0)
+            kw = m_prof.call_args.kwargs
+            self.assertAlmostEqual(kw["iou"], 0.65, places=6)
+            self.assertEqual(kw["imgsz"], 960)
+
+        for bad_args in (
+            ["--iou", "0"],
+            ["--iou", "1.1"],
+            ["--iou", "nan"],
+            ["--imgsz", "0"],
+            ["--imgsz", "-64"],
+        ):
+            with self.subTest(bad_args=bad_args):
+                with self.assertRaises(SystemExit):
+                    bench_main(["--demo", *bad_args])
+
     def test_summarize_stage_timings_steady_state_excludes_frame0_warmup(self):
         # 帧 0 含冷启动抖动 (200ms)，帧 1..4 为稳定态 (每帧 20ms -> 50 FPS)
         samples = [

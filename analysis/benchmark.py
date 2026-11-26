@@ -686,6 +686,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--object-policy", type=str, default=str(DEFAULT_OBJECT_POLICY_CONFIG), help="类别策略 YAML")
     parser.add_argument("--device", type=str, default=None, help="推理设备 (如 cpu 或 0)")
     parser.add_argument("--conf", type=float, default=None, help="检测置信度阈值")
+    parser.add_argument("--iou", type=float, default=0.7, help="NMS IoU 阈值 (0~1]，默认 0.7")
+    parser.add_argument("--imgsz", type=int, default=640, help="YOLOv8 推理输入尺寸 (像素)，默认 640")
     parser.add_argument("--fps", type=float, default=None, help="强制指定视频帧率")
     parser.add_argument("--max-frames", type=int, default=30, help="最多剖析帧数，默认 30")
     parser.add_argument(
@@ -730,6 +732,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error("--fps 必须是有限正数")
     if args.conf is not None and (not math.isfinite(args.conf) or not (0.0 < args.conf <= 1.0)):
         parser.error("--conf 必须在 (0, 1] 区间内")
+    if not math.isfinite(args.iou) or not (0.0 < args.iou <= 1.0):
+        parser.error("--iou 必须在 (0, 1] 区间内")
+    if args.imgsz <= 0:
+        parser.error("--imgsz 必须是正整数")
 
     report = profile_pipeline_stages(
         video_path=args.source,
@@ -741,6 +747,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         object_policy_config=args.object_policy,
         device=args.device,
         conf=args.conf,
+        iou=args.iou,
+        imgsz=args.imgsz,
         fps=args.fps,
         max_frames=args.max_frames,
         speed_model=args.speed_model,
