@@ -2,7 +2,7 @@
 
 面向校园道路固定路侧摄像头，研究车辆与行人的视觉感知、连续跟踪、实际速度估计和冲突风险预警。系统以 YOLOv8 + ByteTrack 提供检测与连续轨迹，`analysis` 模块完成道路标定、物理测速、TTC 冲突研判、事件去抖与四级预警，形成从视频输入到风险提示和事件记录的完整技术链路。
 
-**当前阶段：全链路已实现**（检测 → 跟踪 → 短时遮挡缝合 → 标定测速 → 冲突分析 → 预警与双端推送服务）。仓库共含 325 项单元与集成测试（在含 `lap 0.5.12` 与基础权重的验证环境下 325/325 全部通过、0 跳过；其中 `test_io_hardening.py`、`test_tracking.py`、`test_tracking_exports.py`、`test_tracking_integration.py` 共 4 个依赖 ByteTrack/`lap` 的 I/O 加固与跟踪测试模块需配合 `lap` 运行）；校园实景标定、测速精度与实时性尚未评估——本机 CPU 实测约 2.6~15 FPS，定位离线分析，不承诺实时。
+**当前阶段：全链路已实现**（检测 → 跟踪 → 短时遮挡缝合 → 标定测速 → 冲突分析 → 预警、Web 控制台与独立桌面 App-Mode 宿主）。仓库共含 **349 项**单元与集成测试（在含 `lap 0.5.12` 与基础权重的验证环境下 349/349 全部通过、0 跳过；其中 `test_io_hardening.py`、`test_tracking.py`、`test_tracking_exports.py`、`test_tracking_integration.py` 共 4 个依赖 ByteTrack/`lap` 的 I/O 加固与跟踪测试模块需配合 `lap` 运行）。在完整链路（`YOLOv8n + ByteTrack + CTRV + OBB-SSM + TrackletStitcher + 骑行者 VRU`，含渲染写盘）下，RTX 5060 Ti 16GB GPU（`device=0`，`800x600@30fps`，`imgsz=640`，120 帧）端到端实测 **42.58 FPS**（含首帧 CUDA 预热；稳态 P50 `12.30 ms` 约 **81.3 FPS**、P95 `17.82 ms` 约 **56.1 FPS**；三组 360 帧已标定路侧示范视频 `imgsz=960` 实测 **56.2~66.2 FPS**），同配置 CPU 基线（Intel Core i5-14600KF，60 帧）实测 **20.47 FPS**（稳态 P50 `32.68 ms` 约 **30.6 FPS**），纯几何测速与冲突事件模块合计仅占 `1.19 ms/帧`（GPU，5.07%）与 `1.63 ms/帧`（CPU，3.35%）。低配 CPU 仍建议定位离线分析，且校园实景标定、实测车速 MAE 与预警准确率仍待实际校园录像与人工真值验证（详见[实验结果与性能基准报告](docs/实验结果与性能基准报告.md)）。
 
 ## 技术链路
 
@@ -30,11 +30,11 @@ flowchart TD
 | 图像轨迹与运动记录 | 时间自适应位置/速度 EMA、像素位移、方向、px/s | 已实现；独立配置、有界缓存、漏检分段 |
 | 断轨缝合 | `TrackletStitcher`：阻尼二阶外推、马氏门控、航向一致性与轻量 HSV 外观直方图 | 已实现；通过 `--enable-stitching` 开启 |
 | 标定与测速 | 4 点/多点 RANSAC 单应性、去畸变、2D 锚点偏置补偿、雅可比协方差、EMA / CA Kalman / CTRV EKF | 已实现；精度待实景验证 |
-| 类别策略 | bicycle/motorcycle/car/bus/truck 几何尺寸与安全半径策略 | 已实现；参数可在策略模块调整 |
+| 类别策略 | 自行车、摩托车、汽车、公交车、卡车（`bicycle`/`motorcycle`/`car`/`bus`/`truck`）几何尺寸与安全半径策略 | 已实现；参数可在策略模块调整 |
 | 冲突分析与 TTC | CVM 等速圆包络或圆角 OBB 扫掠 TTC + MTTC + DRAC + 整车栅格 PET + 碰撞概率 | 已实现；阈值待实景调优 |
-| 告警事件去抖 | N 帧确认 + 等级滞回 + 冷却合并 | 已实现；confirmed/provisional 分流 |
-| 实时流与双端服务 | `LatestFrameCapture` 丢旧帧、驾驶员/行人双端预警、`ThreadingHTTPServer` 默认后端与可选 FastAPI/WebSocket | 已实现；实景网络压测待开展 |
-| 实验评价与图表 | 检测/跟踪/测速/事件级指标、弯道消融、分阶段耗时基准与离线实验出图 | 框架已备；校园数据与标注待开展 |
+| 告警事件去抖 | N 帧确认 + 等级滞回 + 冷却合并 | 已实现；已确认（`confirmed`）与瞬时（`provisional`）分流 |
+| 实时流、Web 与桌面控制台 | `LatestFrameCapture` 丢旧帧、双端预警、`analysis.service`（`ThreadingHTTPServer` 默认 / 可选 FastAPI+WebSocket）与 `analysis.desktop`（Edge/Chrome App-Mode 独立宿主） | 已实现；支持实时监测、历史回放、可视化标定与已标定路侧演示预设；实景网络压测待开展 |
+| 实验评价与基准图表 | 检测/跟踪/测速/事件级指标、弯道消融、12 项确定性场景回归、GPU/CPU 分阶段基准与全中文离线出图 | 已完成合成消融、12/12 场景回归与 3 组公开路侧标定示范运行；校园实拍真值待开展 |
 
 测速核心：`v(m/s) = ‖p(t) − p(t−Δt)‖ / Δt`（滑窗两端差分），`v(km/h) = 3.6 × v(m/s)`。超限 35 m、背向远离、持续静止且速度已收敛的目标不参与碰撞研判；超速与轨迹冲突独立判定，未超速也可能触发高级别 TTC 预警。
 
@@ -60,6 +60,9 @@ python -m analysis --tracks runs/yolo/track/run-*/tracks.jsonl --calib configs/c
 # 启用 2D CA Kalman 测速、OBB+SSM 冲突研判与短时遮挡断轨缝合
 python -m analysis --tracks runs/yolo/track/run-*/tracks.jsonl --calib configs/calibration.yaml --speed-model kalman --conflict-model obb_ssm --enable-stitching
 
+# 使用本地已标定路侧示范预设（data/demo_videos/ 下的 sherbrooke_intersection / rouen_crosswalk / stmarc_mixed_vru 与对应 calib_*.yaml）
+python -m analysis --source data/demo_videos/sherbrooke_intersection.mp4 --calib data/demo_videos/calib_sherbrooke_intersection.yaml --device 0 --speed-model ctrv --conflict-model obb_ssm --enable-stitching --include-cyclist-vru --compensate-anchor-bias
+
 # 无实测标定时的流程演示（内存合成标定，物理量不可信）
 python -m analysis --source path/to/video.mp4 --demo
 
@@ -80,9 +83,9 @@ python -m analysis.service --host 127.0.0.1 --port 8000
 # 启动后在浏览器访问 http://127.0.0.1:8000/ （支持实时监测、历史回放、可视化标定、算法评测与双端预警镜像）
 ```
 
-本次 CPU 验证环境：Python 3.12、PyTorch 2.11.0+cpu、torchvision 0.26.0、Ultralytics 8.4.182、opencv-python 5.0.0.93、lap 0.5.12。依赖中不存在的 lap 0.10.0 已修正。
+当前基准验证环境：Python 3.11.9、PyTorch 2.11.0+cu128、torchvision 0.26.0+cu128、CUDA 12.8、Ultralytics 8.4.182、opencv-python 5.0.0.93、lap 0.5.12（RTX 5060 Ti 16GB / Intel Core i5-14600KF；亦兼容纯 CPU 环境）。依赖中不存在的 lap 0.10.0 已修正。
 
-`python -m analysis` 主要参数：`--speed-limit`（30 km/h）、`--object-policy`（类别策略 YAML）、`--speed-model`（`ema` 默认 / `kalman` / `ctrv`）、`--conflict-model`（`cvm_circle` 默认 / `obb_ssm`）、`--enable-stitching`（开启遮挡断轨缝合）、`--include-cyclist-vru`（将自行车与摩托车骑行者纳入 VRU 冲突研判）、`--compensate-anchor-bias`（开启车辆 2D 锚点至几何中心视线偏置补偿）、`--live-drop-stale-frames`（实时流开启后台抓帧丢旧帧）、`--live-reconnect-attempts`/`--live-reconnect-delay`（实时流断流重连次数与等待间隔，默认 3 次 / 1.0 s）、`--ema-alpha`（0.35）、`--window`/`--window-s`（测速窗）、`--ttc-critical`/`--ttc-caution`/`--horizon`（1.8/3.5/3.5 s）、`--parked-seconds`（3.0 s 静止确认）、`--alert-confirm`/`--alert-confirm-s`、`--alert-cooldown`/`--alert-cooldown-s`（去抖窗口）、`--reliable-span-s`（0.2 s 可信度跨度）、`--fps`（无源 FPS 时显式指定）、`--max-frames`、`--demo`、`--show`。**帧数/秒数成对参数一律秒级覆盖帧级。** 配套工具链包含 `python -m analysis.mot_eval`（基于 `tracks.jsonl` 或 MOTChallenge 标注计算 MOTA/IDF1/HOTA/IDSW）、`python -m analysis.benchmark` / `python -m analysis.charts`（分阶段耗时与论文离线图表）、`pythonw -m analysis.desktop` / `python -m analysis.desktop`（独立桌面 App-Mode 宿主）、`python -m analysis.service`（历史查询、MJPEG、标定/实验 API 与双端告警推送服务）及 `python -m analysis.interactive_calibrator` 扩展（支持 `--ground-points` 多点 RANSAC 与无 `--points` 交互点击、`--parking-zone` 与窗口内 `'P'`/`'N'` 停车区框选、`--chessboard-dir` 棋盘格相机内参标定与 `--intrinsics-yaml` 注入）。训练与检测评估入口 `python -m detection train|val` 见[检测模块实施说明](docs/车辆行人检测方案.md)。
+`python -m analysis` 主要参数：`--speed-limit`（30 km/h）、`--object-policy`（类别策略 YAML）、`--speed-model`（`ema` 默认 / `kalman` / `ctrv`）、`--conflict-model`（`cvm_circle` 默认 / `obb_ssm`）、`--enable-stitching`（开启遮挡断轨缝合）、`--include-cyclist-vru`（将自行车与摩托车骑行者纳入 VRU 冲突研判）、`--compensate-anchor-bias`（开启车辆 2D 锚点至几何中心视线偏置补偿）、`--live-drop-stale-frames`（实时流开启后台抓帧丢旧帧）、`--live-reconnect-attempts`/`--live-reconnect-delay`（实时流断流重连次数与等待间隔，默认 3 次 / 1.0 s）、`--ema-alpha`（0.35）、`--window`/`--window-s`（测速窗）、`--ttc-critical`/`--ttc-caution`/`--horizon`（1.8/3.5/3.5 s）、`--parked-seconds`（3.0 s 静止确认）、`--alert-confirm`/`--alert-confirm-s`、`--alert-cooldown`/`--alert-cooldown-s`（去抖窗口）、`--reliable-span-s`（0.2 s 可信度跨度）、`--fps`（无源 FPS 时显式指定）、`--max-frames`、`--demo`、`--show`。**帧数/秒数成对参数一律秒级覆盖帧级。** 配套工具链包含 `python -m analysis.mot_eval`（基于 `tracks.jsonl` 或 MOTChallenge 标注计算 MOTA/IDF1/HOTA/IDSW）、`python -m analysis.benchmark` / `python -m analysis.charts`（分阶段耗时与论文离线图表）、`pythonw -m analysis.desktop` / `python -m analysis.desktop`（零原生打包独立桌面 App-Mode 宿主，自动探测 Edge/Chrome 并支持单实例唤醒与本地文件选择器）、`python -m analysis.service`（Web 控制台、历史查询、MJPEG、可视化标定、已标定路侧示范预设、实验中心 API 与双端告警推送服务）及 `python -m analysis.interactive_calibrator` 扩展（支持 `--ground-points` 多点 RANSAC 与无 `--points` 交互点击、`--parking-zone` 与窗口内 `'P'`/`'N'` 停车区框选、`--chessboard-dir` 棋盘格相机内参标定与 `--intrinsics-yaml` 注入）。训练与检测评估入口 `python -m detection train|val` 见[检测模块实施说明](docs/车辆行人检测方案.md)。
 
 ## 输出产物
 
@@ -111,17 +114,17 @@ python -m analysis.service --host 127.0.0.1 --port 8000
 ```text
 detection/   YOLOv8 检测、训练与评估入口
 tracking/    ByteTrack 会话、轨迹与 px/s 运动记录、平滑、可视化、批处理
-analysis/    标定与偏置补偿 · EMA/CA/CTRV 测速 · CVM/圆角OBB-SSM 冲突研判 · 断轨缝合 · 事件去抖 · 真值评测 · 实时服务 · 基准与出图
+analysis/    标定与偏置补偿 · EMA/CA/CTRV 测速 · CVM/圆角OBB-SSM 冲突研判 · 断轨缝合 · 事件去抖 · 真值评测 · Web 控制台与桌面 App-Mode 宿主 · 基准与出图
 configs/     bytetrack.yaml、motion.yaml、object_policy.yaml、calibration.yaml、真值与数据配置模板
-tests/       单元、集成与异常路径测试（325 项）
-docs/        课题需求、研究蓝图（含数学推导）与模块解释文档
+tests/       单元、集成与异常路径测试（349 项）
+docs/        课题需求、研究蓝图（含数学推导）、模块 01~05 解释文档与实验结果性能基准报告
 ```
 
 ## 文档与参考
 
-- [课题需求与技术路线](docs/课题需求与技术路线.md) · [课题全景蓝图与数学推导](docs/MASTER_RESEARCH_PROMPT.md)
-- [检测模块实施说明](docs/车辆行人检测方案.md) · [YOLOv8 解释文档](docs/modules/01_目标检测_YOLOv8与PyTorch_解释文档.md) · [ByteTrack 解释文档](docs/modules/02_多目标跟踪_ByteTrack_解释文档.md)
-- [目标轨迹与图像运动状态解释文档](docs/modules/03_目标轨迹与图像运动状态_解释文档.md)
+- [课题需求与技术路线](docs/课题需求与技术路线.md) · [课题全景蓝图与数学推导](docs/MASTER_RESEARCH_PROMPT.md) · [实验结果与性能基准报告](docs/实验结果与性能基准报告.md)
+- [检测模块实施说明](docs/车辆行人检测方案.md) · [01 YOLOv8 与 PyTorch 解释文档](docs/modules/01_目标检测_YOLOv8与PyTorch_解释文档.md) · [02 ByteTrack 解释文档](docs/modules/02_多目标跟踪_ByteTrack_解释文档.md)
+- [03 目标轨迹与图像运动状态解释文档](docs/modules/03_目标轨迹与图像运动状态_解释文档.md) · [04 单应性标定与多模型物理测速解释文档](docs/modules/04_单应性标定与多模型物理测速_解释文档.md) · [05 时空冲突研判与四级预警解释文档](docs/modules/05_时空冲突研判与四级预警_解释文档.md)
 - [Ultralytics YOLOv8](https://docs.ultralytics.com/models/yolov8/) · [ByteTrack 项目](https://github.com/FoundationVision/ByteTrack)
 
-GitHub Actions 在 push/PR 时执行完整 unittest 与 compileall。`analysis.schema` 通过只表示输出格式满足当前契约，不代表检测、跟踪、测速或预警精度通过。
+GitHub Actions 在代码推送与拉取请求（push/PR）时执行完整 unittest 与 compileall。`analysis.schema` 通过只表示输出格式满足当前契约，不代表检测、跟踪、测速或预警精度通过。

@@ -2,20 +2,23 @@
 """
 离线无界面实验图表生成器 (Headless Matplotlib Experiment Charts)
 =============================================================================
-强制在导入 pyplot 之前切换 Agg 无界面后端，并全量采用标准英文/ASCII 图表标签，
-确保在无图形界面、无中文字体的 Ubuntu Linux CI 与 -W error::RuntimeWarning
-环境下零警告生成高质量论文/报告 PNG 图表。
+强制在导入 pyplot 之前切换 Agg 无界面后端，并通过 matplotlib.font_manager
+动态探测系统可用中文字体（优雅回退至 DejaVu Sans），在 Windows 桌面端渲染清晰
+中文学术图表，同时确保在无中文字体的 Linux CI 与 -W error::RuntimeWarning 环境下
+零崩溃、零告警稳定生成 PNG 图表。
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import math
 import os
+import warnings
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Optional
 
@@ -26,25 +29,116 @@ prepare_runtime()
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 
 from .benchmark import SUBSTAGE_NAMES
 
-# 全局统一无衬线字体与负号配置（仅使用 matplotlib 内置字体，不依赖系统外部字体包）
-_BASE_RC = {
-    "font.family": "sans-serif",
-    "font.sans-serif": ["DejaVu Sans"],
-    "axes.unicode_minus": False,
-}
+# 按优先级动态探测系统可用 CJK 字体，末尾始终保留 DejaVu Sans 作为安全回退
+CJK_FONT_CANDIDATES: tuple[str, ...] = (
+    "Microsoft YaHei",
+    "SimHei",
+    "PingFang SC",
+    "Noto Sans CJK SC",
+    "Source Han Sans SC",
+    "WenQuanYi Micro Hei",
+    "STHeiti",
+    "SimSun",
+    "Arial Unicode MS",
+)
+FALLBACK_FONT = "DejaVu Sans"
 
 _STAGE_DISPLAY_LABELS: dict[str, str] = {
-    "decode": "Decode",
-    "detect_track": "Detect+Track",
-    "geometry_speed": "Geom+Speed",
-    "conflict_events": "Conflict+Evt",
-    "render_write": "Render+Write",
+    "decode": "解码",
+    "detect_track": "检测与跟踪",
+    "geometry_speed": "投影与测速",
+    "conflict_events": "冲突与事件",
+    "render_write": "渲染与写盘",
 }
+
+_SPEED_MODEL_LABELS: dict[str, str] = {
+    "ema": "滑窗 EMA",
+    "kalman": "2D CA 卡尔曼",
+    "ctrv": "弯道 CTRV",
+}
+
+_SCENARIO_DISPLAY_LABELS: dict[str, str] = {
+    "parallel_pass": "窄路并行",
+    "braking_yield": "制动礼让",
+    "perpendicular_crossing": "垂直横穿",
+    "head_on": "对向交汇",
+    "crossing": "人车横穿",
+}
+
+_RISK_LEVEL_LABELS: tuple[str, str, str, str] = (
+    "L0 正常",
+    "L1 超速",
+    "L2 注意",
+    "L3 紧急",
+)
+
+_LEGEND_STYLE: dict[str, Any] = {
+    "frameon": True,
+    "facecolor": "white",
+    "framealpha": 0.92,
+    "edgecolor": "#e2e8f0",
+}
+
+
+def detect_available_cjk_fonts() -> list[str]:
+    """按预设优先级返回当前环境中已安装的 CJK 无衬线字体名称列表。"""
+    ttflist = getattr(fm.fontManager, "ttflist", ()) or ()
+    available = {getattr(font, "name", "") for font in ttflist}
+    return [name for name in CJK_FONT_CANDIDATES if name in available]
+
+
+def configure_cjk_fonts() -> list[str]:
+    """动态配置 Matplotlib 中文字体链与负号显示，并返回生效字体列表。"""
+    selected = detect_available_cjk_fonts()
+    if FALLBACK_FONT not in selected:
+        selected.append(FALLBACK_FONT)
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = list(selected)
+    plt.rcParams["axes.unicode_minus"] = False
+    return selected
+
+
+# 模块初始化即完成一次字体与负号全局配置
+configure_cjk_fonts()
+
+
+@contextlib.contextmanager
+def _chart_rc_context() -> Iterator[list[str]]:
+    """在绘图上下文中固定字体链；仅当宿主缺失任何 CJK 字体时屏蔽缺字告警。"""
+    fonts = configure_cjk_fonts()
+    has_cjk = any(name != FALLBACK_FONT for name in fonts)
+    rc = {
+        "font.family": "sans-serif",
+        "font.sans-serif": fonts,
+        "axes.unicode_minus": False,
+    }
+    with plt.rc_context(rc):
+        if has_cjk:
+            yield fonts
+        else:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"Glyph .* missing from font",
+                    category=UserWarning,
+                )
+                yield fonts
+
+
+def _display_speed_model(mode: str) -> str:
+    key = mode.strip().lower()
+    return _SPEED_MODEL_LABELS.get(key, mode.upper())
+
+
+def _display_scenario(name: str) -> str:
+    key = name.strip().lower()
+    return _SCENARIO_DISPLAY_LABELS.get(key, name)
 
 
 def _reject_non_finite_constant(value: str) -> None:
@@ -129,9 +223,9 @@ def _ensure_output_dir(output_dir: Any) -> Path:
 
 
 def _save_figure(fig: plt.Figure, out_path: Path) -> str:
-    """在 finally 保护下写出 PNG 并释放图形句柄，防止内存或 figure 数量告警。"""
+    """写出高分辨率 PNG 并确保外边距无裁切。"""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(out_path), format="png", dpi=150, bbox_inches="tight")
+    fig.savefig(str(out_path), format="png", dpi=180, bbox_inches="tight", pad_inches=0.14)
     return str(out_path)
 
 
@@ -179,17 +273,17 @@ def plot_ablation_charts(
 
     if has_speed_est or has_turn_rows or has_speed_grid:
         speed_path = out_root / "ablation_speed_mae.png"
-        with plt.rc_context(_BASE_RC):
+        with _chart_rc_context():
             if has_speed_est and has_turn_rows:
-                fig, (ax_lin, ax_turn) = plt.subplots(1, 2, figsize=(11.0, 4.6))
+                fig, (ax_lin, ax_turn) = plt.subplots(1, 2, figsize=(11.8, 4.9))
             else:
-                fig, ax_single = plt.subplots(figsize=(7.2, 4.6))
+                fig, ax_single = plt.subplots(figsize=(7.6, 4.8))
                 ax_lin = ax_single if has_speed_est else None
                 ax_turn = ax_single if has_turn_rows and not has_speed_est else None
             try:
                 if ax_lin is not None:
                     modes = [m for m in ("ema", "kalman", "ctrv") if isinstance(speed_est.get(m), Mapping)]
-                    labels = [m.upper() if m != "kalman" else "Kalman (CA)" for m in modes]
+                    labels = [_display_speed_model(m) for m in modes]
                     mae_kmh = []
                     rmse_kmh = []
                     has_rmse = all("rmse_ms" in speed_est[m] or "rmse_kmh" in speed_est[m] for m in modes)
@@ -217,31 +311,37 @@ def plot_ablation_charts(
                     x = np.arange(len(modes))
                     if has_rmse:
                         width = 0.34
-                        bars1 = ax_lin.bar(x - width / 2, mae_kmh, width, label="MAE (km/h)", color="#2b6cb0")
-                        bars2 = ax_lin.bar(x + width / 2, rmse_kmh, width, label="RMSE (km/h)", color="#63b3ed")
+                        bars1 = ax_lin.bar(
+                            x - width / 2, mae_kmh, width, label="平均绝对误差 MAE (km/h)", color="#2b6cb0"
+                        )
+                        bars2 = ax_lin.bar(
+                            x + width / 2, rmse_kmh, width, label="均方根误差 RMSE (km/h)", color="#63b3ed"
+                        )
                         all_bars = list(bars1) + list(bars2)
                         max_y = max([0.5, *mae_kmh, *rmse_kmh])
                     else:
-                        bars1 = ax_lin.bar(x, mae_kmh, 0.45, label="MAE (km/h)", color="#2b6cb0")
+                        bars1 = ax_lin.bar(
+                            x, mae_kmh, 0.44, label="平均绝对误差 MAE (km/h)", color="#2b6cb0"
+                        )
                         all_bars = list(bars1)
                         max_y = max([0.5, *mae_kmh])
                     for bar in all_bars:
                         h = bar.get_height()
                         ax_lin.text(
                             bar.get_x() + bar.get_width() / 2,
-                            h + 0.02 * max(1.0, max_y),
+                            h + 0.025 * max(1.0, max_y),
                             f"{h:.2f}",
                             ha="center",
                             va="bottom",
-                            fontsize=8,
+                            fontsize=8.5,
                         )
                     ax_lin.set_xticks(x)
-                    ax_lin.set_xticklabels(labels)
-                    ax_lin.set_ylabel("Speed MAE (km/h)")
-                    ax_lin.set_title("Perspective Speed Estimation Error")
-                    ax_lin.set_ylim(0.0, max_y * 1.25)
+                    ax_lin.set_xticklabels(labels, fontsize=9.5)
+                    ax_lin.set_ylabel("测速误差 (km/h)", fontsize=10)
+                    ax_lin.set_title("透视噪声下直线加减速测速误差对比", fontsize=11.5, pad=10)
+                    ax_lin.set_ylim(0.0, max_y * 1.34)
                     ax_lin.grid(axis="y", linestyle="--", alpha=0.35)
-                    ax_lin.legend(frameon=False)
+                    ax_lin.legend(loc="upper right", fontsize=8.8, **_LEGEND_STYLE)
 
                 if ax_turn is not None and isinstance(turn_rows, list):
                     grouped: dict[str, tuple[list[float], list[float]]] = defaultdict(lambda: ([], []))
@@ -266,40 +366,42 @@ def plot_ablation_charts(
                     ordered_modes = [m for m in ("ema", "kalman", "ctrv") if m in grouped] + [
                         m for m in sorted(grouped) if m not in ("ema", "kalman", "ctrv")
                     ]
-                    t_labels = [
-                        {"ema": "EMA", "kalman": "Kalman (CA)", "ctrv": "CTRV"}.get(m, m.upper())
-                        for m in ordered_modes
-                    ]
+                    t_labels = [_display_speed_model(m) for m in ordered_modes]
                     t_mae = [float(np.mean(grouped[m][0])) for m in ordered_modes]
                     t_max = [float(np.mean(grouped[m][1])) for m in ordered_modes]
+                    max_turn_y = max([0.5, *t_mae, *t_max])
                     x = np.arange(len(ordered_modes))
                     width = 0.34
-                    b1 = ax_turn.bar(x - width / 2, t_mae, width, label="Mean MAE (km/h)", color="#2f855a")
-                    b2 = ax_turn.bar(x + width / 2, t_max, width, label="Mean Max Err (km/h)", color="#9ae6b4")
+                    b1 = ax_turn.bar(
+                        x - width / 2, t_mae, width, label="平均绝对误差 MAE (km/h)", color="#2f855a"
+                    )
+                    b2 = ax_turn.bar(
+                        x + width / 2, t_max, width, label="峰值误差均值 (km/h)", color="#68d391"
+                    )
                     for bar in list(b1) + list(b2):
                         h = bar.get_height()
                         ax_turn.text(
                             bar.get_x() + bar.get_width() / 2,
-                            h + 0.02 * max([1.0, *t_mae, *t_max]),
+                            h + 0.025 * max(1.0, max_turn_y),
                             f"{h:.2f}",
                             ha="center",
                             va="bottom",
-                            fontsize=8,
+                            fontsize=8.5,
                         )
                     ax_turn.set_xticks(x)
-                    ax_turn.set_xticklabels(t_labels)
-                    ax_turn.set_ylabel("Speed MAE (km/h)")
-                    ax_turn.set_title("Curved Turn Speed Ablation")
-                    ax_turn.set_ylim(0.0, max([0.5, *t_mae, *t_max]) * 1.25)
+                    ax_turn.set_xticklabels(t_labels, fontsize=9.5)
+                    ax_turn.set_ylabel("测速误差 (km/h)", fontsize=10)
+                    ax_turn.set_title("弯道场景测速模型消融对比", fontsize=11.5, pad=10)
+                    ax_turn.set_ylim(0.0, max_turn_y * 1.34)
                     ax_turn.grid(axis="y", linestyle="--", alpha=0.35)
-                    ax_turn.legend(frameon=False)
+                    ax_turn.legend(loc="upper right", fontsize=8.8, **_LEGEND_STYLE)
 
                 if not has_speed_est and not has_turn_rows and isinstance(speed_grid, list):
                     by_cfg: dict[str, list[float]] = defaultdict(list)
                     for idx, row in enumerate(speed_grid):
                         if not isinstance(row, Mapping):
                             raise ValueError(f"speed[{idx}] 必须是字典")
-                        cfg_label = f"W{row.get('window_size', '?')}-A{row.get('ema_alpha', '?')}"
+                        cfg_label = f"窗口{row.get('window_size', '?')}/系数{row.get('ema_alpha', '?')}"
                         err_kmh = _finite_float(
                             row["absolute_error_ms"], f"speed[{idx}].absolute_error_ms", non_negative=True
                         ) * 3.6
@@ -309,28 +411,28 @@ def plot_ablation_charts(
                     x = np.arange(len(cfg_keys))
                     ax_single.bar(x, cfg_vals, color="#2b6cb0", width=0.55)
                     ax_single.set_xticks(x)
-                    ax_single.set_xticklabels(cfg_keys, rotation=25, ha="right", fontsize=8)
-                    ax_single.set_ylabel("Speed MAE (km/h)")
-                    ax_single.set_title("EMA Window and Alpha Speed Error")
-                    ax_single.set_ylim(0.0, max([0.2, *cfg_vals]) * 1.25)
+                    ax_single.set_xticklabels(cfg_keys, rotation=25, ha="right", fontsize=8.5)
+                    ax_single.set_ylabel("测速平均绝对误差 MAE (km/h)", fontsize=10)
+                    ax_single.set_title("滑窗长度与 EMA 平滑系数误差消融", fontsize=11.5, pad=10)
+                    ax_single.set_ylim(0.0, max([0.2, *cfg_vals]) * 1.28)
                     ax_single.grid(axis="y", linestyle="--", alpha=0.35)
 
-                fig.tight_layout()
+                fig.tight_layout(pad=1.5, w_pad=2.4)
                 generated.append(_save_figure(fig, speed_path))
             finally:
                 plt.close(fig)
 
-    # 2) 冲突研判指标对比图：对比 CVM 与 OBB-SSM 的风险等级、TTC/MTTC、DRAC 与碰撞概率
+    # 2) 冲突研判指标对比图：对比 CVM 圆包络与 OBB-SSM 的风险等级、DRAC 与碰撞概率
     has_conflict_det = isinstance(conflict_det, list) and len(conflict_det) > 0
     has_conflict_grid = isinstance(conflict_grid, list) and len(conflict_grid) > 0
 
     if has_conflict_det or has_conflict_grid:
         conflict_path = out_root / "ablation_conflict_metrics.png"
-        with plt.rc_context(_BASE_RC):
+        with _chart_rc_context():
             if has_conflict_det:
-                fig, (ax_risk, ax_ssm) = plt.subplots(1, 2, figsize=(11.2, 4.6))
+                fig, (ax_risk, ax_ssm) = plt.subplots(1, 2, figsize=(12.2, 5.0))
             else:
-                fig, ax_grid = plt.subplots(figsize=(7.6, 4.6))
+                fig, ax_grid = plt.subplots(figsize=(8.0, 4.8))
             try:
                 if has_conflict_det and isinstance(conflict_det, list):
                     scenarios: list[str] = []
@@ -342,7 +444,8 @@ def plot_ablation_charts(
                     for idx, row in enumerate(conflict_det):
                         if not isinstance(row, Mapping):
                             raise ValueError(f"conflict_detection[{idx}] 必须是字典")
-                        scenarios.append(str(row.get("scenario", f"case_{idx}")))
+                        raw_scenario = str(row.get("scenario", f"场景_{idx + 1}"))
+                        scenarios.append(_display_scenario(raw_scenario))
                         cvm_sub = row.get("cvm_circle", {})
                         obb_sub = row.get("obb_ssm", {})
                         cvm_lvls.append(_risk_level_num(cvm_sub.get("risk_level")))
@@ -362,66 +465,72 @@ def plot_ablation_charts(
 
                     x = np.arange(len(scenarios))
                     width = 0.34
-                    b_cvm = ax_risk.bar(x - width / 2, cvm_lvls, width, label="CVM Circle", color="#718096")
+                    rotate_deg = 15 if (len(scenarios) > 4 or any(len(s) > 6 for s in scenarios)) else 0
+                    xtick_ha = "right" if rotate_deg else "center"
+
+                    b_cvm = ax_risk.bar(x - width / 2, cvm_lvls, width, label="CVM 圆包络", color="#718096")
                     b_obb = ax_risk.bar(x + width / 2, obb_lvls, width, label="OBB-SSM", color="#dd6b20")
                     for bar in list(b_cvm) + list(b_obb):
                         h = bar.get_height()
+                        lvl_idx = max(0, min(3, int(round(h))))
                         ax_risk.text(
                             bar.get_x() + bar.get_width() / 2,
                             h + 0.08,
-                            f"L{int(round(h))}",
+                            f"L{lvl_idx}",
                             ha="center",
                             va="bottom",
-                            fontsize=8,
+                            fontsize=8.8,
                         )
                     ax_risk.set_xticks(x)
-                    ax_risk.set_xticklabels(scenarios, rotation=15, ha="right")
+                    ax_risk.set_xticklabels(scenarios, rotation=rotate_deg, ha=xtick_ha, fontsize=9.5)
                     ax_risk.set_yticks([0, 1, 2, 3])
-                    ax_risk.set_ylabel("Metric Score")
-                    ax_risk.set_title("Conflict Risk Level: CVM vs OBB-SSM")
-                    ax_risk.set_ylim(0.0, 3.6)
+                    ax_risk.set_yticklabels(list(_RISK_LEVEL_LABELS), fontsize=9)
+                    ax_risk.set_ylabel("风险等级", fontsize=10)
+                    ax_risk.set_title("冲突风险等级对比：CVM 圆包络 vs OBB-SSM", fontsize=11.5, pad=10)
+                    ax_risk.set_ylim(0.0, 3.95)
                     ax_risk.grid(axis="y", linestyle="--", alpha=0.35)
-                    ax_risk.legend(frameon=False)
+                    ax_risk.legend(loc="upper center", ncol=2, fontsize=9, **_LEGEND_STYLE)
 
-                    b_drac = ax_ssm.bar(x - width / 2, drac_vals, width, label="DRAC (m/s^2)", color="#c53030")
+                    b_drac = ax_ssm.bar(x - width / 2, drac_vals, width, label="DRAC (m/s²)", color="#c53030")
                     ax_prob = ax_ssm.twinx()
                     b_prob = ax_prob.bar(
-                        x + width / 2, prob_pcts, width, label="Collision Prob (%)", color="#3182ce"
+                        x + width / 2, prob_pcts, width, label="碰撞概率 (%)", color="#3182ce"
                     )
+                    max_drac = max([1.0, *drac_vals])
                     for bar in b_drac:
                         h = bar.get_height()
                         ax_ssm.text(
                             bar.get_x() + bar.get_width() / 2,
-                            h + 0.03 * max([1.0, *drac_vals]),
+                            h + 0.03 * max_drac,
                             f"{h:.2f}",
                             ha="center",
                             va="bottom",
-                            fontsize=8,
+                            fontsize=8.5,
                         )
                     for bar in b_prob:
                         h = bar.get_height()
                         ax_prob.text(
                             bar.get_x() + bar.get_width() / 2,
-                            h + 2.0,
+                            h + 2.2,
                             f"{h:.1f}%",
                             ha="center",
                             va="bottom",
-                            fontsize=8,
+                            fontsize=8.5,
                         )
                     ax_ssm.set_xticks(x)
-                    ax_ssm.set_xticklabels(scenarios, rotation=15, ha="right")
-                    ax_ssm.set_ylabel("DRAC (m/s^2)")
-                    ax_prob.set_ylabel("Collision Probability (%)")
-                    ax_ssm.set_ylim(0.0, max([1.0, *drac_vals]) * 1.25)
-                    ax_prob.set_ylim(0.0, 115.0)
-                    ax_ssm.set_title("OBB-SSM Severity Indicators")
+                    ax_ssm.set_xticklabels(scenarios, rotation=rotate_deg, ha=xtick_ha, fontsize=9.5)
+                    ax_ssm.set_ylabel("必要减速度 DRAC (m/s²)", fontsize=10)
+                    ax_prob.set_ylabel("碰撞概率 (%)", fontsize=10)
+                    ax_ssm.set_ylim(0.0, max_drac * 1.32)
+                    ax_prob.set_ylim(0.0, 122.0)
+                    ax_ssm.set_title("OBB-SSM 冲突严重度量化指标", fontsize=11.5, pad=10)
                     ax_ssm.grid(axis="y", linestyle="--", alpha=0.35)
                     h1, l1 = ax_ssm.get_legend_handles_labels()
                     h2, l2 = ax_prob.get_legend_handles_labels()
-                    ax_ssm.legend(h1 + h2, l1 + l2, frameon=False, loc="upper left")
+                    ax_ssm.legend(h1 + h2, l1 + l2, loc="upper center", ncol=2, fontsize=9, **_LEGEND_STYLE)
                 elif isinstance(conflict_grid, list):
                     labels = [
-                        f"C{row.get('ttc_critical_s', '?')}/H{row.get('horizon_s', '?')}"
+                        f"临界{row.get('ttc_critical_s', '?')}s/时域{row.get('horizon_s', '?')}s"
                         for row in conflict_grid
                     ]
                     ttcs = [
@@ -438,16 +547,17 @@ def plot_ablation_charts(
                     ]
                     x = np.arange(len(labels))
                     width = 0.35
-                    ax_grid.bar(x - width / 2, ttcs, width, label="TTC (s)", color="#dd6b20")
-                    ax_grid.bar(x + width / 2, dists, width, label="Min Distance (m)", color="#3182ce")
+                    ax_grid.bar(x - width / 2, ttcs, width, label="碰撞时间 TTC (s)", color="#dd6b20")
+                    ax_grid.bar(x + width / 2, dists, width, label="最小间距 (m)", color="#3182ce")
                     ax_grid.set_xticks(x)
-                    ax_grid.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
-                    ax_grid.set_ylabel("Metric Score")
-                    ax_grid.set_title("TTC Threshold Ablation")
+                    ax_grid.set_xticklabels(labels, rotation=22, ha="right", fontsize=8.5)
+                    ax_grid.set_ylabel("指标数值", fontsize=10)
+                    ax_grid.set_title("TTC 临界阈值与预测时域消融对比", fontsize=11.5, pad=10)
+                    ax_grid.set_ylim(0.0, max([0.5, *ttcs, *dists]) * 1.28)
                     ax_grid.grid(axis="y", linestyle="--", alpha=0.35)
-                    ax_grid.legend(frameon=False)
+                    ax_grid.legend(loc="upper right", fontsize=9, **_LEGEND_STYLE)
 
-                fig.tight_layout()
+                fig.tight_layout(pad=1.5, w_pad=2.6)
                 generated.append(_save_figure(fig, conflict_path))
             finally:
                 plt.close(fig)
@@ -475,7 +585,7 @@ def plot_run_timeline(
     run_dir: str | os.PathLike,
     output_dir: str | os.PathLike,
 ) -> list[str]:
-    """绘制运行目录内 speeds.csv 车辆时速曲线、30 km/h 限速红线与冲突事件时间窗。"""
+    """绘制运行目录内 speeds.csv 车辆时速曲线、限速红线与冲突/超速事件时间窗。"""
     run_root = _validate_path_arg(run_dir, "run_dir")
     if not run_root.is_dir():
         raise FileNotFoundError(f"运行目录不存在: {run_root}")
@@ -547,8 +657,8 @@ def plot_run_timeline(
 
     generated: list[str] = []
     timeline_path = out_root / "run_speed_timeline.png"
-    with plt.rc_context(_BASE_RC):
-        fig, ax = plt.subplots(figsize=(9.6, 4.8))
+    with _chart_rc_context():
+        fig, ax = plt.subplots(figsize=(11.0, 5.0))
         try:
             # 对单帧零宽度时间窗做轻微可视展宽，避免 axvspan 在图上不可见
             span_pad = 0.04
@@ -557,7 +667,7 @@ def plot_run_timeline(
                 lo = max(0.0, t0 - span_pad) if math.isclose(t0, t1) else t0
                 hi = (t1 + span_pad) if math.isclose(t0, t1) else t1
                 color = "#e53e3e" if lvl >= 3 else "#dd6b20"
-                lbl = "Conflict Window" if not conflict_labeled else None
+                lbl = "冲突事件窗" if not conflict_labeled else None
                 ax.axvspan(lo, hi, color=color, alpha=0.22, label=lbl)
                 conflict_labeled = True
 
@@ -565,8 +675,8 @@ def plot_run_timeline(
             for t0, t1, _eid in speeding_windows:
                 lo = max(0.0, t0 - span_pad) if math.isclose(t0, t1) else t0
                 hi = (t1 + span_pad) if math.isclose(t0, t1) else t1
-                lbl = "Speeding Window" if not speeding_labeled else None
-                ax.axvspan(lo, hi, color="#ecc94b", alpha=0.18, label=lbl)
+                lbl = "超速事件窗" if not speeding_labeled else None
+                ax.axvspan(lo, hi, color="#ecc94b", alpha=0.20, label=lbl)
                 speeding_labeled = True
 
             # 按观测长度与峰值车速排序，避免多车流下 legend 过长触发紧排告警
@@ -582,18 +692,18 @@ def plot_run_timeline(
                 sp_vals = [p[1] for p in pts]
                 if sp_vals:
                     max_spd_seen = max(max_spd_seen, max(sp_vals))
-                lbl = f"Vehicle #{tid}" if idx < 8 else None
-                ax.plot(ts_vals, sp_vals, marker="o", markersize=2.8, linewidth=1.6, label=lbl)
+                lbl = f"车辆 #{tid}" if idx < 8 else None
+                ax.plot(ts_vals, sp_vals, marker="o", markersize=2.6, linewidth=1.6, label=lbl)
 
             if not ordered_ids:
                 ax.text(
                     0.5,
                     0.5,
-                    "No vehicle speed samples recorded",
+                    "未记录到车辆有效测速样本",
                     transform=ax.transAxes,
                     ha="center",
                     va="center",
-                    fontsize=10,
+                    fontsize=10.5,
                     color="#4a5568",
                 )
 
@@ -602,19 +712,25 @@ def plot_run_timeline(
                 color="#d62728",
                 linestyle="--",
                 linewidth=1.8,
-                label=f"Speed Limit ({speed_limit:.0f} km/h)",
+                label=f"限速阈值 ({speed_limit:.0f} km/h)",
             )
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("Speed (km/h)")
-            ax.set_title("Vehicle Speed Timeline and Conflict Windows")
-            ax.set_ylim(0.0, max(speed_limit * 1.25, max_spd_seen * 1.15, 5.0))
+            ax.set_xlabel("时间 (s)", fontsize=10)
+            ax.set_ylabel("时速 (km/h)", fontsize=10)
+            ax.set_title("车辆瞬时时速与冲突/超速事件时间窗", fontsize=12, pad=10)
+            ax.set_ylim(0.0, max(speed_limit * 1.25, max_spd_seen * 1.16, 5.0))
             if all_timestamps:
                 t_min, t_max = min(all_timestamps), max(all_timestamps)
                 if t_max > t_min:
-                    ax.set_xlim(max(0.0, t_min - 0.05 * (t_max - t_min)), t_max + 0.05 * (t_max - t_min))
+                    ax.set_xlim(max(0.0, t_min - 0.03 * (t_max - t_min)), t_max + 0.03 * (t_max - t_min))
             ax.grid(True, linestyle="--", alpha=0.35)
-            ax.legend(loc="upper right", fontsize=8, frameon=True, framealpha=0.88)
-            fig.tight_layout()
+            ax.legend(
+                loc="upper left",
+                bbox_to_anchor=(1.015, 1.0),
+                borderaxespad=0.0,
+                fontsize=8.8,
+                **_LEGEND_STYLE,
+            )
+            fig.tight_layout(pad=1.4)
             generated.append(_save_figure(fig, timeline_path))
         finally:
             plt.close(fig)
@@ -636,22 +752,26 @@ def plot_run_timeline(
                     frame_ttc[ts] = ttc_val
 
         sorted_ts = sorted(frame_risk.keys())
-        with plt.rc_context(_BASE_RC):
-            fig, ax_r = plt.subplots(figsize=(9.6, 4.0))
+        with _chart_rc_context():
+            fig, ax_r = plt.subplots(figsize=(10.6, 4.4))
             try:
                 ax_r.step(
                     sorted_ts,
                     [frame_risk[t] for t in sorted_ts],
                     where="post",
                     color="#c53030",
-                    linewidth=1.8,
-                    label="Peak Risk Level",
+                    linewidth=1.9,
+                    label="单帧峰值风险等级",
                 )
                 ax_r.set_yticks([0, 1, 2, 3])
-                ax_r.set_ylim(-0.1, 3.4)
-                ax_r.set_xlabel("Time (s)")
-                ax_r.set_ylabel("Risk Level (0-3)")
-                ax_r.set_title("Frame-level Risk and Minimum TTC Timeline")
+                ax_r.set_yticklabels(list(_RISK_LEVEL_LABELS), fontsize=9.2)
+                ax_r.set_ylim(-0.2, 3.6)
+                ax_r.set_xlabel("时间 (s)", fontsize=10)
+                ax_r.set_ylabel("风险等级", fontsize=10)
+                ax_r.set_title("逐帧风险等级与最小 TTC/MTTC 演变曲线", fontsize=12, pad=10)
+                if len(sorted_ts) >= 2 and sorted_ts[-1] > sorted_ts[0]:
+                    span = sorted_ts[-1] - sorted_ts[0]
+                    ax_r.set_xlim(max(0.0, sorted_ts[0] - 0.03 * span), sorted_ts[-1] + 0.03 * span)
                 ax_r.grid(True, linestyle="--", alpha=0.35)
 
                 if frame_ttc:
@@ -663,18 +783,18 @@ def plot_run_timeline(
                         color="#2b6cb0",
                         linestyle="-.",
                         marker=".",
-                        linewidth=1.4,
-                        label="Min TTC/MTTC (s)",
+                        linewidth=1.5,
+                        label="最小 TTC/MTTC (s)",
                     )
-                    ax_t.set_ylabel("TTC / MTTC (s)")
-                    ax_t.set_ylim(0.0, max(4.0, max(frame_ttc.values()) * 1.2))
+                    ax_t.set_ylabel("最小 TTC / MTTC (s)", fontsize=10)
+                    ax_t.set_ylim(0.0, max(4.0, max(frame_ttc.values()) * 1.25))
                     h1, l1 = ax_r.get_legend_handles_labels()
                     h2, l2 = ax_t.get_legend_handles_labels()
-                    ax_r.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=8, frameon=True)
+                    ax_r.legend(h1 + h2, l1 + l2, loc="upper right", ncol=2, fontsize=8.8, **_LEGEND_STYLE)
                 else:
-                    ax_r.legend(loc="upper right", fontsize=8, frameon=True)
+                    ax_r.legend(loc="upper right", fontsize=8.8, **_LEGEND_STYLE)
 
-                fig.tight_layout()
+                fig.tight_layout(pad=1.4)
                 generated.append(_save_figure(fig, risk_path))
             finally:
                 plt.close(fig)
@@ -692,7 +812,7 @@ def _normalize_mot_reports(reports: Any) -> list[tuple[str, Mapping[str, Any]]]:
             if isinstance(entry, tuple) and len(entry) == 2:
                 items.append((str(entry[0]), entry[1]))
             elif isinstance(entry, Mapping):
-                label = entry.get("label") or entry.get("name") or entry.get("model") or f"Run {idx + 1}"
+                label = entry.get("label") or entry.get("name") or entry.get("model") or f"配置 {idx + 1}"
                 items.append((str(label), entry))
             else:
                 raise ValueError(f"reports[{idx}] 必须是 (label, report) 元组或报告字典")
@@ -746,9 +866,9 @@ def plot_mot_comparison(
         hota_vals.append(_finite_float(rep["hota"], f"{label}.hota", non_negative=True))
         idsw_vals.append(_finite_float(raw_idsw, f"{label}.id_switches", non_negative=True))
 
-    with plt.rc_context(_BASE_RC):
+    with _chart_rc_context():
         fig, (ax_scores, ax_idsw) = plt.subplots(
-            1, 2, figsize=(10.8, 4.6), gridspec_kw={"width_ratios": [2.2, 1.0]}
+            1, 2, figsize=(11.6, 4.9), gridspec_kw={"width_ratios": [2.2, 1.0]}
         )
         try:
             x = np.arange(len(labels))
@@ -758,49 +878,51 @@ def plot_mot_comparison(
             b_hota = ax_scores.bar(x + width, hota_vals, width, label="HOTA", color="#dd6b20")
 
             all_scores = mota_vals + idf1_vals + hota_vals
-            y_min = min(0.0, min(all_scores) - 0.12)
-            y_max = max(1.08, max(all_scores) + 0.14)
+            y_min = min(0.0, min(all_scores) - 0.14)
+            y_max = max(1.18, max(all_scores) + 0.22)
             for bar in list(b_mota) + list(b_idf1) + list(b_hota):
                 h = bar.get_height()
                 va = "bottom" if h >= 0 else "top"
-                offset = 0.015 if h >= 0 else -0.02
+                offset = 0.018 if h >= 0 else -0.024
                 ax_scores.text(
                     bar.get_x() + bar.get_width() / 2,
                     h + offset,
                     f"{h:.3f}",
                     ha="center",
                     va=va,
-                    fontsize=8,
+                    fontsize=8.2,
                 )
             ax_scores.axhline(0.0, color="#4a5568", linewidth=0.8)
+            rot = 14 if len(labels) > 3 else 0
+            ha_lbl = "right" if rot else "center"
             ax_scores.set_xticks(x)
-            ax_scores.set_xticklabels(labels, rotation=12 if len(labels) > 3 else 0)
-            ax_scores.set_ylabel("Metric Score")
-            ax_scores.set_title("MOT Accuracy Comparison (MOTA / IDF1 / HOTA)")
+            ax_scores.set_xticklabels(labels, rotation=rot, ha=ha_lbl, fontsize=9.2)
+            ax_scores.set_ylabel("指标得分", fontsize=10)
+            ax_scores.set_title("多目标跟踪精度指标对比 (MOTA / IDF1 / HOTA)", fontsize=11.5, pad=10)
             ax_scores.set_ylim(y_min, y_max)
             ax_scores.grid(axis="y", linestyle="--", alpha=0.35)
-            ax_scores.legend(frameon=False, loc="lower right")
+            ax_scores.legend(loc="upper center", ncol=3, fontsize=9, **_LEGEND_STYLE)
 
-            b_id = ax_idsw.bar(x, idsw_vals, 0.5, color="#c53030", label="IDSW")
+            b_id = ax_idsw.bar(x, idsw_vals, 0.48, color="#c53030", label="IDSW")
             max_idsw = max(idsw_vals) if idsw_vals else 0.0
             for bar in b_id:
                 h = bar.get_height()
                 ax_idsw.text(
                     bar.get_x() + bar.get_width() / 2,
-                    h + max(0.05, max_idsw * 0.03),
+                    h + max(0.06, max_idsw * 0.03),
                     f"{int(round(h))}",
                     ha="center",
                     va="bottom",
                     fontsize=9,
                 )
             ax_idsw.set_xticks(x)
-            ax_idsw.set_xticklabels(labels, rotation=12 if len(labels) > 3 else 0)
-            ax_idsw.set_ylabel("ID Switches (Count)")
-            ax_idsw.set_title("ID Switches (Lower is Better)")
-            ax_idsw.set_ylim(0.0, max(1.5, max_idsw * 1.25))
+            ax_idsw.set_xticklabels(labels, rotation=rot, ha=ha_lbl, fontsize=9.2)
+            ax_idsw.set_ylabel("身份切换次数 (次)", fontsize=10)
+            ax_idsw.set_title("身份切换次数 IDSW (越低越好)", fontsize=11.5, pad=10)
+            ax_idsw.set_ylim(0.0, max(1.5, max_idsw * 1.28))
             ax_idsw.grid(axis="y", linestyle="--", alpha=0.35)
 
-            fig.tight_layout()
+            fig.tight_layout(pad=1.5, w_pad=2.2)
             return _save_figure(fig, out_file)
         finally:
             plt.close(fig)
@@ -852,33 +974,33 @@ def plot_benchmark_breakdown(
     model_load_val = payload.get("model_load_ms")
     frames_val = payload.get("frames_profiled")
 
-    with plt.rc_context(_BASE_RC):
+    with _chart_rc_context():
         fig, (ax_bar, ax_pie) = plt.subplots(
-            1, 2, figsize=(11.4, 4.8), gridspec_kw={"width_ratios": [1.35, 1.0]}
+            1, 2, figsize=(12.4, 5.2), gridspec_kw={"width_ratios": [1.35, 1.0]}
         )
         try:
             x = np.arange(len(stage_labels))
             width = 0.35
-            b_mean = ax_bar.bar(x - width / 2, means, width, label="Mean (ms)", color="#2b6cb0")
-            b_p95 = ax_bar.bar(x + width / 2, p95s, width, label="P95 (ms)", color="#90cdf4")
+            b_mean = ax_bar.bar(x - width / 2, means, width, label="均值耗时 (ms)", color="#2b6cb0")
+            b_p95 = ax_bar.bar(x + width / 2, p95s, width, label="P95 耗时 (ms)", color="#63b3ed")
             max_lat = max([0.1, *means, *p95s])
             for bar in list(b_mean) + list(b_p95):
                 h = bar.get_height()
                 ax_bar.text(
                     bar.get_x() + bar.get_width() / 2,
-                    h + max_lat * 0.02,
+                    h + max_lat * 0.025,
                     f"{h:.2f}",
                     ha="center",
                     va="bottom",
-                    fontsize=8,
+                    fontsize=8.5,
                 )
             ax_bar.set_xticks(x)
-            ax_bar.set_xticklabels(stage_labels, rotation=15, ha="right")
-            ax_bar.set_ylabel("Stage Latency (ms)")
-            ax_bar.set_title("Pipeline Stage Latency (Mean vs P95)")
-            ax_bar.set_ylim(0.0, max_lat * 1.25)
+            ax_bar.set_xticklabels(stage_labels, rotation=0, ha="center", fontsize=9.5)
+            ax_bar.set_ylabel("单帧耗时 (ms)", fontsize=10)
+            ax_bar.set_title("流水线各阶段单帧耗时分布 (均值 vs P95)", fontsize=11.5, pad=10)
+            ax_bar.set_ylim(0.0, max_lat * 1.30)
             ax_bar.grid(axis="y", linestyle="--", alpha=0.35)
-            ax_bar.legend(frameon=False)
+            ax_bar.legend(loc="upper right", fontsize=9, **_LEGEND_STYLE)
 
             colors = ["#2b6cb0", "#c53030", "#2f855a", "#dd6b20", "#805ad5"]
             if total_sum > 0.0:
@@ -893,39 +1015,42 @@ def plot_benchmark_breakdown(
                     startangle=90,
                     wedgeprops={"linewidth": 1.0, "edgecolor": "white"},
                 )
+                ax_pie.set_aspect("equal")
                 ax_pie.legend(
                     wedges,
                     pie_labels,
                     loc="center left",
-                    bbox_to_anchor=(0.95, 0.5),
-                    fontsize=8,
+                    bbox_to_anchor=(0.94, 0.5),
+                    fontsize=9,
                     frameon=False,
                 )
-                ax_pie.set_title("Stage Time Share (%)")
+                ax_pie.set_title("各阶段平均耗时占比 (%)", fontsize=11.5, pad=10)
             else:
                 ax_pie.axis("off")
                 ax_pie.text(
                     0.5,
                     0.5,
-                    "Zero positive stage latency recorded",
+                    "未记录到正值阶段耗时",
                     ha="center",
                     va="center",
-                    fontsize=10,
+                    fontsize=10.5,
                     color="#4a5568",
                 )
-                ax_pie.set_title("Stage Time Share (%)")
+                ax_pie.set_title("各阶段平均耗时占比 (%)", fontsize=11.5, pad=10)
 
             subtitle_parts = []
             if frames_val is not None and type(frames_val) is int:
-                subtitle_parts.append(f"Frames: {frames_val}")
+                subtitle_parts.append(f"评测帧数：{frames_val} 帧")
             if fps_val is not None and not isinstance(fps_val, (bool, np.bool_)):
-                subtitle_parts.append(f"Throughput: {float(fps_val):.2f} FPS")
+                subtitle_parts.append(f"端到端吞吐：{float(fps_val):.2f} FPS")
             if model_load_val is not None and not isinstance(model_load_val, (bool, np.bool_)):
-                subtitle_parts.append(f"Model Load: {float(model_load_val):.1f} ms")
+                subtitle_parts.append(f"模型冷启动加载：{float(model_load_val):.1f} ms")
             if subtitle_parts:
-                fig.suptitle(" | ".join(subtitle_parts), fontsize=10, y=1.01)
+                fig.suptitle("  |  ".join(subtitle_parts), fontsize=10.5, y=0.985)
+                fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93), pad=1.5, w_pad=2.0)
+            else:
+                fig.tight_layout(pad=1.5, w_pad=2.0)
 
-            fig.tight_layout()
             return _save_figure(fig, out_file)
         finally:
             plt.close(fig)

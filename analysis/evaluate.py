@@ -498,25 +498,53 @@ def evaluate_run(
     return payload
 
 
+_RISK_DISPLAY_MAP: dict[str, str] = {
+    "LEVEL_0": "L0 正常",
+    "LEVEL_0_SAFE": "L0 正常",
+    "LEVEL_1": "L1 超速",
+    "LEVEL_1_SPEEDING": "L1 超速",
+    "LEVEL_2": "L2 注意",
+    "LEVEL_2_CAUTION": "L2 注意",
+    "LEVEL_3": "L3 紧急",
+    "LEVEL_3_CRITICAL": "L3 紧急",
+}
+
+
+def _format_speed_stat(value) -> str:
+    if value is None:
+        return "无"
+    return f"{float(value):.2f}"
+
+
+def _format_risk_label(key: str) -> str:
+    return _RISK_DISPLAY_MAP.get(str(key).strip().upper(), str(key))
+
+
 def to_markdown(result: dict) -> str:
-    """将评价结果转换为适合实验记录的简短 Markdown。"""
+    """将评价结果转换为适合实验记录的简短中文 Markdown。"""
     frames = result["frames"]
     events = result["events"]
     speed = result["speed_rows"]["speed_kmh"]
     lines = [
-        "# Analysis run evaluation\n",
-        f"- Run: `{result['run_dir']}`",
-        f"- Frames processed: {frames['processed']}",
-        f"- Assessment rows: {frames['observed_assessment_rows']}",
-        f"- Events: {events['count']}",
-        f"- Speed km/h: min={speed['min']}, mean={speed['mean']}, max={speed['max']}",
+        "# 运行产物分析评价\n",
+        f"- 运行目录：`{result['run_dir']}`",
+        f"- 已处理帧数：{frames['processed']}",
+        f"- 冲突评估记录行数：{frames['observed_assessment_rows']}",
+        f"- 确认告警事件数：{events['count']}",
+        (
+            f"- 目标车速统计 (km/h)：最小 {_format_speed_stat(speed['min'])} / "
+            f"平均 {_format_speed_stat(speed['mean'])} / 最大 {_format_speed_stat(speed['max'])}"
+        ),
         "",
-        "## Risk counts",
+        "## 风险等级分布",
         "",
-        "| Level | Rows |",
+        "| 风险等级 | 记录行数 |",
         "|---|---:|",
     ]
-    lines.extend(f"| {key} | {value} |" for key, value in result["risk_counts"].items())
+    lines.extend(
+        f"| {_format_risk_label(key)} | {value} |"
+        for key, value in result["risk_counts"].items()
+    )
     if result.get("has_ground_truth") and "ground_truth_evaluation" in result:
         gt_eval = result["ground_truth_evaluation"]
         sa = gt_eval["speed_accuracy"]
@@ -524,17 +552,17 @@ def to_markdown(result: dict) -> str:
         lt = ea["lead_time_s"]
         lines.extend([
             "",
-            "## Ground-truth accuracy",
+            "## 人工真值精度评价 (Ground-truth accuracy)",
             "",
-            f"- Speed matched: {sa['matched_count']}/{sa['reference_count']} | MAE={sa['mae_kmh']} km/h | RMSE={sa['rmse_kmh']} km/h | MaxAbs={sa['max_abs_error_kmh']} km/h",
-            f"- Event matching: TP={ea['tp']}, FP={ea['fp']}, FN={ea['fn']} | Precision={ea['precision']} | Recall={ea['recall']} | F1={ea['f1']}",
-            f"- Lead time (s): count={lt['count']}, min={lt['min']}, mean={lt['mean']}, max={lt['max']}",
+            f"- 测速误差评价：匹配目标 {sa['matched_count']}/{sa['reference_count']} | MAE={sa['mae_kmh']} km/h | RMSE={sa['rmse_kmh']} km/h | 最大绝对误差={sa['max_abs_error_kmh']} km/h",
+            f"- 事件匹配指标：TP={ea['tp']}，FP={ea['fp']}，FN={ea['fn']} | Precision={ea['precision']} | Recall={ea['recall']} | F1={ea['f1']}",
+            f"- 预警提前量 (s)：样本数={lt['count']}，最小={lt['min']}，平均={lt['mean']}，最大={lt['max']}",
             "",
         ])
     else:
         lines.extend([
             "",
-            "> This is descriptive output without ground truth; it is not an accuracy evaluation.",
+            "> 说明：本输出为无人工真值（ground truth）的描述性运行统计，不构成精度评价。",
             "",
         ])
     return "\n".join(lines)

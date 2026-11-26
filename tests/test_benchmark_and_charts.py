@@ -30,10 +30,15 @@ from analysis.benchmark import (
     main as bench_main,
 )
 from analysis.charts import (
+    CJK_FONT_CANDIDATES,
+    FALLBACK_FONT,
+    configure_cjk_fonts,
+    detect_available_cjk_fonts,
     main as charts_main,
     plot_benchmark_breakdown,
     plot_mot_comparison,
 )
+from analysis.evaluate import to_markdown as evaluate_to_markdown
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -443,6 +448,222 @@ class TestCharts(unittest.TestCase):
                     with contextlib.redirect_stderr(io.StringIO()):
                         with self.assertRaises(SystemExit):
                             charts_main(bad_argv)
+
+    def test_cjk_font_detection_priority_and_headless_fallback(self):
+        import matplotlib.font_manager as fm
+        import matplotlib.pyplot as plt
+
+        self.assertEqual(CJK_FONT_CANDIDATES[:4], (
+            "Microsoft YaHei",
+            "SimHei",
+            "PingFang SC",
+            "Noto Sans CJK SC",
+        ))
+        self.assertEqual(FALLBACK_FONT, "DejaVu Sans")
+
+        # 模拟仅安装部分 Linux CJK 字体的环境，验证优先级排序与回退字体保留
+        linux_fonts = [
+            mock.Mock(name="font_dejavu"),
+            mock.Mock(name="font_wqy"),
+            mock.Mock(name="font_noto"),
+        ]
+        linux_fonts[0].name = "DejaVu Sans"
+        linux_fonts[1].name = "WenQuanYi Micro Hei"
+        linux_fonts[2].name = "Noto Sans CJK SC"
+        with mock.patch.object(fm.fontManager, "ttflist", linux_fonts):
+            detected = detect_available_cjk_fonts()
+            self.assertEqual(detected, ["Noto Sans CJK SC", "WenQuanYi Micro Hei"])
+            configured = configure_cjk_fonts()
+            self.assertEqual(configured, ["Noto Sans CJK SC", "WenQuanYi Micro Hei", "DejaVu Sans"])
+            self.assertFalse(plt.rcParams["axes.unicode_minus"])
+
+        # 模拟无任何中文字体的无界面 Linux CI（仅保留真实 DejaVu Sans FontEntry）：
+        # 出图必须零 RuntimeWarning 与零 UserWarning
+        dejavu_only = [f for f in fm.fontManager.ttflist if getattr(f, "name", "") == "DejaVu Sans"]
+        self.assertTrue(dejavu_only, msg="Matplotlib 内置 DejaVu Sans 字体缺失")
+        bench_data = summarize_stage_timings([
+            {"decode": 1.0, "detect_track": 12.0, "geometry_speed": 0.6, "conflict_events": 0.5, "render_write": 2.5}
+        ])
+        ablation_sample = {
+            "algorithm_comparison": {
+                "speed_estimation": {
+                    "ema": {"mae_ms": 0.58, "rmse_ms": 0.68},
+                    "kalman": {"mae_ms": 0.36, "rmse_ms": 0.46},
+                },
+                "conflict_detection": [
+                    {
+                        "scenario": "parallel_pass",
+                        "cvm_circle": {"risk_level": "LEVEL_3_CRITICAL"},
+                        "obb_ssm": {"risk_level": "LEVEL_0_SAFE", "drac_ms2": None, "collision_prob": None},
+                    },
+                ],
+            },
+        }
+        cache_clear = getattr(getattr(fm.fontManager, "_findfont_cached", None), "cache_clear", None)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            try:
+                with mock.patch.object(fm.fontManager, "ttflist", dejavu_only):
+                    if callable(cache_clear):
+                        cache_clear()
+                    self.assertEqual(detect_available_cjk_fonts(), [])
+                    self.assertEqual(configure_cjk_fonts(), ["DejaVu Sans"])
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", RuntimeWarning)
+                        warnings.simplefilter("error", UserWarning)
+                        out_paths = plot_ablation_charts(ablation_sample, root)
+                        bench_png = plot_benchmark_breakdown(bench_data, root / "bench_headless.png")
+            finally:
+                if callable(cache_clear):
+                    cache_clear()
+                configure_cjk_fonts()
+            for p in [*out_paths, bench_png]:
+                self._assert_valid_png(p)
+
+    def test_chinese_chart_labels_rendered_across_chart_types(self):
+        import analysis.charts as charts_mod
+
+        captured_texts: dict[str, str] = {}
+        orig_save = charts_mod._save_figure
+
+        def _capture_save(fig, out_path):
+            parts: list[str] = []
+            if fig._suptitle is not None:
+                parts.append(fig._suptitle.get_text())
+            for ax in fig.axes:
+                parts.append(ax.get_title())
+                parts.append(ax.get_xlabel())
+                parts.append(ax.get_ylabel())
+                parts.extend(t.get_text() for t in ax.get_xticklabels())
+                parts.extend(t.get_text() for t in ax.get_yticklabels())
+                leg = ax.get_legend()
+                if leg is not None:
+                    parts.extend(t.get_text() for t in leg.get_texts())
+            captured_texts[Path(out_path).name] = "\n".join(parts)
+            return orig_save(fig, out_path)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            run_dir = root / "run_cn"
+            run_dir.mkdir(parents=True)
+            (run_dir / "configuration.json").write_text(json.dumps({"speed_limit_kmh": 30.0}), encoding="utf-8")
+            with (run_dir / "speeds.csv").open("w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["timestamp_s", "track_id", "category", "speed_kmh"])
+                w.writerow(["0.0", "1", "vehicle", "22.5"])
+                w.writerow(["0.5", "1", "vehicle", "33.0"])
+            (run_dir / "events.jsonl").write_text(
+                json.dumps({
+                    "event_id": 1, "kind": "conflict",
+                    "start_timestamp_s": 0.2, "end_timestamp_s": 0.5, "peak_risk_level": 3,
+                }) + "\n",
+                encoding="utf-8",
+            )
+            (run_dir / "conflicts.jsonl").write_text(
+                json.dumps({
+                    "frame_index": 0, "timestamp_s": 0.0,
+                    "assessment": {"risk_level": 0, "ttc_seconds": None},
+                }) + "\n"
+                + json.dumps({
+                    "frame_index": 1, "timestamp_s": 0.5,
+                    "assessment": {"risk_level": 3, "ttc_seconds": 0.9},
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            ablation_data = {
+                "algorithm_comparison": {
+                    "speed_estimation": {
+                        "ema": {"mae_ms": 0.58, "rmse_ms": 0.68},
+                        "kalman": {"mae_ms": 0.36, "rmse_ms": 0.46},
+                    },
+                    "conflict_detection": [
+                        {
+                            "scenario": "parallel_pass",
+                            "cvm_circle": {"risk_level": "LEVEL_3_CRITICAL"},
+                            "obb_ssm": {"risk_level": "LEVEL_0_SAFE", "drac_ms2": None, "collision_prob": None},
+                        },
+                        {
+                            "scenario": "braking_yield",
+                            "cvm_circle": {"risk_level": "LEVEL_3_CRITICAL"},
+                            "obb_ssm": {"risk_level": "LEVEL_2_CAUTION", "drac_ms2": 1.97, "collision_prob": 0.0},
+                        },
+                        {
+                            "scenario": "perpendicular_crossing",
+                            "cvm_circle": {"risk_level": "LEVEL_3_CRITICAL"},
+                            "obb_ssm": {"risk_level": "LEVEL_3_CRITICAL", "drac_ms2": 6.94, "collision_prob": 0.473},
+                        },
+                    ],
+                },
+                "turn_speed_ablation": [
+                    {"estimator_mode": "ema", "mean_abs_error_kmh": 0.43, "max_abs_error_kmh": 1.53},
+                    {"estimator_mode": "kalman", "mean_abs_error_kmh": 0.57, "max_abs_error_kmh": 2.14},
+                    {"estimator_mode": "ctrv", "mean_abs_error_kmh": 0.23, "max_abs_error_kmh": 0.86},
+                ],
+            }
+            bench_data = summarize_stage_timings([
+                {"decode": 1.0, "detect_track": 18.2, "geometry_speed": 0.58, "conflict_events": 0.62, "render_write": 3.09}
+            ])
+            bench_data["model_load_ms"] = 1344.0
+
+            with mock.patch.object(charts_mod, "_save_figure", side_effect=_capture_save):
+                plot_ablation_charts(ablation_data, root / "charts")
+                plot_run_timeline(run_dir, root / "charts")
+                plot_benchmark_breakdown(bench_data, root / "charts" / "benchmark_breakdown.png")
+                plot_mot_comparison(
+                    {
+                        "基线跟踪": {"mota": 0.78, "idf1": 0.72, "hota": 0.68, "id_switches": 6},
+                        "轨迹缝合": {"mota": 0.89, "idf1": 0.91, "hota": 0.85, "id_switches": 1},
+                    },
+                    root / "charts" / "mot_comparison.png",
+                )
+
+        speed_txt = captured_texts["ablation_speed_mae.png"]
+        for expected in ("滑窗 EMA", "2D CA 卡尔曼", "弯道 CTRV", "测速误差 (km/h)", "弯道场景测速模型消融对比"):
+            self.assertIn(expected, speed_txt)
+
+        conflict_txt = captured_texts["ablation_conflict_metrics.png"]
+        for expected in ("CVM 圆包络", "OBB-SSM", "窄路并行", "制动礼让", "垂直横穿", "L0 正常", "L3 紧急", "碰撞概率 (%)"):
+            self.assertIn(expected, conflict_txt)
+
+        bench_txt = captured_texts["benchmark_breakdown.png"]
+        for expected in ("解码", "检测与跟踪", "投影与测速", "冲突与事件", "渲染与写盘", "单帧耗时 (ms)", "端到端吞吐"):
+            self.assertIn(expected, bench_txt)
+
+        timeline_txt = captured_texts["run_speed_timeline.png"]
+        for expected in ("时间 (s)", "时速 (km/h)", "限速阈值 (30 km/h)", "冲突事件窗", "车辆 #1"):
+            self.assertIn(expected, timeline_txt)
+
+        risk_txt = captured_texts["run_risk_timeline.png"]
+        for expected in ("风险等级", "L0 正常", "L1 超速", "L2 注意", "L3 紧急", "单帧峰值风险等级"):
+            self.assertIn(expected, risk_txt)
+
+        mot_txt = captured_texts["mot_comparison.png"]
+        for expected in ("多目标跟踪精度指标对比", "身份切换次数", "指标得分"):
+            self.assertIn(expected, mot_txt)
+
+    def test_evaluate_markdown_chinese_localization(self):
+        sample = {
+            "run_dir": "D:/runs/demo",
+            "has_ground_truth": False,
+            "frames": {"processed": 360, "observed_assessment_rows": 28},
+            "events": {"count": 2},
+            "speed_rows": {"speed_kmh": {"min": 0.0, "mean": 5.4812, "max": 35.2}},
+            "risk_counts": {"LEVEL_0_SAFE": 14, "LEVEL_1": 3, "LEVEL_2": 1, "LEVEL_3": 10},
+        }
+        md = evaluate_to_markdown(sample)
+        for token in ("# 运行产物分析评价", "已处理帧数：360", "## 风险等级分布", "L0 正常", "L1 超速", "L2 注意", "L3 紧急", "ground truth"):
+            self.assertIn(token, md)
+
+        sample_gt = dict(sample)
+        sample_gt["has_ground_truth"] = True
+        sample_gt["ground_truth_evaluation"] = {
+            "speed_accuracy": {"matched_count": 2, "reference_count": 2, "mae_kmh": 1.2, "rmse_kmh": 1.5, "max_abs_error_kmh": 2.0},
+            "event_accuracy": {"tp": 1, "fp": 0, "fn": 0, "precision": 1.0, "recall": 1.0, "f1": 1.0, "lead_time_s": {"count": 1, "min": 1.5, "mean": 1.5, "max": 1.5}},
+        }
+        md_gt = evaluate_to_markdown(sample_gt)
+        self.assertIn("人工真值精度评价 (Ground-truth accuracy)", md_gt)
+        self.assertIn("MAE=1.2 km/h", md_gt)
 
 
 if __name__ == "__main__":
