@@ -581,6 +581,7 @@ class TestCharts(unittest.TestCase):
     def test_chinese_chart_labels_rendered_across_chart_types(self):
         import analysis.charts as charts_mod
 
+        host_has_cjk = bool(detect_available_cjk_fonts())
         captured_texts: dict[str, str] = {}
         orig_save = charts_mod._save_figure
 
@@ -598,7 +599,8 @@ class TestCharts(unittest.TestCase):
                 if leg is not None:
                     parts.extend(t.get_text() for t in leg.get_texts())
             captured_texts[Path(out_path).name] = "\n".join(parts)
-            return orig_save(fig, out_path)
+            # 无中文字体的 Linux CI 上跳过光栅化中文到 DejaVu Sans，仅验证全部中文文案结构
+            return orig_save(fig, out_path) if host_has_cjk else str(out_path)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -667,7 +669,15 @@ class TestCharts(unittest.TestCase):
             bench_data["wall_elapsed_ms"] = 1400.0
             bench_data["wall_fps"] = round(2.0 / 1.4, 3)
 
-            with mock.patch.object(charts_mod, "_save_figure", side_effect=_capture_save):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(charts_mod, "_save_figure", side_effect=_capture_save))
+                if not host_has_cjk:
+                    stack.enter_context(
+                        mock.patch.object(charts_mod, "detect_available_cjk_fonts", return_value=["Microsoft YaHei"])
+                    )
+                    warn_ctx = warnings.catch_warnings()
+                    stack.enter_context(warn_ctx)
+                    warnings.filterwarnings("ignore", message="Glyph .* missing from font", category=UserWarning)
                 plot_ablation_charts(ablation_data, root / "charts")
                 plot_run_timeline(run_dir, root / "charts")
                 plot_benchmark_breakdown(bench_data, root / "charts" / "benchmark_breakdown.png")
@@ -941,17 +951,23 @@ class TestCharts(unittest.TestCase):
                 with mock.patch.object(charts_mod, "_save_figure", side_effect=_inspect_conflict):
                     plot_ablation_charts(ablation_data, root)
 
-        # parallel_pass (None/None) 不绘柱、标注“无数据”；braking_yield 的真实 0.0% 必须绘柱且标注“0.0%”
+        # parallel_pass (None/None) 不绘柱、标注“无数据”/“N/A”；braking_yield 的真实 0.0% 必须绘柱且标注“0.0%”
+        missing_lbl = "无数据" if detect_available_cjk_fonts() else "N/A"
         self.assertEqual(inspected["drac_bars"], [1.97, 6.94])
         self.assertEqual(inspected["prob_bars"], [0.0, 47.3])
-        self.assertIn("无数据", inspected["drac_texts"])
+        self.assertIn(missing_lbl, inspected["drac_texts"])
         self.assertNotIn("0.00", inspected["drac_texts"])
-        self.assertIn("无数据", inspected["prob_texts"])
+        self.assertIn(missing_lbl, inspected["prob_texts"])
         self.assertIn("0.0%", inspected["prob_texts"])
         self.assertIn("47.3%", inspected["prob_texts"])
 
     def test_run_timeline_separate_ttc_mttc_sparse_gaps_and_single_point(self):
         import analysis.charts as charts_mod
+
+        use_cjk = bool(detect_available_cjk_fonts())
+        limit_prefix = "限速阈值" if use_cjk else "Speed Limit"
+        inferred_lbl = "瞬时高风险窗（推断）" if use_cjk else "Inferred Transient Risk"
+        confirmed_lbl = "确认冲突事件窗" if use_cjk else "Confirmed Conflict Event"
 
         captured: dict[str, dict] = {}
         orig_save = charts_mod._save_figure
@@ -1031,9 +1047,9 @@ class TestCharts(unittest.TestCase):
 
             # 验证限速保留小数 25.25，且稀疏推断高风险窗为 2 个独立窄窗，未合并成 [2, 5]
             speed_info = captured["run_speed_timeline.png"]
-            self.assertIn("限速阈值 (25.25 km/h)", speed_info["legend"])
-            self.assertIn("瞬时高风险窗（推断）", speed_info["legend"])
-            self.assertNotIn("确认冲突事件窗", speed_info["legend"])
+            self.assertIn(f"{limit_prefix} (25.25 km/h)", speed_info["legend"])
+            self.assertIn(inferred_lbl, speed_info["legend"])
+            self.assertNotIn(confirmed_lbl, speed_info["legend"])
             self.assertEqual(len(speed_info["spans"]), 2)
             self.assertLess(speed_info["spans"][0][1], 2.5)
             self.assertGreater(speed_info["spans"][1][0], 4.5)
@@ -1078,7 +1094,7 @@ class TestCharts(unittest.TestCase):
                 out_single = plot_run_timeline(run_single, root / "out_single")
             for p in out_single:
                 self._assert_valid_png(p)
-            self.assertIn("限速阈值 (30.5 km/h)", captured["run_speed_timeline.png"]["legend"])
+            self.assertIn(f"{limit_prefix} (30.5 km/h)", captured["run_speed_timeline.png"]["legend"])
             single_risk_ln = captured["run_risk_timeline.png"]["risk_lines"][0]
             self.assertEqual(single_risk_ln["x"], [1.0])
             self.assertEqual(single_risk_ln["y"], [3.0])
@@ -1102,7 +1118,7 @@ class TestCharts(unittest.TestCase):
                 out_nested = plot_run_timeline(run_nested, root / "out_nested")
             for p in out_nested:
                 self._assert_valid_png(p)
-            self.assertIn("限速阈值 (22.5 km/h)", captured["run_speed_timeline.png"]["legend"])
+            self.assertIn(f"{limit_prefix} (22.5 km/h)", captured["run_speed_timeline.png"]["legend"])
 
             # 若同时存在 configuration.json，则优先读取 configuration.json；均缺失时回退 30.0
             (run_nested / "configuration.json").write_text(
