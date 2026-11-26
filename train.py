@@ -337,14 +337,40 @@ def main() -> None:
             T_max=max(1, args.epochs),   # 一个完整余弦周期的长度
         )
 
+    def _model_best_path(model_name: str) -> Path:
+        return config.BEST_MODEL_PATH.with_name(
+            f"{config.BEST_MODEL_PATH.stem}_{model_name}{config.BEST_MODEL_PATH.suffix}"
+        )
+
+    def _is_compatible_checkpoint(ckpt: object) -> bool:
+        if not isinstance(ckpt, dict):
+            return False
+        ckpt_model_name = ckpt.get("model_name")
+        if ckpt_model_name is not None and ckpt_model_name != args.model:
+            return False
+        state = ckpt.get("model_state")
+        if not isinstance(state, dict):
+            return False
+        current_state = model.state_dict()
+        if set(state.keys()) != set(current_state.keys()):
+            return False
+        return all(
+            isinstance(state[k], torch.Tensor) and state[k].shape == v.shape
+            for k, v in current_state.items()
+        )
+
+    model_best_path = _model_best_path(args.model)
+
     # ---------- 恢复训练（可选） ----------
     start_epoch = 1
     best_val_acc = 0.0          # 历史最佳验证准确率
     best_epoch = 0
     epochs_no_improve = 0       # 连续多少轮没进步（用于早停）
+    resume_path: Path | None = None
     if args.resume:
-        resume_path = Path(args.resume)
-        if resume_path.exists():
+        candidate_resume = Path(args.resume)
+        if candidate_resume.exists():
+            resume_path = candidate_resume
             print(f"\n从检查点恢复: {resume_path}")
             # ★ weights_only=False 才能加载含优化器状态的完整检查点
             #   PyTorch 2.6+ 默认 weights_only=True，加载自己存的字典会报错
@@ -354,12 +380,14 @@ def main() -> None:
             _restore_scheduler_on_resume(scheduler, optimizer, ckpt, args.epochs)
             start_epoch = ckpt.get("epoch", 0) + 1
             epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
-            if config.BEST_MODEL_PATH.exists():
-                best_val_acc = float(ckpt.get("best_val_acc", ckpt.get("val_acc", 0.0)))
-                best_epoch = int(ckpt.get("best_epoch", ckpt.get("epoch", 0)))
+            best_val_acc = float(ckpt.get("best_val_acc", ckpt.get("val_acc", 0.0)))
+            best_epoch = int(ckpt.get("best_epoch", ckpt.get("epoch", 0)))
+            for best_candidate in (model_best_path, config.BEST_MODEL_PATH):
+                if not best_candidate.exists():
+                    continue
                 try:
-                    best_ckpt = torch.load(config.BEST_MODEL_PATH, map_location=device, weights_only=False)
-                    if best_ckpt.get("model_name") in (None, args.model):
+                    best_ckpt = torch.load(best_candidate, map_location=device, weights_only=False)
+                    if _is_compatible_checkpoint(best_ckpt):
                         disk_acc = float(best_ckpt.get("val_acc", 0.0))
                         disk_epoch = int(best_ckpt.get("epoch", 0))
                         if disk_acc >= best_val_acc:
@@ -369,7 +397,7 @@ def main() -> None:
                     pass
             print(f"从第 {start_epoch} 轮继续 (历史最佳 {best_val_acc:.2f}% @ 第 {best_epoch} 轮)")
         else:
-            print(f"[警告] 找不到检查点 {resume_path}，从头开始训练")
+            print(f"[警告] 找不到检查点 {candidate_resume}，从头开始训练")
 
     # ---------- 准备保存目录 ----------
     ensure_dir(config.CKPT_DIR)
@@ -441,23 +469,22 @@ def main() -> None:
             #   optimizer_state —— 想接着训练就需要它（Adam 内部有动量等状态）
             #   epoch          —— 从哪一轮继续
             #   class_names    —— 推理时要把下标变回类别名，必须存！
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_name": args.model,
-                    "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "val_acc": val_acc,
-                    "val_loss": val_loss,
-                    "class_names": class_names,
-                    "config": {
-                        "num_classes": num_classes,
-                        "image_size": config.IMAGE_SIZE,
-                        "in_channels": config.IN_CHANNELS,
-                    },
+            best_payload = {
+                "epoch": epoch,
+                "model_name": args.model,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "val_acc": val_acc,
+                "val_loss": val_loss,
+                "class_names": class_names,
+                "config": {
+                    "num_classes": num_classes,
+                    "image_size": config.IMAGE_SIZE,
+                    "in_channels": config.IN_CHANNELS,
                 },
-                config.BEST_MODEL_PATH,
-            )
+            }
+            torch.save(best_payload, model_best_path)
+            torch.save(best_payload, config.BEST_MODEL_PATH)
             print(f"  [OK] 新的最佳模型已保存 (val_acc={val_acc:.2f}%)"
                   f" → {config.BEST_MODEL_PATH}")
         else:
@@ -494,14 +521,31 @@ def main() -> None:
     # ---------- 训练结束，用最佳模型测测试集 ----------
     banner("加载最佳模型，在测试集上做最终评估")
 
-    if not config.BEST_MODEL_PATH.exists():
-        print("[错误] 没有找到最佳模型，训练可能失败了")
-        return
+    eval_candidates = [model_best_path, config.BEST_MODEL_PATH]
+    if resume_path is not None:
+        eval_candidates.append(resume_path)
+    eval_candidates.append(config.LAST_MODEL_PATH)
 
-    ckpt = torch.load(config.BEST_MODEL_PATH, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state"])
+    loaded_eval_ckpt = None
+    for cand_path in eval_candidates:
+        if not cand_path.exists():
+            continue
+        try:
+            cand_ckpt = torch.load(cand_path, map_location=device, weights_only=False)
+        except Exception:
+            continue
+        if _is_compatible_checkpoint(cand_ckpt):
+            loaded_eval_ckpt = cand_ckpt
+            break
 
-    print(f"最佳模型来自第 {ckpt['epoch']} 轮，验证集准确率 {ckpt['val_acc']:.2f}%")
+    if loaded_eval_ckpt is not None:
+        model.load_state_dict(loaded_eval_ckpt["model_state"])
+        print(
+            f"最佳兼容模型来自第 {loaded_eval_ckpt.get('epoch', '?')} 轮，"
+            f"验证集准确率 {float(loaded_eval_ckpt.get('val_acc', 0.0)):.2f}%"
+        )
+    else:
+        print("[警告] 未找到与当前架构兼容的检查点，将直接使用当前内存模型评估测试集")
 
     # ★★ 测试集全程只用这一次（数据泄漏的防护纪律）
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)

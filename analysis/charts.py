@@ -17,6 +17,7 @@ import csv
 import json
 import math
 import os
+import zlib
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -177,18 +178,34 @@ def _safe_label(text: str, *, use_cjk: bool, fallback: str) -> str:
     cmap = _fallback_font_charmap()
     if cmap is not None and all(ord(ch) in cmap for ch in text):
         return text
-    return fallback
+    if fallback.isascii():
+        return fallback
+    if cmap is not None and all(ord(ch) in cmap for ch in fallback):
+        return fallback
+    ascii_only = "".join(ch for ch in fallback if ord(ch) < 128).strip()
+    return ascii_only if ascii_only else "Item"
 
 
 def _display_stage(stage_key: str, *, use_cjk: bool = True) -> str:
     table = _STAGE_DISPLAY_LABELS if use_cjk else _STAGE_DISPLAY_LABELS_EN
-    return table.get(stage_key, stage_key)
+    if stage_key in table:
+        return table[stage_key]
+    return _safe_label(stage_key, use_cjk=use_cjk, fallback=f"Stage ({zlib.crc32(stage_key.encode('utf-8')) & 0xFFFF:04x})")
 
 
-def _display_speed_model(mode: str, *, use_cjk: bool = True) -> str:
+def _display_speed_model(
+    mode: str, *, use_cjk: bool = True, fallback_index: Optional[int] = None
+) -> str:
     key = mode.strip().lower()
     table = _SPEED_MODEL_LABELS if use_cjk else _SPEED_MODEL_LABELS_EN
-    return table.get(key, _safe_label(mode.upper(), use_cjk=use_cjk, fallback=key or "MODEL"))
+    if key in table:
+        return table[key]
+    fallback = (
+        f"Custom Model #{fallback_index}"
+        if fallback_index is not None
+        else f"Model ({zlib.crc32(mode.encode('utf-8')) & 0xFFFF:04x})"
+    )
+    return _safe_label(mode.upper(), use_cjk=use_cjk, fallback=fallback)
 
 
 def _display_scenario(name: str, *, use_cjk: bool = True, fallback: str = "Scenario") -> str:
@@ -351,7 +368,10 @@ def plot_ablation_charts(
             try:
                 if ax_lin is not None:
                     modes = [m for m in ("ema", "kalman", "ctrv") if isinstance(speed_est.get(m), Mapping)]
-                    labels = [_display_speed_model(m, use_cjk=use_cjk) for m in modes]
+                    labels = [
+                        _display_speed_model(m, use_cjk=use_cjk, fallback_index=i + 1)
+                        for i, m in enumerate(modes)
+                    ]
                     mae_kmh = []
                     rmse_kmh = []
                     has_rmse = all("rmse_ms" in speed_est[m] or "rmse_kmh" in speed_est[m] for m in modes)
@@ -442,7 +462,10 @@ def plot_ablation_charts(
                     ordered_modes = [m for m in ("ema", "kalman", "ctrv") if m in grouped] + [
                         m for m in sorted(grouped) if m not in ("ema", "kalman", "ctrv")
                     ]
-                    t_labels = [_display_speed_model(m, use_cjk=use_cjk) for m in ordered_modes]
+                    t_labels = [
+                        _display_speed_model(m, use_cjk=use_cjk, fallback_index=i + 1)
+                        for i, m in enumerate(ordered_modes)
+                    ]
                     t_mae = [float(np.mean(grouped[m][0])) for m in ordered_modes]
                     t_max = [float(np.mean(grouped[m][1])) for m in ordered_modes]
                     max_turn_y = max([0.5, *t_mae, *t_max])
@@ -952,7 +975,7 @@ def plot_run_timeline(
     speed_limit = _resolve_speed_limit_kmh(run_root)
     speed_limit_str = _format_speed_limit(speed_limit)
 
-    veh_series: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    veh_series: dict[int, list[tuple[Optional[int], float, float, bool]]] = defaultdict(list)
     all_timestamps: list[float] = []
     with speeds_csv.open(encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
@@ -967,9 +990,25 @@ def plot_run_timeline(
                 raise ValueError(f"{speeds_csv} 第 {row_idx} 行数值字段无效") from None
             if not (math.isfinite(ts) and math.isfinite(spd)) or ts < 0.0 or spd < 0.0:
                 raise ValueError(f"{speeds_csv} 第 {row_idx} 行包含非有限或负数值")
+            raw_fi = row.get("frame_idx")
+            if raw_fi is None or not str(raw_fi).strip():
+                raw_fi = row.get("frame_index")
+            fidx: Optional[int] = None
+            if raw_fi is not None and str(raw_fi).strip():
+                try:
+                    fidx = int(str(raw_fi).strip())
+                except ValueError:
+                    raise ValueError(f"{speeds_csv} 第 {row_idx} 行 frame_idx 无效") from None
+                if fidx < 0:
+                    raise ValueError(f"{speeds_csv} 第 {row_idx} 行 frame_idx 不能为负数")
+            raw_rel = row.get("is_reliable")
+            is_rel = True
+            if raw_rel is not None and str(raw_rel).strip():
+                rel_tok = str(raw_rel).strip().lower()
+                is_rel = rel_tok not in ("0", "false", "no", "n")
             all_timestamps.append(ts)
             if str(row.get("category", "")).strip().lower() == "vehicle":
-                veh_series[tid].append((ts, spd))
+                veh_series[tid].append((fidx, ts, spd, is_rel))
 
     unique_speed_ts = sorted(set(all_timestamps))
     median_dt = _compute_median_dt(unique_speed_ts)
@@ -1100,21 +1139,55 @@ def plot_run_timeline(
             # 按观测长度与峰值车速排序，避免多车流下 legend 过长触发紧排告警
             ordered_ids = sorted(
                 veh_series.keys(),
-                key=lambda tid: (len(veh_series[tid]), max(s for _, s in veh_series[tid])),
+                key=lambda tid: (len(veh_series[tid]), max(s for _, _, s, _ in veh_series[tid])),
                 reverse=True,
             )
             max_spd_seen = speed_limit
+            unreliable_labeled = False
+            unreliable_label_text = "未收敛测速样本" if use_cjk else "Unreliable Sample"
             for idx, tid in enumerate(ordered_ids):
-                pts = sorted(veh_series[tid], key=lambda pair: pair[0])
-                ts_vals = [p[0] for p in pts]
-                sp_vals = [p[1] for p in pts]
-                if sp_vals:
-                    max_spd_seen = max(max_spd_seen, max(sp_vals))
+                pts = sorted(
+                    veh_series[tid],
+                    key=lambda item: (item[1], -1 if item[0] is None else item[0]),
+                )
+                sp_all = [p[2] for p in pts]
+                if sp_all:
+                    max_spd_seen = max(max_spd_seen, max(sp_all))
+                rel_pts = [(p[0], p[1], p[2]) for p in pts if p[3]]
+                unrel_pts = [(p[1], p[2]) for p in pts if not p[3]]
+
                 if idx < 8:
                     lbl = f"车辆 #{tid}" if use_cjk else f"Vehicle #{tid}"
                 else:
                     lbl = None
-                ax.plot(ts_vals, sp_vals, marker="o", markersize=2.6, linewidth=1.6, label=lbl)
+
+                if rel_pts:
+                    rel_ts, rel_sp = _build_segmented_series(
+                        rel_pts, unique_speed_ts=unique_speed_ts, median_dt=median_dt
+                    )
+                    lines = ax.plot(
+                        rel_ts, rel_sp, marker="o", markersize=2.6, linewidth=1.6, label=lbl
+                    )
+                    line_color = lines[0].get_color()
+                else:
+                    # 无可靠样本时仍用空线段保持车辆图例与颜色一致，未收敛点单独空心标出
+                    lines = ax.plot([], [], marker="o", markersize=2.6, linewidth=1.6, label=lbl)
+                    line_color = lines[0].get_color()
+
+                if unrel_pts:
+                    ax.plot(
+                        [p[0] for p in unrel_pts],
+                        [p[1] for p in unrel_pts],
+                        linestyle="None",
+                        marker="o",
+                        markerfacecolor="none",
+                        markeredgecolor=line_color,
+                        markeredgewidth=1.3,
+                        markersize=4.4,
+                        alpha=0.85,
+                        label=(unreliable_label_text if not unreliable_labeled else None),
+                    )
+                    unreliable_labeled = True
 
             if not ordered_ids:
                 ax.text(
@@ -1469,6 +1542,9 @@ def plot_benchmark_breakdown(
         and isinstance(steady_obj.get("warmup_frames_excluded"), (int, np.integer))
         and not isinstance(steady_obj.get("warmup_frames_excluded"), (bool, np.bool_))
         and int(steady_obj["warmup_frames_excluded"]) > 0
+        and isinstance(steady_obj.get("frames_evaluated"), (int, np.integer))
+        and not isinstance(steady_obj.get("frames_evaluated"), (bool, np.bool_))
+        and int(steady_obj["frames_evaluated"]) > 0
         and steady_obj.get("steady_state_fps") is not None
         and not isinstance(steady_obj.get("steady_state_fps"), (bool, np.bool_))
     ):

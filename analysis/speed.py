@@ -171,10 +171,19 @@ class TrackMotionTracker:
         self._last_timestamp_s: Optional[float] = None
         self._stationary_streak = 0
         self._last_kalman_reset_count = 0
+        self._consecutive_rejects = 0
 
         # 类别滞回状态：新类别需连续多帧确认才生效
         self._pending_category: Optional[str] = None
         self._pending_count = 0
+
+    def reset_reliability_window(self, timestamp_s: float, x_m: float, y_m: float) -> None:
+        """在几何参考点切换（如类别翻转切回未补偿锚点）时重建可靠度窗口，保留滤波器速度状态。"""
+        self.history.clear()
+        self.history.append((float(timestamp_s), float(x_m), float(y_m)))
+        self._stationary_streak = 0
+        if self.estimator_mode not in ("kalman", "ctrv"):
+            self.has_valid_velocity = False
 
     def observe_category(self, category: str, confirm_frames: int = 3):
         """按连续 N 帧确认机制更新类别，抑制 person/vehicle 检测抖动"""
@@ -233,17 +242,21 @@ class TrackMotionTracker:
         pos_std_m: Optional[float] = None,
         pos_cov_m2: Optional[Tuple[float, float, float, float]] = None,
         yaw_rate_rad_s: float = 0.0,
+        obs_accepted: bool = True,
     ) -> SpeedReading:
         """统一计算静止滞回、微动截断、航向角、超速与可信度判定。"""
         # 静止判定必须使用截断前的平滑速度幅值：
         # 微动截断（<1 km/h 显示为 0）只影响展示标量，
-        # 若用截断后值判定，0.2 m/s 蠕行车辆会被误豁免为"泊车"导致碰撞漏报
+        # 若用截断后值判定，0.2 m/s 蠕行车辆会被误豁免为"泊车"导致碰撞漏报；
+        # 同时仅允许新近被滤波器接受的观测推进静止计数，且连续 2 帧拒收立即撤销既有泊车豁免。
         smoothed_mag = math.hypot(vx_ms, vy_ms)
-        if len(self.history) >= 3:
-            if smoothed_mag < self.stationary_speed_ms:
-                self._stationary_streak += 1
-            else:
+        if smoothed_mag >= self.stationary_speed_ms:
+            self._stationary_streak = 0
+        elif not obs_accepted:
+            if self._consecutive_rejects >= 2:
                 self._stationary_streak = 0
+        elif len(self.history) >= 3:
+            self._stationary_streak += 1
         is_stationary = self._stationary_streak >= self.stationary_min_frames
 
         speed_ms, speed_kmh = self._apply_micro_truncation(smoothed_mag)
@@ -340,11 +353,15 @@ class TrackMotionTracker:
                 # 滤波器触发连续拒收或数值溢出重置后，清空旧历史窗口与静止计数，
                 # 要求重置后重新累积足够跨度的干净观测才恢复 is_reliable。
                 self._last_kalman_reset_count = reset_count
+                self._consecutive_rejects = 0
                 self.history.clear()
                 self.history.append((ts, xm, ym))
                 self._stationary_streak = 0
             elif accepted:
+                self._consecutive_rejects = 0
                 self.history.append((ts, xm, ym))
+            else:
+                self._consecutive_rejects += 1
 
             kf_x, kf_y = self._kalman.position_xy
             kf_vx, kf_vy = self._kalman.velocity_xy
@@ -369,6 +386,7 @@ class TrackMotionTracker:
                 pos_std_m=pos_std,
                 pos_cov_m2=pos_cov_tuple,
                 yaw_rate_rad_s=yaw_rate,
+                obs_accepted=bool(accepted),
             )
 
         self._last_timestamp_s = ts

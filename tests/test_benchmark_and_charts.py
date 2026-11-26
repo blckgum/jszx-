@@ -214,15 +214,18 @@ class TestBenchmark(unittest.TestCase):
             self.assertEqual(zero_report["steady_state"]["warmup_frames_excluded"], 0)
             self.assertEqual(zero_report["steady_state"]["frames_evaluated"], 0)
 
-            # 验证 max_frames=1 时安全不丢弃唯一帧 (warmup_frames_excluded == 0)
+            # 验证 max_frames=1 时安全不丢弃唯一帧且将稳态吞吐标为无可用样本 (None)
             with mock.patch("analysis.pipeline.TrackingSession", return_value=_mock_tracking_session()):
                 one_report = profile_pipeline_stages(
                     video, demo=True, max_frames=1, render_video=False
                 )
             self.assertEqual(one_report["frames_profiled"], 1)
             self.assertEqual(one_report["steady_state"]["warmup_frames_excluded"], 0)
-            self.assertEqual(one_report["steady_state"]["frames_evaluated"], 1)
-            self.assertEqual(one_report["steady_state"]["steady_state_fps"], one_report["frame_processing_fps"])
+            self.assertEqual(one_report["steady_state"]["frames_evaluated"], 0)
+            self.assertIsNone(one_report["steady_state"]["steady_state_fps"])
+            self.assertEqual(one_report["steady_state"]["stages"], {})
+            one_md = benchmark_to_markdown(one_report)
+            self.assertIn("N/A", one_md)
 
             # CLI 输出 JSON 与 Markdown
             out_json = root / "bench.json"
@@ -277,12 +280,12 @@ class TestBenchmark(unittest.TestCase):
         self.assertAlmostEqual(steady["stages"]["detect_track"]["max_ms"], 12.0, places=3)
         self.assertAlmostEqual(steady["stages"]["total_frame"]["mean_ms"], 20.0, places=3)
 
-        # 单帧边界：不剔除唯一帧
+        # 单帧边界：不将唯一预热样本标成稳态
         single = summarize_stage_timings([samples[1]])
         self.assertEqual(single["steady_state"]["warmup_frames_excluded"], 0)
-        self.assertEqual(single["steady_state"]["frames_evaluated"], 1)
-        self.assertEqual(single["steady_state"]["steady_state_fps"], single["frame_processing_fps"])
-        self.assertAlmostEqual(single["steady_state"]["stages"]["total_frame"]["mean_ms"], 20.0, places=3)
+        self.assertEqual(single["steady_state"]["frames_evaluated"], 0)
+        self.assertIsNone(single["steady_state"]["steady_state_fps"])
+        self.assertEqual(single["steady_state"]["stages"], {})
 
     def test_benchmark_rejects_blank_paths_and_invalid_args(self):
         for bad_path in ("", "   ", Path("   "), True):
@@ -1185,6 +1188,99 @@ class TestCharts(unittest.TestCase):
         self.assertIn("| L1 超速 | 10 |", md)
         self.assertEqual(md.count("| L1 超速 |"), 1)
         self.assertEqual(md.count("| L0 正常 |"), 1)
+
+    def test_custom_non_ascii_model_headless_fallback_single_frame_bench_and_speed_gaps(self):
+        import matplotlib.font_manager as fm
+        import matplotlib.ft2font as ft2font
+        import matplotlib.text as mtext
+        import analysis.charts as charts_mod
+
+        dejavu_only = [f for f in fm.fontManager.ttflist if getattr(f, "name", "") == "DejaVu Sans"]
+        dejavu_cmap = set(ft2font.FT2Font(dejavu_only[0].fname).get_charmap().keys())
+        captured_texts: dict[str, list[str]] = {}
+        orig_save = charts_mod._save_figure
+
+        def _capture(fig, out_path):
+            fig.canvas.draw()
+            captured_texts[Path(out_path).name] = [
+                t.get_text()
+                for t in fig.findobj(mtext.Text)
+                if t.get_visible() and t.get_text().strip()
+            ]
+            return orig_save(fig, out_path)
+
+        cache_clear = getattr(getattr(fm.fontManager, "_findfont_cached", None), "cache_clear", None)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            # 1) 无 CJK 字体传入非内置自定义中文模型名，必须生成可区分 ASCII 标签且零缺字警告
+            custom_ab = {
+                "turn_speed_ablation": [
+                    {"estimator_mode": "自定义", "target_speed_kmh": 25.0, "turn_rate_rad_s": 0.3, "mean_abs_error_kmh": 1.2, "max_abs_error_kmh": 2.0},
+                    {"estimator_mode": "自研滤波", "target_speed_kmh": 25.0, "turn_rate_rad_s": 0.3, "mean_abs_error_kmh": 0.9, "max_abs_error_kmh": 1.6},
+                ],
+            }
+            single_bench = summarize_stage_timings([
+                {"decode": 1.0, "detect_track": 999.0, "geometry_speed": 0.0, "conflict_events": 0.0, "render_write": 0.0}
+            ])
+            try:
+                with mock.patch.object(fm.fontManager, "ttflist", dejavu_only), \
+                        mock.patch.object(charts_mod, "_save_figure", side_effect=_capture):
+                    if callable(cache_clear):
+                        cache_clear()
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", RuntimeWarning)
+                        warnings.simplefilter("error", UserWarning)
+                        p_custom = plot_ablation_charts(custom_ab, root / "custom_out")
+                        p_bench1 = plot_benchmark_breakdown(single_bench, root / "bench1.png")
+            finally:
+                if callable(cache_clear):
+                    cache_clear()
+                configure_cjk_fonts()
+
+            self._assert_valid_png(p_custom[0])
+            self._assert_valid_png(p_bench1)
+            ab_text = " ".join(captured_texts["ablation_speed_mae.png"])
+            self.assertIn("Custom Model #1", ab_text)
+            self.assertIn("Custom Model #2", ab_text)
+            self.assertNotIn("Steady FPS", " ".join(captured_texts["bench1.png"]))
+            for txt in [*captured_texts["ablation_speed_mae.png"], *captured_texts["bench1.png"]]:
+                self.assertTrue(all(ord(ch) in dejavu_cmap for ch in txt), msg=f"存在缺字: {txt!r}")
+
+            # 2) 速度图：按 frame_idx 断开缺失帧并把 is_reliable=0 样本单独空心标注（不与可靠线连成骤降）
+            run_gap = root / "run_gap"
+            run_gap.mkdir()
+            with (run_gap / "speeds.csv").open("w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["frame_idx", "timestamp_s", "track_id", "category", "speed_kmh", "is_reliable"])
+                w.writerow([177, "5.900", 6, "vehicle", "33.5", 1])
+                w.writerow([178, "5.933", 6, "vehicle", "34.7", 1])
+                w.writerow([179, "5.967", 6, "vehicle", "0.0", 0])
+                # 缺失 frame_idx 180
+                w.writerow([181, "6.033", 6, "vehicle", "12.1", 0])
+                w.writerow([182, "6.067", 6, "vehicle", "18.5", 1])
+                w.writerow([183, "6.100", 6, "vehicle", "19.2", 1])
+
+            line_data: list[tuple[str, list[float], list[float], str]] = []
+            import matplotlib.axes
+
+            orig_plot = matplotlib.axes.Axes.plot
+
+            def _spy_plot(ax_self, x, y, *a, **kw):
+                line_data.append((str(kw.get("label", "")), list(x), list(y), str(kw.get("linestyle", "-"))))
+                return orig_plot(ax_self, x, y, *a, **kw)
+
+            with mock.patch.object(matplotlib.axes.Axes, "plot", _spy_plot):
+                out_gap = plot_run_timeline(run_gap, root / "gap_charts")
+            self._assert_valid_png(out_gap[0])
+            veh_lines = [entry for entry in line_data if "6" in entry[0]]
+            unrel_lines = [entry for entry in line_data if "未收敛" in entry[0] or "Unreliable" in entry[0]]
+            self.assertEqual(len(veh_lines), 1)
+            self.assertEqual(len(unrel_lines), 1)
+            # 可靠线段在 178 与 182 之间必须有 NaN 断点，绝不直接连接成 34.7 -> 18.5
+            self.assertTrue(any(np.isnan(v) for v in veh_lines[0][2]))
+            # 不可靠样本以空心无连线散点单独绘出
+            self.assertEqual(unrel_lines[0][3], "None")
+            self.assertEqual(len(unrel_lines[0][1]), 2)
 
 
 if __name__ == "__main__":

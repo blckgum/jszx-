@@ -494,6 +494,19 @@ class ConflictAnalyzer:
                     t_eff = accel_entry_t
                 else:
                     t_eff = mttc if (mttc is not None and mttc < obb.t_enter) else obb.t_enter
+                    # 二阶圆角安全包络侵入时刻跨过更严厉的分级阈值（如 L2->L3 或 L0->L2/L3）时，
+                    # 必须采用真实二阶侵入时刻，避免一维 MTTC 与扩展圆角包络的微小偏差导致降级漏报。
+                    if accel_entry_t is not None and accel_entry_t < t_eff:
+                        base_tier = (
+                            2 if t_eff <= self.ttc_critical_s
+                            else (1 if t_eff <= self.ttc_caution_s else 0)
+                        )
+                        accel_tier = (
+                            2 if accel_entry_t <= self.ttc_critical_s
+                            else (1 if accel_entry_t <= self.ttc_caution_s else 0)
+                        )
+                        if accel_tier > base_tier:
+                            t_eff = accel_entry_t
             else:
                 assert accel_entry_t is not None
                 t_eff = accel_entry_t
@@ -514,17 +527,17 @@ class ConflictAnalyzer:
             if level == RiskLevel.LEVEL_0_SAFE:
                 return None
 
-            drac_txt = f"{drac:.2f}" if drac is not None else "0.00"
+            drac_part = f", DRAC={drac:.2f}m/s^2" if drac is not None else ""
             if level == RiskLevel.LEVEL_3_CRITICAL:
                 crit_prefix = f"紧急碰撞危险({target_label})!" if is_cyclist else "紧急碰撞危险!"
                 desc = (
-                    f"{crit_prefix} (OBB-TTC={t_eff:.2f}s, "
-                    f"DRAC={drac_txt}m/s^2, 净距={min_dist_out:.2f}m)"
+                    f"{crit_prefix} (OBB-TTC={t_eff:.2f}s"
+                    f"{drac_part}, 净距={min_dist_out:.2f}m)"
                 )
             else:
                 desc = (
-                    f"注意减速礼让{target_label} (OBB-TTC={t_eff:.2f}s, "
-                    f"DRAC={drac_txt}m/s^2, 净距={min_dist_out:.2f}m)"
+                    f"注意减速礼让{target_label} (OBB-TTC={t_eff:.2f}s"
+                    f"{drac_part}, 净距={min_dist_out:.2f}m)"
                 )
 
         if not obb.collides and accel_enters_obb:

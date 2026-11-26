@@ -136,8 +136,8 @@ def _empty_timing_summary() -> dict:
         "steady_state": {
             "warmup_frames_excluded": 0,
             "frames_evaluated": 0,
-            "steady_state_fps": zero_fps,
-            "stages": steady_stages,
+            "steady_state_fps": None,
+            "stages": {},
         },
     }
 
@@ -220,9 +220,9 @@ def summarize_stage_timings(stage_samples: Sequence[Mapping[str, Any]] | Mapping
     else:
         steady_state = {
             "warmup_frames_excluded": 0,
-            "frames_evaluated": n_frames,
-            "steady_state_fps": frame_processing_fps,
-            "stages": {name: dict(stats) for name, stats in stages_summary.items()},
+            "frames_evaluated": 0,
+            "steady_state_fps": None,
+            "stages": {},
         }
 
     return {
@@ -647,9 +647,15 @@ def benchmark_to_markdown(report: Mapping[str, Any]) -> str:
     if isinstance(steady, Mapping) and "steady_state_fps" in steady:
         warmup_excl = int(steady.get("warmup_frames_excluded", 0))
         frames_eval = int(steady.get("frames_evaluated", 0))
+        steady_fps_raw = steady.get("steady_state_fps")
+        steady_str = (
+            f"{float(steady_fps_raw):.3f} FPS"
+            if steady_fps_raw is not None and frames_eval > 0
+            else "N/A (insufficient frames)"
+        )
         lines.append(
             f"- Steady-state throughput (warmup excluded={warmup_excl}, frames={frames_eval}): "
-            f"{float(steady['steady_state_fps']):.3f} FPS"
+            f"{steady_str}"
         )
     lines.extend([
         "",

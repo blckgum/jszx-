@@ -242,6 +242,76 @@ class TestTrainResumeBestCheckpoint(unittest.TestCase):
                 [1, 2],
             )
 
+    def test_resume_avoids_crashing_on_incompatible_global_best_checkpoint(self):
+        class _OtherNet(torch.nn.Module):
+            def __init__(self, num_classes: int = 10):
+                super().__init__()
+                self.other = torch.nn.Linear(3 * 32 * 32, num_classes)
+
+            def forward(self, x):
+                return self.other(x.view(x.size(0), -1))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ckpt_dir = root / "checkpoints"
+            runs_dir = root / "runs"
+            best_path = ckpt_dir / "best.pt"
+            last_path = ckpt_dir / "last.pt"
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            runs_dir.mkdir(parents=True, exist_ok=True)
+
+            # 全局 best.pt 属于另一种架构，且保留 90% 历史最高；本轮续训 SimpleCNN 仅取得 85%，不得加载异构 best.pt 崩溃
+            other_model = _OtherNet(10)
+            torch.save(
+                {
+                    "epoch": 3,
+                    "model_name": "ResNet18",
+                    "model_state": other_model.state_dict(),
+                    "val_acc": 92.0,
+                    "class_names": [str(i) for i in range(10)],
+                },
+                best_path,
+            )
+            cnn_model = _TinyNet(10)
+            cnn_opt = torch.optim.AdamW(cnn_model.parameters(), lr=1e-3)
+            torch.save(
+                {
+                    "epoch": 5,
+                    "model_name": "SimpleCNN",
+                    "model_state": cnn_model.state_dict(),
+                    "optimizer_state": cnn_opt.state_dict(),
+                    "val_acc": 80.0,
+                    "best_val_acc": 90.0,
+                    "best_epoch": 4,
+                    "class_names": [str(i) for i in range(10)],
+                },
+                last_path,
+            )
+
+            eval_seq = iter([(0.28, 85.0), (0.25, 86.0)])
+
+            def _fake_loader(*args, **kwargs):
+                xs = torch.randn(4, 3, 32, 32)
+                ys = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+                ds = torch.utils.data.TensorDataset(xs, ys)
+                loader = torch.utils.data.DataLoader(ds, batch_size=4)
+                return loader, loader, loader, [str(i) for i in range(10)]
+
+            with mock.patch.object(config, "CKPT_DIR", ckpt_dir), \
+                    mock.patch.object(config, "RUNS_DIR", runs_dir), \
+                    mock.patch.object(config, "BEST_MODEL_PATH", best_path), \
+                    mock.patch.object(config, "LAST_MODEL_PATH", last_path), \
+                    mock.patch.object(config, "USE_SCHEDULER", False), \
+                    mock.patch.object(train_mod, "get_device", return_value=torch.device("cpu")), \
+                    mock.patch.object(train_mod, "build_dataloaders", side_effect=_fake_loader), \
+                    mock.patch.object(train_mod, "build_model", side_effect=lambda *a, **kw: _TinyNet(10)), \
+                    mock.patch.object(train_mod, "evaluate", side_effect=lambda *a, **kw: next(eval_seq)), \
+                    mock.patch.object(sys, "argv", ["train.py", "--fake", "--model", "SimpleCNN", "--epochs", "6", "--resume", str(last_path)]):
+                train_mod.main()
+
+            preserved_best = torch.load(best_path, map_location="cpu", weights_only=False)
+            self.assertEqual(preserved_best["model_name"], "ResNet18")
+
 
 if __name__ == "__main__":
     unittest.main()

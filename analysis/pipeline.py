@@ -351,6 +351,7 @@ class ConflictPerceptionPipeline:
         self.visualizer = EnhancedConflictVisualizer(
             calibrator=calibrator, speed_limit_kmh=speed_limit_kmh
         )
+        self._track_anchor_compensated: dict[int, bool] = {}
         self._latest_frame_snapshot: Optional[dict] = None
 
     def _configuration_snapshot(
@@ -436,6 +437,7 @@ class ConflictPerceptionPipeline:
         if self.stationary_seconds is not None:
             kwargs["stationary_min_frames"] = max(1, int(round(fps * self.stationary_seconds)))
         self.speed_estimator = SpeedEstimator(**kwargs)
+        self._track_anchor_compensated = {}
 
     def _configure_event_tracker(self, fps: float):
         """按视频实际 FPS 重建告警事件跟踪器：换算秒级窗口，且不继承上一视频状态"""
@@ -683,6 +685,7 @@ class ConflictPerceptionPipeline:
             if self.enable_stitching and self.stitcher is not None:
                 self.stitcher.update_kinematics(eff_id, reading, timestamp_s)
 
+            cur_anchor_applied = False
             if callable(comp_fn) and reading.category == "vehicle":
                 pol = object_policy(reading.object_kind, reading.category, self.object_policies)
                 if pol.kind != "pedestrian":
@@ -701,6 +704,19 @@ class ConflictPerceptionPipeline:
                     if math.isfinite(x_comp) and math.isfinite(y_comp):
                         reading.x_m = float(x_comp)
                         reading.y_m = float(y_comp)
+                        cur_anchor_applied = True
+
+            prev_anchor_applied = self._track_anchor_compensated.get(eff_id)
+            if prev_anchor_applied is not None and prev_anchor_applied != cur_anchor_applied:
+                # 同一轨迹因确认类别翻转导致几何参考点（车体中心 <-> 未补偿锚点）切换时，
+                # 重建可靠度窗口并清除切换帧的可信/超速/静止状态，避免输出空间位置阶跃跳变。
+                tracker = self.speed_estimator.tracks.get(eff_id)
+                if tracker is not None:
+                    tracker.reset_reliability_window(timestamp_s, x_m, y_m)
+                reading.is_reliable = False
+                reading.is_speeding = False
+                reading.is_stationary = False
+            self._track_anchor_compensated[eff_id] = cur_anchor_applied
 
             reading.in_parking_zone = self.calibrator.is_in_parking_zone(reading.x_m, reading.y_m)
             reading_map[eff_id] = reading
@@ -717,6 +733,8 @@ class ConflictPerceptionPipeline:
         else:
             live_ids = live_raw_ids
         self.speed_estimator.prune_stale_tracks(live_ids)
+        for stale_tid in [tid for tid in self._track_anchor_compensated if tid not in live_ids]:
+            del self._track_anchor_compensated[stale_tid]
 
         conflicts = self.conflict_analyzer.analyze_frame(
             speed_readings, timestamp_s=timestamp_s

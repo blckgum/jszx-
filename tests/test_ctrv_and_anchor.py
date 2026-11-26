@@ -617,6 +617,69 @@ class TestSpeedEstimatorCTRVAndAblationScenarios(unittest.TestCase):
             self.assertIn("ctrv_turn_results", payload)
             self.assertTrue(all(r["passed"] for r in payload["ctrv_turn_results"]))
 
+    def test_anchor_bias_flip_between_vehicle_and_pedestrian_resets_reliability(self):
+        from analysis.pipeline import ConflictPerceptionPipeline
+        import csv as _csv
+
+        cal = _build_pinhole_calibrator([0.0, -25.0, 9.0])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            calib_path = root / "calib.yaml"
+            cal.to_yaml(calib_path)
+
+            # 构造 motorcycle 在第 0..5 帧稳定行驶并开启锚点补偿，第 6..8 帧类别切为 person（确认翻转）
+            tracks_path = root / "tracks.jsonl"
+            rows = []
+            for idx in range(16):
+                cls_name = "motorcycle" if idx < 6 else "person"
+                cat = "vehicle" if idx < 6 else "pedestrian"
+                gx = -0.5 + 0.15 * idx
+                gy = 8.0
+                # 通过 H^-1 投回真实地面角点，使得底边锚点连续移动且触发补偿偏移切换
+                pt_arr = cal.H_inv @ np.array([[gx], [gy], [1.0]], dtype=np.float64)
+                u = float(pt_arr[0, 0] / pt_arr[2, 0])
+                v = float(pt_arr[1, 0] / pt_arr[2, 0])
+                rows.append({
+                    "schema_version": 1,
+                    "session_id": "test_anchor_flip",
+                    "frame_index": idx,
+                    "timestamp_s": idx * 0.05,
+                    "width": 1280,
+                    "height": 720,
+                    "tracks": [{
+                        "track_id": 380,
+                        "class_name": cls_name,
+                        "category": cat,
+                        "confidence": 0.9,
+                        "bbox_xyxy": [u - 15.0, v - 50.0, u + 15.0, v],
+                        "anchor_xy": [u, v],
+                    }],
+                })
+            tracks_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+            out_dir = root / "out"
+            pipe = ConflictPerceptionPipeline(
+                calibrator=RoadCalibrator.from_yaml(calib_path),
+                speed_model="ctrv",
+                conflict_model="obb_ssm",
+                compensate_anchor_bias=True,
+                include_cyclist_vru=True,
+                category_confirm_frames=3,
+                reliable_min_span_s=0.2,
+                window_size=8,
+            )
+            pipe.process_tracks(tracks_path, out_dir)
+            with (out_dir / "speeds.csv").open(encoding="utf-8", newline="") as f:
+                csv_rows = list(_csv.DictReader(f))
+            # 第 8 帧（person 第 3 帧）完成类别切换：参考点由补偿中心切回锚点，必须重置可靠度并标记为不可靠
+            by_frame = {int(r["frame_idx"]): r for r in csv_rows}
+            self.assertEqual(by_frame[7]["is_reliable"], "1")
+            self.assertEqual(by_frame[8]["category"], "pedestrian")
+            self.assertEqual(by_frame[8]["is_reliable"], "0")
+            self.assertEqual(by_frame[8]["is_speeding"], "0")
+            # 经过 0.2s (4*0.05s) 干净观测后重新收敛为可靠
+            self.assertEqual(by_frame[13]["is_reliable"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()

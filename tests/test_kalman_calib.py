@@ -863,6 +863,55 @@ class TestSpeedEstimatorKalmanAndTransfer(unittest.TestCase):
         self.assertEqual(kf_ok._kalman.category, "pedestrian")
         self.assertEqual(kf_ok._kalman.jerk_std_ms3, 1.5)
 
+    def test_rejected_frames_do_not_advance_stationary_and_expire_exemption(self):
+        from analysis.conflict import ConflictAnalyzer, RiskLevel
+
+        for mode in ("kalman", "ctrv"):
+            with self.subTest(mode=mode):
+                est = SpeedEstimator(
+                    speed_limit_kmh=30.0,
+                    stationary_speed_ms=0.1,
+                    stationary_min_frames=8,
+                    reliable_min_span_s=0.2,
+                    estimator_mode=mode,
+                )
+                analyzer = ConflictAnalyzer(conflict_model="obb_ssm")
+                # 输入 9 个静止观测（streak 达 7，尚差 1 帧确认静止），第 10 帧注入被门控拒收的外点
+                for i in range(9):
+                    r = est.update(1, "vehicle", i * 0.1, 3.0, 5.0, object_kind="car")
+                self.assertFalse(r.is_stationary)
+                self.assertTrue(r.is_reliable)
+                ped = SpeedReading(
+                    track_id=2, category="pedestrian", x_m=3.5, y_m=5.0,
+                    vx_ms=0.0, vy_ms=0.0, speed_ms=0.0, speed_kmh=0.0,
+                    is_speeding=False, heading_deg=0.0, is_reliable=True, object_kind="pedestrian",
+                )
+                self.assertEqual(analyzer.evaluate_pair(r, ped).risk_level, RiskLevel.LEVEL_3_CRITICAL)
+
+                r_rej1 = est.update(1, "vehicle", 0.9, 25.0, 25.0, object_kind="car")
+                self.assertFalse(est.tracks[1]._kalman.last_accepted)
+                self.assertFalse(r_rej1.is_stationary)
+                self.assertIsNotNone(analyzer.evaluate_pair(r_rej1, ped))
+
+                # 确认静止后：首帧拒收保留宽限，连续 2 帧拒收立即撤销静止豁免
+                est2 = SpeedEstimator(
+                    speed_limit_kmh=30.0,
+                    stationary_speed_ms=0.1,
+                    stationary_min_frames=8,
+                    reliable_min_span_s=0.2,
+                    estimator_mode=mode,
+                )
+                for i in range(10):
+                    r_ok = est2.update(1, "vehicle", i * 0.1, 3.0, 5.0, object_kind="car")
+                self.assertTrue(r_ok.is_stationary)
+                r_g1 = est2.update(1, "vehicle", 1.0, 25.0, 25.0, object_kind="car")
+                self.assertFalse(est2.tracks[1]._kalman.last_accepted)
+                self.assertTrue(r_g1.is_stationary)
+                r_g2 = est2.update(1, "vehicle", 1.1, 25.5, 25.5, object_kind="car")
+                self.assertFalse(est2.tracks[1]._kalman.last_accepted)
+                self.assertFalse(r_g2.is_stationary)
+                self.assertEqual(analyzer.evaluate_pair(r_g2, ped).risk_level, RiskLevel.LEVEL_3_CRITICAL)
+
 
 if __name__ == "__main__":
     unittest.main()

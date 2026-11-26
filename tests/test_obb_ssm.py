@@ -833,6 +833,32 @@ class TestOBBSSMConflictAnalyzer(unittest.TestCase):
         _, ped_map_zero = build_conflict_maps([c_pet_small, c_pet_zero])
         self.assertIs(ped_map_zero[9], c_pet_zero)
 
+    def test_obb_accel_crossing_18s_threshold_and_overlapping_missing_drac_desc(self):
+        # 1. 直线加速逼近：等速 TTC=1.904s (>1.8s)，但二阶圆角安全包络在 1.7848s (<1.8s) 侵入，必须报 L3
+        car_accel = _mk_reading(
+            1, "vehicle", 0.0, 0.0, 1.5, 0.0,
+            object_kind="car", heading_deg=0.0, ax_ms2=1.0, ay_ms2=0.0,
+        )
+        ped_ahead = _mk_reading(2, "pedestrian", 7.32, 0.0, 0.0, 0.0, object_kind="pedestrian")
+        res_accel = self.obb.evaluate_pair(car_accel, ped_ahead)
+        self.assertIsNotNone(res_accel)
+        self.assertEqual(res_accel.risk_level, RiskLevel.LEVEL_3_CRITICAL)
+        self.assertIsNotNone(res_accel.ttc_seconds)
+        self.assertLessEqual(res_accel.ttc_seconds, 1.8)
+        self.assertAlmostEqual(res_accel.ttc_seconds, 1.7848, delta=0.02)
+
+        # 2. 包络已重叠且同向同速：drac_ms2 为 None 时描述不得伪装成 DRAC=0.00m/s^2
+        car_overlap = _mk_reading(
+            1, "vehicle", 0.0, 0.0, 3.0, 0.0,
+            object_kind="car", heading_deg=0.0,
+        )
+        ped_overlap = _mk_reading(2, "pedestrian", 1.0, 0.0, 3.0, 0.0, object_kind="pedestrian")
+        res_overlap = self.obb.evaluate_pair(car_overlap, ped_overlap)
+        self.assertIsNotNone(res_overlap)
+        self.assertEqual(res_overlap.ttc_seconds, 0.0)
+        self.assertIsNone(res_overlap.drac_ms2)
+        self.assertNotIn("DRAC=0.00", res_overlap.risk_desc)
+
 
 if __name__ == "__main__":
     unittest.main()
