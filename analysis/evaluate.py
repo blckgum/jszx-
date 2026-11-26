@@ -94,12 +94,43 @@ def _finite(values):
     return out
 
 
+_CANONICAL_RISK_NAMES: dict[str, str] = {
+    "0": "LEVEL_0_SAFE",
+    "L0": "LEVEL_0_SAFE",
+    "LEVEL_0": "LEVEL_0_SAFE",
+    "LEVEL_0_SAFE": "LEVEL_0_SAFE",
+    "1": "LEVEL_1",
+    "L1": "LEVEL_1",
+    "LEVEL_1": "LEVEL_1",
+    "LEVEL_1_SPEEDING": "LEVEL_1",
+    "2": "LEVEL_2",
+    "L2": "LEVEL_2",
+    "LEVEL_2": "LEVEL_2",
+    "LEVEL_2_CAUTION": "LEVEL_2",
+    "3": "LEVEL_3",
+    "L3": "LEVEL_3",
+    "LEVEL_3": "LEVEL_3",
+    "LEVEL_3_CRITICAL": "LEVEL_3",
+}
+
+
 def _risk_name(value) -> str:
-    if value is None or value == "":
+    if value is None:
         return "LEVEL_0_SAFE"
+    if isinstance(value, bool):
+        return str(value)
     if isinstance(value, str):
-        return value if value.startswith("LEVEL_") else f"LEVEL_{value}"
-    return f"LEVEL_{int(value)}_SAFE" if int(value) == 0 else f"LEVEL_{int(value)}"
+        norm = value.strip().upper()
+        if not norm:
+            return "LEVEL_0_SAFE"
+        if norm in _CANONICAL_RISK_NAMES:
+            return _CANONICAL_RISK_NAMES[norm]
+        return norm if norm.startswith("LEVEL_") else f"LEVEL_{norm}"
+    lvl = int(value)
+    key = str(lvl)
+    if key in _CANONICAL_RISK_NAMES:
+        return _CANONICAL_RISK_NAMES[key]
+    return f"LEVEL_{lvl}"
 
 
 def _require_non_neg_number(value, name: str) -> float:
@@ -499,14 +530,29 @@ def evaluate_run(
 
 
 _RISK_DISPLAY_MAP: dict[str, str] = {
+    "0": "L0 正常",
+    "L0": "L0 正常",
     "LEVEL_0": "L0 正常",
     "LEVEL_0_SAFE": "L0 正常",
+    "1": "L1 超速",
+    "L1": "L1 超速",
     "LEVEL_1": "L1 超速",
     "LEVEL_1_SPEEDING": "L1 超速",
+    "2": "L2 注意",
+    "L2": "L2 注意",
     "LEVEL_2": "L2 注意",
     "LEVEL_2_CAUTION": "L2 注意",
+    "3": "L3 紧急",
+    "L3": "L3 紧急",
     "LEVEL_3": "L3 紧急",
     "LEVEL_3_CRITICAL": "L3 紧急",
+}
+
+_RISK_DISPLAY_ORDER: dict[str, int] = {
+    "L0 正常": 0,
+    "L1 超速": 1,
+    "L2 注意": 2,
+    "L3 紧急": 3,
 }
 
 
@@ -516,8 +562,39 @@ def _format_speed_stat(value) -> str:
     return f"{float(value):.2f}"
 
 
-def _format_risk_label(key: str) -> str:
-    return _RISK_DISPLAY_MAP.get(str(key).strip().upper(), str(key))
+def _format_optional_metric(value, unit: str = "") -> str:
+    if value is None:
+        return "无"
+    return f"{value} {unit}" if unit else f"{value}"
+
+
+def _markdown_code_span(value) -> str:
+    """按 CommonMark 规则动态选择反引号围栏长度，安全展示含反引号的路径。"""
+    text = str(value)
+    max_run = 0
+    cur_run = 0
+    for ch in text:
+        if ch == "`":
+            cur_run += 1
+            if cur_run > max_run:
+                max_run = cur_run
+        else:
+            cur_run = 0
+    fence = "`" * (max_run + 1)
+    if (
+        text.startswith("`")
+        or text.endswith("`")
+        or (len(text) >= 2 and text.startswith(" ") and text.endswith(" ") and text.strip())
+    ):
+        return f"{fence} {text} {fence}"
+    return f"{fence}{text}{fence}"
+
+
+def _format_risk_label(key) -> str:
+    if isinstance(key, bool):
+        return str(key)
+    norm = str(key).strip().upper()
+    return _RISK_DISPLAY_MAP.get(norm, str(key))
 
 
 def to_markdown(result: dict) -> str:
@@ -527,7 +604,7 @@ def to_markdown(result: dict) -> str:
     speed = result["speed_rows"]["speed_kmh"]
     lines = [
         "# 运行产物分析评价\n",
-        f"- 运行目录：`{result['run_dir']}`",
+        f"- 运行目录：{_markdown_code_span(result['run_dir'])}",
         f"- 已处理帧数：{frames['processed']}",
         f"- 冲突评估记录行数：{frames['observed_assessment_rows']}",
         f"- 确认告警事件数：{events['count']}",
@@ -541,9 +618,17 @@ def to_markdown(result: dict) -> str:
         "| 风险等级 | 记录行数 |",
         "|---|---:|",
     ]
+    merged_risk_counts: dict[str, int] = {}
+    for key, value in result["risk_counts"].items():
+        label = _format_risk_label(key)
+        merged_risk_counts[label] = merged_risk_counts.get(label, 0) + value
+    ordered_risk_items = sorted(
+        merged_risk_counts.items(),
+        key=lambda item: (_RISK_DISPLAY_ORDER.get(item[0], 99), item[0]),
+    )
     lines.extend(
-        f"| {_format_risk_label(key)} | {value} |"
-        for key, value in result["risk_counts"].items()
+        f"| {label} | {value} |"
+        for label, value in ordered_risk_items
     )
     if result.get("has_ground_truth") and "ground_truth_evaluation" in result:
         gt_eval = result["ground_truth_evaluation"]
@@ -554,9 +639,24 @@ def to_markdown(result: dict) -> str:
             "",
             "## 人工真值精度评价 (Ground-truth accuracy)",
             "",
-            f"- 测速误差评价：匹配目标 {sa['matched_count']}/{sa['reference_count']} | MAE={sa['mae_kmh']} km/h | RMSE={sa['rmse_kmh']} km/h | 最大绝对误差={sa['max_abs_error_kmh']} km/h",
-            f"- 事件匹配指标：TP={ea['tp']}，FP={ea['fp']}，FN={ea['fn']} | Precision={ea['precision']} | Recall={ea['recall']} | F1={ea['f1']}",
-            f"- 预警提前量 (s)：样本数={lt['count']}，最小={lt['min']}，平均={lt['mean']}，最大={lt['max']}",
+            (
+                f"- 测速误差评价：匹配目标 {sa['matched_count']}/{sa['reference_count']} | "
+                f"MAE={_format_optional_metric(sa['mae_kmh'], 'km/h')} | "
+                f"RMSE={_format_optional_metric(sa['rmse_kmh'], 'km/h')} | "
+                f"最大绝对误差={_format_optional_metric(sa['max_abs_error_kmh'], 'km/h')}"
+            ),
+            (
+                f"- 事件匹配指标：TP={ea['tp']}，FP={ea['fp']}，FN={ea['fn']} | "
+                f"Precision={_format_optional_metric(ea['precision'])} | "
+                f"Recall={_format_optional_metric(ea['recall'])} | "
+                f"F1={_format_optional_metric(ea['f1'])}"
+            ),
+            (
+                f"- 预警提前量 (s)：样本数={lt['count']}，"
+                f"最小={_format_optional_metric(lt['min'])}，"
+                f"平均={_format_optional_metric(lt['mean'])}，"
+                f"最大={_format_optional_metric(lt['max'])}"
+            ),
             "",
         ])
     else:

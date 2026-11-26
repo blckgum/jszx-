@@ -11,12 +11,12 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import contextlib
 import csv
 import json
 import math
 import os
-import warnings
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -30,6 +30,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.font_manager as fm
+import matplotlib.ft2font as ft2font
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -57,10 +59,24 @@ _STAGE_DISPLAY_LABELS: dict[str, str] = {
     "render_write": "渲染与写盘",
 }
 
+_STAGE_DISPLAY_LABELS_EN: dict[str, str] = {
+    "decode": "Decode",
+    "detect_track": "Detect & Track",
+    "geometry_speed": "Geom & Speed",
+    "conflict_events": "Conflict & Events",
+    "render_write": "Render & Write",
+}
+
 _SPEED_MODEL_LABELS: dict[str, str] = {
     "ema": "滑窗 EMA",
     "kalman": "2D CA 卡尔曼",
     "ctrv": "弯道 CTRV",
+}
+
+_SPEED_MODEL_LABELS_EN: dict[str, str] = {
+    "ema": "Sliding EMA",
+    "kalman": "2D CA Kalman",
+    "ctrv": "Turning CTRV",
 }
 
 _SCENARIO_DISPLAY_LABELS: dict[str, str] = {
@@ -71,11 +87,26 @@ _SCENARIO_DISPLAY_LABELS: dict[str, str] = {
     "crossing": "人车横穿",
 }
 
+_SCENARIO_DISPLAY_LABELS_EN: dict[str, str] = {
+    "parallel_pass": "Parallel Pass",
+    "braking_yield": "Braking Yield",
+    "perpendicular_crossing": "Perp. Crossing",
+    "head_on": "Head-On",
+    "crossing": "Crossing",
+}
+
 _RISK_LEVEL_LABELS: tuple[str, str, str, str] = (
     "L0 正常",
     "L1 超速",
     "L2 注意",
     "L3 紧急",
+)
+
+_RISK_LEVEL_LABELS_EN: tuple[str, str, str, str] = (
+    "L0 Safe",
+    "L1 Speeding",
+    "L2 Caution",
+    "L3 Critical",
 )
 
 _LEGEND_STYLE: dict[str, Any] = {
@@ -84,6 +115,8 @@ _LEGEND_STYLE: dict[str, Any] = {
     "framealpha": 0.92,
     "edgecolor": "#e2e8f0",
 }
+
+_FONT_CHARMAP_CACHE: dict[str, set[int]] = {}
 
 
 def detect_available_cjk_fonts() -> list[str]:
@@ -109,36 +142,71 @@ configure_cjk_fonts()
 
 
 @contextlib.contextmanager
-def _chart_rc_context() -> Iterator[list[str]]:
-    """在绘图上下文中固定字体链；仅当宿主缺失任何 CJK 字体时屏蔽缺字告警。"""
+def _chart_rc_context() -> Iterator[bool]:
+    """在绘图上下文中固定字体链并返回是否启用中文标签（无 CJK 字体时切为英文，不抑制缺字告警）。"""
     fonts = configure_cjk_fonts()
-    has_cjk = any(name != FALLBACK_FONT for name in fonts)
+    use_cjk = any(name != FALLBACK_FONT for name in fonts)
     rc = {
         "font.family": "sans-serif",
         "font.sans-serif": fonts,
         "axes.unicode_minus": False,
     }
     with plt.rc_context(rc):
-        if has_cjk:
-            yield fonts
-        else:
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"Glyph .* missing from font",
-                    category=UserWarning,
-                )
-                yield fonts
+        yield use_cjk
 
 
-def _display_speed_model(mode: str) -> str:
+def _fallback_font_charmap() -> Optional[set[int]]:
+    """读取回退字体（DejaVu Sans）的真实字形覆盖表，用于校验非 ASCII 用户标签。"""
+    ttflist = getattr(fm.fontManager, "ttflist", ()) or ()
+    for entry in ttflist:
+        if getattr(entry, "name", "") == FALLBACK_FONT:
+            fname = getattr(entry, "fname", None)
+            if isinstance(fname, str) and fname and os.path.isfile(fname):
+                cached = _FONT_CHARMAP_CACHE.get(fname)
+                if cached is None:
+                    cached = set(ft2font.FT2Font(fname).get_charmap().keys())
+                    _FONT_CHARMAP_CACHE[fname] = cached
+                return cached
+    return None
+
+
+def _safe_label(text: str, *, use_cjk: bool, fallback: str) -> str:
+    """当无 CJK 字体时，确保外部传入标签不包含当前字体缺失的字符。"""
+    if use_cjk or text.isascii():
+        return text
+    cmap = _fallback_font_charmap()
+    if cmap is not None and all(ord(ch) in cmap for ch in text):
+        return text
+    return fallback
+
+
+def _display_stage(stage_key: str, *, use_cjk: bool = True) -> str:
+    table = _STAGE_DISPLAY_LABELS if use_cjk else _STAGE_DISPLAY_LABELS_EN
+    return table.get(stage_key, stage_key)
+
+
+def _display_speed_model(mode: str, *, use_cjk: bool = True) -> str:
     key = mode.strip().lower()
-    return _SPEED_MODEL_LABELS.get(key, mode.upper())
+    table = _SPEED_MODEL_LABELS if use_cjk else _SPEED_MODEL_LABELS_EN
+    return table.get(key, _safe_label(mode.upper(), use_cjk=use_cjk, fallback=key or "MODEL"))
 
 
-def _display_scenario(name: str) -> str:
+def _display_scenario(name: str, *, use_cjk: bool = True, fallback: str = "Scenario") -> str:
     key = name.strip().lower()
-    return _SCENARIO_DISPLAY_LABELS.get(key, name)
+    table = _SCENARIO_DISPLAY_LABELS if use_cjk else _SCENARIO_DISPLAY_LABELS_EN
+    if key in table:
+        return table[key]
+    return _safe_label(name, use_cjk=use_cjk, fallback=fallback)
+
+
+def _risk_level_labels(*, use_cjk: bool = True) -> list[str]:
+    return list(_RISK_LEVEL_LABELS if use_cjk else _RISK_LEVEL_LABELS_EN)
+
+
+def _format_speed_limit(value: float) -> str:
+    """格式化限速数值，保留有效小数位并去除多余尾随零（如 30.0->30, 30.5->30.5）。"""
+    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+    return text if text else "0"
 
 
 def _reject_non_finite_constant(value: str) -> None:
@@ -273,7 +341,7 @@ def plot_ablation_charts(
 
     if has_speed_est or has_turn_rows or has_speed_grid:
         speed_path = out_root / "ablation_speed_mae.png"
-        with _chart_rc_context():
+        with _chart_rc_context() as use_cjk:
             if has_speed_est and has_turn_rows:
                 fig, (ax_lin, ax_turn) = plt.subplots(1, 2, figsize=(11.8, 4.9))
             else:
@@ -283,7 +351,7 @@ def plot_ablation_charts(
             try:
                 if ax_lin is not None:
                     modes = [m for m in ("ema", "kalman", "ctrv") if isinstance(speed_est.get(m), Mapping)]
-                    labels = [_display_speed_model(m) for m in modes]
+                    labels = [_display_speed_model(m, use_cjk=use_cjk) for m in modes]
                     mae_kmh = []
                     rmse_kmh = []
                     has_rmse = all("rmse_ms" in speed_est[m] or "rmse_kmh" in speed_est[m] for m in modes)
@@ -309,19 +377,21 @@ def plot_ablation_charts(
                                     _finite_float(entry["rmse_kmh"], f"speed_estimation.{m}.rmse_kmh", non_negative=True)
                                 )
                     x = np.arange(len(modes))
+                    mae_label = "平均绝对误差 MAE (km/h)" if use_cjk else "MAE (km/h)"
+                    rmse_label = "均方根误差 RMSE (km/h)" if use_cjk else "RMSE (km/h)"
                     if has_rmse:
                         width = 0.34
                         bars1 = ax_lin.bar(
-                            x - width / 2, mae_kmh, width, label="平均绝对误差 MAE (km/h)", color="#2b6cb0"
+                            x - width / 2, mae_kmh, width, label=mae_label, color="#2b6cb0"
                         )
                         bars2 = ax_lin.bar(
-                            x + width / 2, rmse_kmh, width, label="均方根误差 RMSE (km/h)", color="#63b3ed"
+                            x + width / 2, rmse_kmh, width, label=rmse_label, color="#63b3ed"
                         )
                         all_bars = list(bars1) + list(bars2)
                         max_y = max([0.5, *mae_kmh, *rmse_kmh])
                     else:
                         bars1 = ax_lin.bar(
-                            x, mae_kmh, 0.44, label="平均绝对误差 MAE (km/h)", color="#2b6cb0"
+                            x, mae_kmh, 0.44, label=mae_label, color="#2b6cb0"
                         )
                         all_bars = list(bars1)
                         max_y = max([0.5, *mae_kmh])
@@ -337,8 +407,14 @@ def plot_ablation_charts(
                         )
                     ax_lin.set_xticks(x)
                     ax_lin.set_xticklabels(labels, fontsize=9.5)
-                    ax_lin.set_ylabel("测速误差 (km/h)", fontsize=10)
-                    ax_lin.set_title("透视噪声下直线加减速测速误差对比", fontsize=11.5, pad=10)
+                    ax_lin.set_ylabel("测速误差 (km/h)" if use_cjk else "Speed Error (km/h)", fontsize=10)
+                    ax_lin.set_title(
+                        "透视噪声下直线加减速测速误差对比"
+                        if use_cjk
+                        else "Linear Acceleration Speed Error Under Perspective Noise",
+                        fontsize=11.5,
+                        pad=10,
+                    )
                     ax_lin.set_ylim(0.0, max_y * 1.34)
                     ax_lin.grid(axis="y", linestyle="--", alpha=0.35)
                     ax_lin.legend(loc="upper right", fontsize=8.8, **_LEGEND_STYLE)
@@ -366,17 +442,25 @@ def plot_ablation_charts(
                     ordered_modes = [m for m in ("ema", "kalman", "ctrv") if m in grouped] + [
                         m for m in sorted(grouped) if m not in ("ema", "kalman", "ctrv")
                     ]
-                    t_labels = [_display_speed_model(m) for m in ordered_modes]
+                    t_labels = [_display_speed_model(m, use_cjk=use_cjk) for m in ordered_modes]
                     t_mae = [float(np.mean(grouped[m][0])) for m in ordered_modes]
                     t_max = [float(np.mean(grouped[m][1])) for m in ordered_modes]
                     max_turn_y = max([0.5, *t_mae, *t_max])
                     x = np.arange(len(ordered_modes))
                     width = 0.34
                     b1 = ax_turn.bar(
-                        x - width / 2, t_mae, width, label="平均绝对误差 MAE (km/h)", color="#2f855a"
+                        x - width / 2,
+                        t_mae,
+                        width,
+                        label=("平均绝对误差 MAE (km/h)" if use_cjk else "MAE (km/h)"),
+                        color="#2f855a",
                     )
                     b2 = ax_turn.bar(
-                        x + width / 2, t_max, width, label="峰值误差均值 (km/h)", color="#68d391"
+                        x + width / 2,
+                        t_max,
+                        width,
+                        label=("峰值误差均值 (km/h)" if use_cjk else "Mean Peak Error (km/h)"),
+                        color="#68d391",
                     )
                     for bar in list(b1) + list(b2):
                         h = bar.get_height()
@@ -390,8 +474,14 @@ def plot_ablation_charts(
                         )
                     ax_turn.set_xticks(x)
                     ax_turn.set_xticklabels(t_labels, fontsize=9.5)
-                    ax_turn.set_ylabel("测速误差 (km/h)", fontsize=10)
-                    ax_turn.set_title("弯道场景测速模型消融对比", fontsize=11.5, pad=10)
+                    ax_turn.set_ylabel("测速误差 (km/h)" if use_cjk else "Speed Error (km/h)", fontsize=10)
+                    ax_turn.set_title(
+                        "弯道场景测速模型消融对比"
+                        if use_cjk
+                        else "Turning Scenario Speed Estimator Ablation",
+                        fontsize=11.5,
+                        pad=10,
+                    )
                     ax_turn.set_ylim(0.0, max_turn_y * 1.34)
                     ax_turn.grid(axis="y", linestyle="--", alpha=0.35)
                     ax_turn.legend(loc="upper right", fontsize=8.8, **_LEGEND_STYLE)
@@ -401,7 +491,9 @@ def plot_ablation_charts(
                     for idx, row in enumerate(speed_grid):
                         if not isinstance(row, Mapping):
                             raise ValueError(f"speed[{idx}] 必须是字典")
-                        cfg_label = f"窗口{row.get('window_size', '?')}/系数{row.get('ema_alpha', '?')}"
+                        w_val = row.get("window_size", "?")
+                        a_val = row.get("ema_alpha", "?")
+                        cfg_label = f"窗口{w_val}/系数{a_val}" if use_cjk else f"W{w_val}/a={a_val}"
                         err_kmh = _finite_float(
                             row["absolute_error_ms"], f"speed[{idx}].absolute_error_ms", non_negative=True
                         ) * 3.6
@@ -412,8 +504,17 @@ def plot_ablation_charts(
                     ax_single.bar(x, cfg_vals, color="#2b6cb0", width=0.55)
                     ax_single.set_xticks(x)
                     ax_single.set_xticklabels(cfg_keys, rotation=25, ha="right", fontsize=8.5)
-                    ax_single.set_ylabel("测速平均绝对误差 MAE (km/h)", fontsize=10)
-                    ax_single.set_title("滑窗长度与 EMA 平滑系数误差消融", fontsize=11.5, pad=10)
+                    ax_single.set_ylabel(
+                        "测速平均绝对误差 MAE (km/h)" if use_cjk else "Speed MAE (km/h)",
+                        fontsize=10,
+                    )
+                    ax_single.set_title(
+                        "滑窗长度与 EMA 平滑系数误差消融"
+                        if use_cjk
+                        else "Window Size & EMA Alpha Speed Error Ablation",
+                        fontsize=11.5,
+                        pad=10,
+                    )
                     ax_single.set_ylim(0.0, max([0.2, *cfg_vals]) * 1.28)
                     ax_single.grid(axis="y", linestyle="--", alpha=0.35)
 
@@ -428,7 +529,8 @@ def plot_ablation_charts(
 
     if has_conflict_det or has_conflict_grid:
         conflict_path = out_root / "ablation_conflict_metrics.png"
-        with _chart_rc_context():
+        with _chart_rc_context() as use_cjk:
+            missing_lbl = "无数据" if use_cjk else "N/A"
             if has_conflict_det:
                 fig, (ax_risk, ax_ssm) = plt.subplots(1, 2, figsize=(12.2, 5.0))
             else:
@@ -438,14 +540,19 @@ def plot_ablation_charts(
                     scenarios: list[str] = []
                     cvm_lvls: list[int] = []
                     obb_lvls: list[int] = []
-                    drac_vals: list[float] = []
-                    prob_pcts: list[float] = []
+                    drac_vals: list[Optional[float]] = []
+                    prob_pcts: list[Optional[float]] = []
 
                     for idx, row in enumerate(conflict_det):
                         if not isinstance(row, Mapping):
                             raise ValueError(f"conflict_detection[{idx}] 必须是字典")
-                        raw_scenario = str(row.get("scenario", f"场景_{idx + 1}"))
-                        scenarios.append(_display_scenario(raw_scenario))
+                        default_scn = f"场景_{idx + 1}" if use_cjk else f"Scenario {idx + 1}"
+                        raw_scenario = str(row.get("scenario", default_scn))
+                        scenarios.append(
+                            _display_scenario(
+                                raw_scenario, use_cjk=use_cjk, fallback=f"Scenario {idx + 1}"
+                            )
+                        )
                         cvm_sub = row.get("cvm_circle", {})
                         obb_sub = row.get("obb_ssm", {})
                         cvm_lvls.append(_risk_level_num(cvm_sub.get("risk_level")))
@@ -454,22 +561,38 @@ def plot_ablation_charts(
                         drac_vals.append(
                             _finite_float(raw_drac, f"conflict[{idx}].drac_ms2", non_negative=True)
                             if raw_drac is not None
-                            else 0.0
+                            else None
                         )
                         raw_prob = obb_sub.get("collision_prob")
                         prob_pcts.append(
                             _finite_float(raw_prob, f"conflict[{idx}].collision_prob", non_negative=True) * 100.0
                             if raw_prob is not None
-                            else 0.0
+                            else None
                         )
 
                     x = np.arange(len(scenarios))
                     width = 0.34
-                    rotate_deg = 15 if (len(scenarios) > 4 or any(len(s) > 6 for s in scenarios)) else 0
+                    rotate_deg = (
+                        15
+                        if (len(scenarios) > 4 or any(len(s) > (6 if use_cjk else 10) for s in scenarios))
+                        else 0
+                    )
                     xtick_ha = "right" if rotate_deg else "center"
 
-                    b_cvm = ax_risk.bar(x - width / 2, cvm_lvls, width, label="CVM 圆包络", color="#718096")
-                    b_obb = ax_risk.bar(x + width / 2, obb_lvls, width, label="OBB-SSM", color="#dd6b20")
+                    b_cvm = ax_risk.bar(
+                        x - width / 2,
+                        cvm_lvls,
+                        width,
+                        label=("CVM 圆包络" if use_cjk else "CVM Circle"),
+                        color="#718096",
+                    )
+                    b_obb = ax_risk.bar(
+                        x + width / 2,
+                        obb_lvls,
+                        width,
+                        label="OBB-SSM",
+                        color="#dd6b20",
+                    )
                     for bar in list(b_cvm) + list(b_obb):
                         h = bar.get_height()
                         lvl_idx = max(0, min(3, int(round(h))))
@@ -484,78 +607,181 @@ def plot_ablation_charts(
                     ax_risk.set_xticks(x)
                     ax_risk.set_xticklabels(scenarios, rotation=rotate_deg, ha=xtick_ha, fontsize=9.5)
                     ax_risk.set_yticks([0, 1, 2, 3])
-                    ax_risk.set_yticklabels(list(_RISK_LEVEL_LABELS), fontsize=9)
-                    ax_risk.set_ylabel("风险等级", fontsize=10)
-                    ax_risk.set_title("冲突风险等级对比：CVM 圆包络 vs OBB-SSM", fontsize=11.5, pad=10)
+                    ax_risk.set_yticklabels(_risk_level_labels(use_cjk=use_cjk), fontsize=9)
+                    ax_risk.set_ylabel("风险等级" if use_cjk else "Risk Level", fontsize=10)
+                    ax_risk.set_title(
+                        "冲突风险等级对比：CVM 圆包络 vs OBB-SSM"
+                        if use_cjk
+                        else "Conflict Risk Level: CVM Circle vs OBB-SSM",
+                        fontsize=11.5,
+                        pad=10,
+                    )
                     ax_risk.set_ylim(0.0, 3.95)
                     ax_risk.grid(axis="y", linestyle="--", alpha=0.35)
                     ax_risk.legend(loc="upper center", ncol=2, fontsize=9, **_LEGEND_STYLE)
 
-                    b_drac = ax_ssm.bar(x - width / 2, drac_vals, width, label="DRAC (m/s²)", color="#c53030")
+                    drac_label = "DRAC (m/s²)" if use_cjk else "DRAC (m/s^2)"
+                    prob_label = "碰撞概率 (%)" if use_cjk else "Collision Prob. (%)"
+                    valid_drac = [v for v in drac_vals if v is not None]
+                    max_drac = max([1.0, *valid_drac])
+
+                    drac_x = [float(x[i]) - width / 2 for i, v in enumerate(drac_vals) if v is not None]
+                    drac_h = [v for v in drac_vals if v is not None]
+                    if drac_x:
+                        ax_ssm.bar(drac_x, drac_h, width, label=drac_label, color="#c53030")
+
                     ax_prob = ax_ssm.twinx()
-                    b_prob = ax_prob.bar(
-                        x + width / 2, prob_pcts, width, label="碰撞概率 (%)", color="#3182ce"
-                    )
-                    max_drac = max([1.0, *drac_vals])
-                    for bar in b_drac:
-                        h = bar.get_height()
-                        ax_ssm.text(
-                            bar.get_x() + bar.get_width() / 2,
-                            h + 0.03 * max_drac,
-                            f"{h:.2f}",
-                            ha="center",
-                            va="bottom",
-                            fontsize=8.5,
-                        )
-                    for bar in b_prob:
-                        h = bar.get_height()
-                        ax_prob.text(
-                            bar.get_x() + bar.get_width() / 2,
-                            h + 2.2,
-                            f"{h:.1f}%",
-                            ha="center",
-                            va="bottom",
-                            fontsize=8.5,
-                        )
+                    prob_x = [float(x[i]) + width / 2 for i, v in enumerate(prob_pcts) if v is not None]
+                    prob_h = [v for v in prob_pcts if v is not None]
+                    if prob_x:
+                        ax_prob.bar(prob_x, prob_h, width, label=prob_label, color="#3182ce")
+
+                    for i, v in enumerate(drac_vals):
+                        cx = float(x[i]) - width / 2
+                        if v is not None:
+                            ax_ssm.text(
+                                cx,
+                                v + 0.03 * max_drac,
+                                f"{v:.2f}",
+                                ha="center",
+                                va="bottom",
+                                fontsize=8.5,
+                            )
+                        else:
+                            ax_ssm.text(
+                                cx,
+                                0.03 * max_drac,
+                                missing_lbl,
+                                ha="center",
+                                va="bottom",
+                                fontsize=8.0,
+                                color="#718096",
+                            )
+                    for i, v in enumerate(prob_pcts):
+                        cx = float(x[i]) + width / 2
+                        if v is not None:
+                            ax_prob.text(
+                                cx,
+                                v + 2.2,
+                                f"{v:.1f}%",
+                                ha="center",
+                                va="bottom",
+                                fontsize=8.5,
+                            )
+                        else:
+                            ax_prob.text(
+                                cx,
+                                2.2,
+                                missing_lbl,
+                                ha="center",
+                                va="bottom",
+                                fontsize=8.0,
+                                color="#718096",
+                            )
                     ax_ssm.set_xticks(x)
                     ax_ssm.set_xticklabels(scenarios, rotation=rotate_deg, ha=xtick_ha, fontsize=9.5)
-                    ax_ssm.set_ylabel("必要减速度 DRAC (m/s²)", fontsize=10)
-                    ax_prob.set_ylabel("碰撞概率 (%)", fontsize=10)
+                    ax_ssm.set_xlim(-0.6, max(0.6, len(scenarios) - 0.4))
+                    ax_ssm.set_ylabel(
+                        "必要减速度 DRAC (m/s²)" if use_cjk else "Required Decel. DRAC (m/s^2)",
+                        fontsize=10,
+                    )
+                    ax_prob.set_ylabel(
+                        "碰撞概率 (%)" if use_cjk else "Collision Probability (%)",
+                        fontsize=10,
+                    )
                     ax_ssm.set_ylim(0.0, max_drac * 1.32)
                     ax_prob.set_ylim(0.0, 122.0)
-                    ax_ssm.set_title("OBB-SSM 冲突严重度量化指标", fontsize=11.5, pad=10)
+                    ax_ssm.set_title(
+                        "OBB-SSM 冲突严重度量化指标"
+                        if use_cjk
+                        else "OBB-SSM Conflict Severity Metrics",
+                        fontsize=11.5,
+                        pad=10,
+                    )
                     ax_ssm.grid(axis="y", linestyle="--", alpha=0.35)
                     h1, l1 = ax_ssm.get_legend_handles_labels()
                     h2, l2 = ax_prob.get_legend_handles_labels()
+                    if not h1:
+                        h1, l1 = [mpatches.Patch(color="#c53030")], [drac_label]
+                    if not h2:
+                        h2, l2 = [mpatches.Patch(color="#3182ce")], [prob_label]
                     ax_ssm.legend(h1 + h2, l1 + l2, loc="upper center", ncol=2, fontsize=9, **_LEGEND_STYLE)
                 elif isinstance(conflict_grid, list):
                     labels = [
-                        f"临界{row.get('ttc_critical_s', '?')}s/时域{row.get('horizon_s', '?')}s"
+                        (
+                            f"临界{row.get('ttc_critical_s', '?')}s/时域{row.get('horizon_s', '?')}s"
+                            if use_cjk
+                            else f"Crit {row.get('ttc_critical_s', '?')}s / Hor {row.get('horizon_s', '?')}s"
+                        )
                         for row in conflict_grid
                     ]
-                    ttcs = [
+                    ttcs: list[Optional[float]] = [
                         _finite_float(row["ttc_s"], f"conflict[{i}].ttc_s", non_negative=True)
                         if row.get("ttc_s") is not None
-                        else 0.0
+                        else None
                         for i, row in enumerate(conflict_grid)
                     ]
-                    dists = [
+                    dists: list[Optional[float]] = [
                         _finite_float(row["min_distance_m"], f"conflict[{i}].min_distance_m", non_negative=True)
                         if row.get("min_distance_m") is not None
-                        else 0.0
+                        else None
                         for i, row in enumerate(conflict_grid)
                     ]
                     x = np.arange(len(labels))
                     width = 0.35
-                    ax_grid.bar(x - width / 2, ttcs, width, label="碰撞时间 TTC (s)", color="#dd6b20")
-                    ax_grid.bar(x + width / 2, dists, width, label="最小间距 (m)", color="#3182ce")
+                    ttc_lbl = "碰撞时间 TTC (s)" if use_cjk else "TTC (s)"
+                    dist_lbl = "最小间距 (m)" if use_cjk else "Min Distance (m)"
+                    valid_grid = [v for v in (*ttcs, *dists) if v is not None]
+                    max_grid_y = max([0.5, *valid_grid])
+
+                    ttc_x = [float(x[i]) - width / 2 for i, v in enumerate(ttcs) if v is not None]
+                    ttc_h = [v for v in ttcs if v is not None]
+                    if ttc_x:
+                        ax_grid.bar(ttc_x, ttc_h, width, label=ttc_lbl, color="#dd6b20")
+                    dist_x = [float(x[i]) + width / 2 for i, v in enumerate(dists) if v is not None]
+                    dist_h = [v for v in dists if v is not None]
+                    if dist_x:
+                        ax_grid.bar(dist_x, dist_h, width, label=dist_lbl, color="#3182ce")
+                    for i, v in enumerate(ttcs):
+                        if v is None:
+                            ax_grid.text(
+                                float(x[i]) - width / 2,
+                                0.03 * max_grid_y,
+                                missing_lbl,
+                                ha="center",
+                                va="bottom",
+                                fontsize=8.0,
+                                color="#718096",
+                            )
+                    for i, v in enumerate(dists):
+                        if v is None:
+                            ax_grid.text(
+                                float(x[i]) + width / 2,
+                                0.03 * max_grid_y,
+                                missing_lbl,
+                                ha="center",
+                                va="bottom",
+                                fontsize=8.0,
+                                color="#718096",
+                            )
                     ax_grid.set_xticks(x)
                     ax_grid.set_xticklabels(labels, rotation=22, ha="right", fontsize=8.5)
-                    ax_grid.set_ylabel("指标数值", fontsize=10)
-                    ax_grid.set_title("TTC 临界阈值与预测时域消融对比", fontsize=11.5, pad=10)
-                    ax_grid.set_ylim(0.0, max([0.5, *ttcs, *dists]) * 1.28)
+                    ax_grid.set_xlim(-0.6, max(0.6, len(labels) - 0.4))
+                    ax_grid.set_ylabel("指标数值" if use_cjk else "Metric Value", fontsize=10)
+                    ax_grid.set_title(
+                        "TTC 临界阈值与预测时域消融对比"
+                        if use_cjk
+                        else "TTC Threshold & Prediction Horizon Ablation",
+                        fontsize=11.5,
+                        pad=10,
+                    )
+                    ax_grid.set_ylim(0.0, max_grid_y * 1.28)
                     ax_grid.grid(axis="y", linestyle="--", alpha=0.35)
-                    ax_grid.legend(loc="upper right", fontsize=9, **_LEGEND_STYLE)
+                    hg, lg = ax_grid.get_legend_handles_labels()
+                    if not hg:
+                        hg = [mpatches.Patch(color="#dd6b20"), mpatches.Patch(color="#3182ce")]
+                        lg = [ttc_lbl, dist_lbl]
+                    ax_grid.legend(hg, lg, loc="upper right", fontsize=9, **_LEGEND_STYLE)
 
                 fig.tight_layout(pad=1.5, w_pad=2.6)
                 generated.append(_save_figure(fig, conflict_path))
@@ -568,17 +794,146 @@ def plot_ablation_charts(
 
 
 def _resolve_speed_limit_kmh(run_root: Path) -> float:
-    """从 configuration.json 或 summary.json 读取限速阈值，缺省回退 30.0 km/h。"""
+    """从 configuration.json 或 summary.json（含嵌套 configuration）读取限速阈值，缺省回退 30.0 km/h。"""
     for fname in ("configuration.json", "summary.json"):
         cfg_file = run_root / fname
         if cfg_file.is_file():
             cfg = _load_json_strict(cfg_file, str(cfg_file))
-            raw_limit = cfg.get("speed_limit_kmh")
-            if raw_limit is not None:
-                val = _finite_float(raw_limit, f"{fname}.speed_limit_kmh", non_negative=True)
-                if val > 0.0:
-                    return val
+            candidates: list[tuple[Any, str]] = [
+                (cfg.get("speed_limit_kmh"), f"{fname}.speed_limit_kmh"),
+            ]
+            nested_cfg = cfg.get("configuration")
+            if isinstance(nested_cfg, Mapping):
+                candidates.append(
+                    (nested_cfg.get("speed_limit_kmh"), f"{fname}.configuration.speed_limit_kmh")
+                )
+            for raw_limit, label in candidates:
+                if raw_limit is not None:
+                    val = _finite_float(raw_limit, label, non_negative=True)
+                    if val > 0.0:
+                        return val
     return 30.0
+
+
+def _compute_median_dt(unique_sorted_ts: Sequence[float]) -> Optional[float]:
+    """根据有序去重时间戳计算典型帧间隔中位数（秒）。"""
+    diffs = [
+        b - a
+        for a, b in zip(unique_sorted_ts, unique_sorted_ts[1:])
+        if (b - a) > 1e-9
+    ]
+    if not diffs:
+        return None
+    return float(np.median(diffs))
+
+
+def _are_consecutive_frames(
+    prev_fidx: Optional[int],
+    prev_ts: float,
+    curr_fidx: Optional[int],
+    curr_ts: float,
+    *,
+    unique_speed_ts: Sequence[float],
+    median_dt: Optional[float],
+) -> bool:
+    """判定两条按序排列的冲突帧记录是否严格连续（无跳帧或缺失中间帧）。"""
+    if prev_fidx is not None and curr_fidx is not None:
+        return curr_fidx == prev_fidx + 1
+    if curr_ts <= prev_ts + 1e-9:
+        return False
+    lo_idx = bisect.bisect_right(unique_speed_ts, prev_ts + 1e-9)
+    if lo_idx < len(unique_speed_ts) and unique_speed_ts[lo_idx] < curr_ts - 1e-9:
+        return False
+    dt = curr_ts - prev_ts
+    if median_dt is not None and median_dt > 0.0:
+        return dt <= median_dt * 1.5 + 1e-9
+    return dt <= 0.15 + 1e-9
+
+
+def _build_segmented_series(
+    points: Sequence[tuple[Optional[int], float, float]],
+    *,
+    unique_speed_ts: Sequence[float],
+    median_dt: Optional[float],
+) -> tuple[list[float], list[float]]:
+    """在非连续帧间隙插入 NaN 断点，避免稀疏记录被错误连成连续折线。"""
+    xs: list[float] = []
+    ys: list[float] = []
+    prev_fidx: Optional[int] = None
+    prev_ts: Optional[float] = None
+    for fidx, ts, val in points:
+        if prev_ts is not None and not _are_consecutive_frames(
+            prev_fidx,
+            prev_ts,
+            fidx,
+            ts,
+            unique_speed_ts=unique_speed_ts,
+            median_dt=median_dt,
+        ):
+            xs.append(math.nan)
+            ys.append(math.nan)
+        xs.append(ts)
+        ys.append(val)
+        prev_fidx = fidx
+        prev_ts = ts
+    return xs, ys
+
+
+def _parse_conflict_frame_records(conflicts: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """按帧聚合 conflicts.jsonl，保留独立 TTC 与 MTTC 最小值及峰值风险等级。"""
+    by_key: dict[tuple[str, Any], dict[str, Any]] = {}
+    for idx, row in enumerate(conflicts):
+        ts = _finite_float(row.get("timestamp_s", 0.0), f"conflict[{idx}].timestamp_s", non_negative=True)
+        raw_fi = row.get("frame_index")
+        if raw_fi is not None:
+            if isinstance(raw_fi, (bool, np.bool_)) or not isinstance(raw_fi, (int, np.integer)):
+                raise ValueError(f"conflict[{idx}].frame_index 必须为非负整数")
+            fidx: Optional[int] = int(raw_fi)
+            if fidx < 0:
+                raise ValueError(f"conflict[{idx}].frame_index 不能为负数")
+            key: tuple[str, Any] = ("f", fidx)
+        else:
+            fidx = None
+            key = ("t", ts)
+
+        ass = row.get("assessment", row)
+        lvl = _risk_level_num(ass.get("risk_level"))
+        raw_ttc = ass.get("ttc_seconds")
+        ttc_val = (
+            _finite_float(raw_ttc, f"conflict[{idx}].ttc_seconds", non_negative=True)
+            if raw_ttc is not None
+            else None
+        )
+        raw_mttc = ass.get("mttc_seconds")
+        mttc_val = (
+            _finite_float(raw_mttc, f"conflict[{idx}].mttc_seconds", non_negative=True)
+            if raw_mttc is not None
+            else None
+        )
+
+        rec = by_key.get(key)
+        if rec is None:
+            by_key[key] = {
+                "frame_index": fidx,
+                "ts": ts,
+                "risk": lvl,
+                "ttc": ttc_val,
+                "mttc": mttc_val,
+            }
+        else:
+            rec["ts"] = min(rec["ts"], ts)
+            rec["risk"] = max(rec["risk"], lvl)
+            if ttc_val is not None:
+                rec["ttc"] = ttc_val if rec["ttc"] is None else min(rec["ttc"], ttc_val)
+            if mttc_val is not None:
+                rec["mttc"] = mttc_val if rec["mttc"] is None else min(rec["mttc"], mttc_val)
+
+    records = list(by_key.values())
+    if records and all(r["frame_index"] is not None for r in records):
+        records.sort(key=lambda r: (int(r["frame_index"]), r["ts"]))
+    else:
+        records.sort(key=lambda r: (r["ts"], -1 if r["frame_index"] is None else int(r["frame_index"])))
+    return records
 
 
 def plot_run_timeline(
@@ -595,6 +950,7 @@ def plot_run_timeline(
 
     out_root = _ensure_output_dir(output_dir)
     speed_limit = _resolve_speed_limit_kmh(run_root)
+    speed_limit_str = _format_speed_limit(speed_limit)
 
     veh_series: dict[int, list[tuple[float, float]]] = defaultdict(list)
     all_timestamps: list[float] = []
@@ -615,11 +971,16 @@ def plot_run_timeline(
             if str(row.get("category", "")).strip().lower() == "vehicle":
                 veh_series[tid].append((ts, spd))
 
+    unique_speed_ts = sorted(set(all_timestamps))
+    median_dt = _compute_median_dt(unique_speed_ts)
+
     events = _load_jsonl_strict(run_root / "events.jsonl")
     conflicts = _load_jsonl_strict(run_root / "conflicts.jsonl")
+    frame_records = _parse_conflict_frame_records(conflicts) if conflicts else []
 
-    # 从 events.jsonl 提取冲突/超速事件时间窗；若无 events.jsonl 则从 conflicts.jsonl 提取高风险帧段
-    conflict_windows: list[tuple[float, float, int, Optional[int]]] = []
+    # 严格区分来自 events.jsonl 的确认事件窗，与无 events.jsonl 时仅按连续帧推断的瞬时高风险窗
+    confirmed_conflict_windows: list[tuple[float, float, int, Optional[int]]] = []
+    inferred_risk_windows: list[tuple[float, float, int]] = []
     speeding_windows: list[tuple[float, float, Optional[int]]] = []
     for ev in events:
         t0 = _finite_float(ev.get("start_timestamp_s", 0.0), "event.start_timestamp_s", non_negative=True)
@@ -629,54 +990,111 @@ def plot_run_timeline(
         lvl = _risk_level_num(ev.get("peak_risk_level", 2))
         eid = ev.get("event_id")
         if ev.get("kind") == "conflict":
-            conflict_windows.append((t0, t1, lvl, eid if type(eid) is int else None))
+            confirmed_conflict_windows.append((t0, t1, lvl, eid if type(eid) is int else None))
         elif ev.get("kind") == "speeding":
             speeding_windows.append((t0, t1, eid if type(eid) is int else None))
 
-    if not conflict_windows and conflicts:
-        # 兼容早期无 events.jsonl 的运行目录：按连续 LEVEL_2/LEVEL_3 帧合成时间窗
+    if not confirmed_conflict_windows and frame_records:
+        # 仅合并严格连续的 LEVEL_2/LEVEL_3 帧，绝不将跨间隙的稀疏记录并成连续时段
         cur_start: Optional[float] = None
         cur_end: Optional[float] = None
         cur_lvl = 0
-        for row in conflicts:
-            ts = _finite_float(row.get("timestamp_s", 0.0), "conflict.timestamp_s", non_negative=True)
-            lvl = _risk_level_num(row.get("assessment", row).get("risk_level"))
+        cur_last_fidx: Optional[int] = None
+        cur_last_ts: Optional[float] = None
+        for rec in frame_records:
+            ts = rec["ts"]
+            lvl = rec["risk"]
+            fidx = rec["frame_index"]
             if lvl >= 2:
                 if cur_start is None:
                     cur_start = ts
                     cur_end = ts
                     cur_lvl = lvl
-                else:
+                    cur_last_fidx = fidx
+                    cur_last_ts = ts
+                elif cur_last_ts is not None and _are_consecutive_frames(
+                    cur_last_fidx,
+                    cur_last_ts,
+                    fidx,
+                    ts,
+                    unique_speed_ts=unique_speed_ts,
+                    median_dt=median_dt,
+                ):
                     cur_end = ts
                     cur_lvl = max(cur_lvl, lvl)
+                    cur_last_fidx = fidx
+                    cur_last_ts = ts
+                else:
+                    inferred_risk_windows.append(
+                        (cur_start, cur_end if cur_end is not None else cur_start, cur_lvl)
+                    )
+                    cur_start = ts
+                    cur_end = ts
+                    cur_lvl = lvl
+                    cur_last_fidx = fidx
+                    cur_last_ts = ts
             elif cur_start is not None:
-                conflict_windows.append((cur_start, cur_end if cur_end is not None else cur_start, cur_lvl, None))
+                inferred_risk_windows.append(
+                    (cur_start, cur_end if cur_end is not None else cur_start, cur_lvl)
+                )
                 cur_start = None
+                cur_end = None
+                cur_last_fidx = None
+                cur_last_ts = None
         if cur_start is not None:
-            conflict_windows.append((cur_start, cur_end if cur_end is not None else cur_start, cur_lvl, None))
+            inferred_risk_windows.append(
+                (cur_start, cur_end if cur_end is not None else cur_start, cur_lvl)
+            )
 
     generated: list[str] = []
     timeline_path = out_root / "run_speed_timeline.png"
-    with _chart_rc_context():
+    with _chart_rc_context() as use_cjk:
         fig, ax = plt.subplots(figsize=(11.0, 5.0))
         try:
             # 对单帧零宽度时间窗做轻微可视展宽，避免 axvspan 在图上不可见
-            span_pad = 0.04
-            conflict_labeled = False
-            for t0, t1, lvl, _eid in conflict_windows:
+            if all_timestamps and max(all_timestamps) > min(all_timestamps):
+                span_pad = min(0.25, max(0.04, 0.005 * (max(all_timestamps) - min(all_timestamps))))
+            else:
+                span_pad = 0.04
+
+            confirmed_labeled = False
+            confirmed_label_text = "确认冲突事件窗" if use_cjk else "Confirmed Conflict Event"
+            for t0, t1, lvl, _eid in confirmed_conflict_windows:
                 lo = max(0.0, t0 - span_pad) if math.isclose(t0, t1) else t0
                 hi = (t1 + span_pad) if math.isclose(t0, t1) else t1
-                color = "#e53e3e" if lvl >= 3 else "#dd6b20"
-                lbl = "冲突事件窗" if not conflict_labeled else None
-                ax.axvspan(lo, hi, color=color, alpha=0.22, label=lbl)
-                conflict_labeled = True
+                fc = "#e53e3e" if lvl >= 3 else "#dd6b20"
+                lbl = confirmed_label_text if not confirmed_labeled else None
+                ax.axvspan(lo, hi, facecolor=fc, alpha=0.22, label=lbl)
+                confirmed_labeled = True
+
+            inferred_labeled = False
+            inferred_label_text = "瞬时高风险窗（推断）" if use_cjk else "Inferred Transient Risk"
+            for t0, t1, lvl in inferred_risk_windows:
+                lo = max(0.0, t0 - span_pad) if math.isclose(t0, t1) else t0
+                hi = (t1 + span_pad) if math.isclose(t0, t1) else t1
+                fc = "#fc8181" if lvl >= 3 else "#f6ad55"
+                ec = "#c53030" if lvl >= 3 else "#c05621"
+                lbl = inferred_label_text if not inferred_labeled else None
+                ax.axvspan(
+                    lo,
+                    hi,
+                    facecolor=fc,
+                    edgecolor=ec,
+                    hatch="//",
+                    linestyle="--",
+                    linewidth=0.9,
+                    alpha=0.24,
+                    label=lbl,
+                )
+                inferred_labeled = True
 
             speeding_labeled = False
+            speeding_label_text = "超速事件窗" if use_cjk else "Speeding Event Window"
             for t0, t1, _eid in speeding_windows:
                 lo = max(0.0, t0 - span_pad) if math.isclose(t0, t1) else t0
                 hi = (t1 + span_pad) if math.isclose(t0, t1) else t1
-                lbl = "超速事件窗" if not speeding_labeled else None
-                ax.axvspan(lo, hi, color="#ecc94b", alpha=0.20, label=lbl)
+                lbl = speeding_label_text if not speeding_labeled else None
+                ax.axvspan(lo, hi, facecolor="#ecc94b", alpha=0.20, label=lbl)
                 speeding_labeled = True
 
             # 按观测长度与峰值车速排序，避免多车流下 legend 过长触发紧排告警
@@ -692,14 +1110,17 @@ def plot_run_timeline(
                 sp_vals = [p[1] for p in pts]
                 if sp_vals:
                     max_spd_seen = max(max_spd_seen, max(sp_vals))
-                lbl = f"车辆 #{tid}" if idx < 8 else None
+                if idx < 8:
+                    lbl = f"车辆 #{tid}" if use_cjk else f"Vehicle #{tid}"
+                else:
+                    lbl = None
                 ax.plot(ts_vals, sp_vals, marker="o", markersize=2.6, linewidth=1.6, label=lbl)
 
             if not ordered_ids:
                 ax.text(
                     0.5,
                     0.5,
-                    "未记录到车辆有效测速样本",
+                    "未记录到车辆有效测速样本" if use_cjk else "No valid vehicle speed samples recorded",
                     transform=ax.transAxes,
                     ha="center",
                     va="center",
@@ -712,11 +1133,21 @@ def plot_run_timeline(
                 color="#d62728",
                 linestyle="--",
                 linewidth=1.8,
-                label=f"限速阈值 ({speed_limit:.0f} km/h)",
+                label=(
+                    f"限速阈值 ({speed_limit_str} km/h)"
+                    if use_cjk
+                    else f"Speed Limit ({speed_limit_str} km/h)"
+                ),
             )
-            ax.set_xlabel("时间 (s)", fontsize=10)
-            ax.set_ylabel("时速 (km/h)", fontsize=10)
-            ax.set_title("车辆瞬时时速与冲突/超速事件时间窗", fontsize=12, pad=10)
+            ax.set_xlabel("时间 (s)" if use_cjk else "Time (s)", fontsize=10)
+            ax.set_ylabel("时速 (km/h)" if use_cjk else "Speed (km/h)", fontsize=10)
+            ax.set_title(
+                "车辆瞬时时速与冲突/超速事件时间窗"
+                if use_cjk
+                else "Vehicle Speed Timeline & Conflict/Speeding Windows",
+                fontsize=12,
+                pad=10,
+            )
             ax.set_ylim(0.0, max(speed_limit * 1.25, max_spd_seen * 1.16, 5.0))
             if all_timestamps:
                 t_min, t_max = min(all_timestamps), max(all_timestamps)
@@ -735,62 +1166,98 @@ def plot_run_timeline(
         finally:
             plt.close(fig)
 
-    # 若存在逐帧冲突记录，补充一张风险等级与 TTC/MTTC 演变曲线图
-    if conflicts:
+    # 若存在逐帧冲突记录，补充一张风险等级与独立 TTC / MTTC 演变曲线图
+    if frame_records:
         risk_path = out_root / "run_risk_timeline.png"
-        frame_risk: dict[float, int] = {}
-        frame_ttc: dict[float, float] = {}
-        for row in conflicts:
-            ts = _finite_float(row.get("timestamp_s", 0.0), "conflict.timestamp_s", non_negative=True)
-            ass = row.get("assessment", row)
-            lvl = _risk_level_num(ass.get("risk_level"))
-            frame_risk[ts] = max(frame_risk.get(ts, 0), lvl)
-            raw_ttc = ass.get("mttc_seconds") if ass.get("mttc_seconds") is not None else ass.get("ttc_seconds")
-            if raw_ttc is not None:
-                ttc_val = _finite_float(raw_ttc, "conflict.ttc_seconds", non_negative=True)
-                if ts not in frame_ttc or ttc_val < frame_ttc[ts]:
-                    frame_ttc[ts] = ttc_val
+        risk_pts = [(r["frame_index"], r["ts"], float(r["risk"])) for r in frame_records]
+        ttc_pts = [(r["frame_index"], r["ts"], float(r["ttc"])) for r in frame_records if r["ttc"] is not None]
+        mttc_pts = [(r["frame_index"], r["ts"], float(r["mttc"])) for r in frame_records if r["mttc"] is not None]
 
-        sorted_ts = sorted(frame_risk.keys())
-        with _chart_rc_context():
+        risk_x, risk_y = _build_segmented_series(
+            risk_pts, unique_speed_ts=unique_speed_ts, median_dt=median_dt
+        )
+        t_candidates = list(all_timestamps) + [r["ts"] for r in frame_records]
+
+        with _chart_rc_context() as use_cjk:
             fig, ax_r = plt.subplots(figsize=(10.6, 4.4))
             try:
                 ax_r.step(
-                    sorted_ts,
-                    [frame_risk[t] for t in sorted_ts],
+                    risk_x,
+                    risk_y,
                     where="post",
                     color="#c53030",
                     linewidth=1.9,
-                    label="单帧峰值风险等级",
+                    marker="o",
+                    markersize=4.8,
+                    label=("单帧峰值风险等级" if use_cjk else "Per-Frame Peak Risk Level"),
                 )
                 ax_r.set_yticks([0, 1, 2, 3])
-                ax_r.set_yticklabels(list(_RISK_LEVEL_LABELS), fontsize=9.2)
+                ax_r.set_yticklabels(_risk_level_labels(use_cjk=use_cjk), fontsize=9.2)
                 ax_r.set_ylim(-0.2, 3.6)
-                ax_r.set_xlabel("时间 (s)", fontsize=10)
-                ax_r.set_ylabel("风险等级", fontsize=10)
-                ax_r.set_title("逐帧风险等级与最小 TTC/MTTC 演变曲线", fontsize=12, pad=10)
-                if len(sorted_ts) >= 2 and sorted_ts[-1] > sorted_ts[0]:
-                    span = sorted_ts[-1] - sorted_ts[0]
-                    ax_r.set_xlim(max(0.0, sorted_ts[0] - 0.03 * span), sorted_ts[-1] + 0.03 * span)
+                ax_r.set_xlabel("时间 (s)" if use_cjk else "Time (s)", fontsize=10)
+                ax_r.set_ylabel("风险等级" if use_cjk else "Risk Level", fontsize=10)
+                ax_r.set_title(
+                    "逐帧风险等级与最小 TTC/MTTC 演变曲线"
+                    if use_cjk
+                    else "Per-Frame Risk Level & Min TTC/MTTC Timeline",
+                    fontsize=12,
+                    pad=10,
+                )
+                if t_candidates:
+                    t_lo, t_hi = min(t_candidates), max(t_candidates)
+                    if t_hi > t_lo:
+                        span = t_hi - t_lo
+                        ax_r.set_xlim(max(0.0, t_lo - 0.03 * span), t_hi + 0.03 * span)
+                    else:
+                        ax_r.set_xlim(max(0.0, t_lo - 0.5), t_lo + 0.5)
                 ax_r.grid(True, linestyle="--", alpha=0.35)
 
-                if frame_ttc:
-                    ttc_ts = sorted(frame_ttc.keys())
+                if ttc_pts or mttc_pts:
                     ax_t = ax_r.twinx()
-                    ax_t.plot(
-                        ttc_ts,
-                        [frame_ttc[t] for t in ttc_ts],
-                        color="#2b6cb0",
-                        linestyle="-.",
-                        marker=".",
-                        linewidth=1.5,
-                        label="最小 TTC/MTTC (s)",
-                    )
-                    ax_t.set_ylabel("最小 TTC / MTTC (s)", fontsize=10)
-                    ax_t.set_ylim(0.0, max(4.0, max(frame_ttc.values()) * 1.25))
+                    all_t_vals: list[float] = []
+                    if ttc_pts:
+                        ttc_x, ttc_y = _build_segmented_series(
+                            ttc_pts, unique_speed_ts=unique_speed_ts, median_dt=median_dt
+                        )
+                        ax_t.plot(
+                            ttc_x,
+                            ttc_y,
+                            color="#2b6cb0",
+                            linestyle="-.",
+                            marker="o",
+                            markersize=4.5,
+                            linewidth=1.6,
+                            label=("最小 TTC (s)" if use_cjk else "Min TTC (s)"),
+                        )
+                        all_t_vals.extend(p[2] for p in ttc_pts)
+                    if mttc_pts:
+                        mttc_x, mttc_y = _build_segmented_series(
+                            mttc_pts, unique_speed_ts=unique_speed_ts, median_dt=median_dt
+                        )
+                        ax_t.plot(
+                            mttc_x,
+                            mttc_y,
+                            color="#805ad5",
+                            linestyle=":",
+                            marker="s",
+                            markersize=4.2,
+                            linewidth=1.6,
+                            label=("最小 MTTC (s)" if use_cjk else "Min MTTC (s)"),
+                        )
+                        all_t_vals.extend(p[2] for p in mttc_pts)
+                    ax_t.set_ylabel("最小 TTC / MTTC (s)" if use_cjk else "Min TTC / MTTC (s)", fontsize=10)
+                    y_top = max(4.0, max(all_t_vals) * 1.25)
+                    ax_t.set_ylim(-0.04 * y_top, y_top)
                     h1, l1 = ax_r.get_legend_handles_labels()
                     h2, l2 = ax_t.get_legend_handles_labels()
-                    ax_r.legend(h1 + h2, l1 + l2, loc="upper right", ncol=2, fontsize=8.8, **_LEGEND_STYLE)
+                    ax_r.legend(
+                        h1 + h2,
+                        l1 + l2,
+                        loc="upper right",
+                        ncol=min(3, len(h1) + len(h2)),
+                        fontsize=8.6,
+                        **_LEGEND_STYLE,
+                    )
                 else:
                     ax_r.legend(loc="upper right", fontsize=8.8, **_LEGEND_STYLE)
 
@@ -802,7 +1269,7 @@ def plot_run_timeline(
     return generated
 
 
-def _normalize_mot_reports(reports: Any) -> list[tuple[str, Mapping[str, Any]]]:
+def _normalize_mot_reports(reports: Any, *, use_cjk: bool = True) -> list[tuple[str, Mapping[str, Any]]]:
     """统一解析 MOT 对比输入（字典映射、二元组列表或带 label 的报告列表）。"""
     items: list[tuple[str, Any]] = []
     if isinstance(reports, Mapping):
@@ -812,7 +1279,8 @@ def _normalize_mot_reports(reports: Any) -> list[tuple[str, Mapping[str, Any]]]:
             if isinstance(entry, tuple) and len(entry) == 2:
                 items.append((str(entry[0]), entry[1]))
             elif isinstance(entry, Mapping):
-                label = entry.get("label") or entry.get("name") or entry.get("model") or f"配置 {idx + 1}"
+                default_lbl = f"配置 {idx + 1}" if use_cjk else f"Config {idx + 1}"
+                label = entry.get("label") or entry.get("name") or entry.get("model") or default_lbl
                 items.append((str(label), entry))
             else:
                 raise ValueError(f"reports[{idx}] 必须是 (label, report) 元组或报告字典")
@@ -844,29 +1312,29 @@ def plot_mot_comparison(
 ) -> str:
     """绘制多组跟踪配置的 MOTA / IDF1 / HOTA / IDSW 分组柱状对比图。"""
     out_file = _validate_path_arg(output_path, "output_path")
-    parsed = _normalize_mot_reports(reports)
+    with _chart_rc_context() as use_cjk:
+        parsed = _normalize_mot_reports(reports, use_cjk=use_cjk)
 
-    labels: list[str] = []
-    mota_vals: list[float] = []
-    idf1_vals: list[float] = []
-    hota_vals: list[float] = []
-    idsw_vals: list[float] = []
+        labels: list[str] = []
+        mota_vals: list[float] = []
+        idf1_vals: list[float] = []
+        hota_vals: list[float] = []
+        idsw_vals: list[float] = []
 
-    for label, rep in parsed:
-        for req_k in ("mota", "idf1", "hota"):
-            if req_k not in rep:
-                raise ValueError(f"MOT 报告 {label!r} 缺少字段 {req_k}")
-        raw_idsw = rep.get("id_switches", rep.get("idsw"))
-        if raw_idsw is None:
-            raise ValueError(f"MOT 报告 {label!r} 缺少字段 id_switches")
+        for idx, (label, rep) in enumerate(parsed):
+            for req_k in ("mota", "idf1", "hota"):
+                if req_k not in rep:
+                    raise ValueError(f"MOT 报告 {label!r} 缺少字段 {req_k}")
+            raw_idsw = rep.get("id_switches", rep.get("idsw"))
+            if raw_idsw is None:
+                raise ValueError(f"MOT 报告 {label!r} 缺少字段 id_switches")
 
-        labels.append(label)
-        mota_vals.append(_finite_float(rep["mota"], f"{label}.mota"))
-        idf1_vals.append(_finite_float(rep["idf1"], f"{label}.idf1", non_negative=True))
-        hota_vals.append(_finite_float(rep["hota"], f"{label}.hota", non_negative=True))
-        idsw_vals.append(_finite_float(raw_idsw, f"{label}.id_switches", non_negative=True))
+            labels.append(_safe_label(label, use_cjk=use_cjk, fallback=f"Config {idx + 1}"))
+            mota_vals.append(_finite_float(rep["mota"], f"{label}.mota"))
+            idf1_vals.append(_finite_float(rep["idf1"], f"{label}.idf1", non_negative=True))
+            hota_vals.append(_finite_float(rep["hota"], f"{label}.hota", non_negative=True))
+            idsw_vals.append(_finite_float(raw_idsw, f"{label}.id_switches", non_negative=True))
 
-    with _chart_rc_context():
         fig, (ax_scores, ax_idsw) = plt.subplots(
             1, 2, figsize=(11.6, 4.9), gridspec_kw={"width_ratios": [2.2, 1.0]}
         )
@@ -897,8 +1365,14 @@ def plot_mot_comparison(
             ha_lbl = "right" if rot else "center"
             ax_scores.set_xticks(x)
             ax_scores.set_xticklabels(labels, rotation=rot, ha=ha_lbl, fontsize=9.2)
-            ax_scores.set_ylabel("指标得分", fontsize=10)
-            ax_scores.set_title("多目标跟踪精度指标对比 (MOTA / IDF1 / HOTA)", fontsize=11.5, pad=10)
+            ax_scores.set_ylabel("指标得分" if use_cjk else "Score", fontsize=10)
+            ax_scores.set_title(
+                "多目标跟踪精度指标对比 (MOTA / IDF1 / HOTA)"
+                if use_cjk
+                else "MOT Accuracy Comparison (MOTA / IDF1 / HOTA)",
+                fontsize=11.5,
+                pad=10,
+            )
             ax_scores.set_ylim(y_min, y_max)
             ax_scores.grid(axis="y", linestyle="--", alpha=0.35)
             ax_scores.legend(loc="upper center", ncol=3, fontsize=9, **_LEGEND_STYLE)
@@ -917,8 +1391,14 @@ def plot_mot_comparison(
                 )
             ax_idsw.set_xticks(x)
             ax_idsw.set_xticklabels(labels, rotation=rot, ha=ha_lbl, fontsize=9.2)
-            ax_idsw.set_ylabel("身份切换次数 (次)", fontsize=10)
-            ax_idsw.set_title("身份切换次数 IDSW (越低越好)", fontsize=11.5, pad=10)
+            ax_idsw.set_ylabel("身份切换次数 (次)" if use_cjk else "ID Switches (count)", fontsize=10)
+            ax_idsw.set_title(
+                "身份切换次数 IDSW (越低越好)"
+                if use_cjk
+                else "ID Switches IDSW (Lower Is Better)",
+                fontsize=11.5,
+                pad=10,
+            )
             ax_idsw.set_ylim(0.0, max(1.5, max_idsw * 1.28))
             ax_idsw.grid(axis="y", linestyle="--", alpha=0.35)
 
@@ -946,7 +1426,6 @@ def plot_benchmark_breakdown(
     if not isinstance(stages_obj, Mapping) or not stages_obj:
         raise ValueError("bench_data 缺少有效的 stages 耗时统计")
 
-    stage_labels: list[str] = []
     means: list[float] = []
     p95s: list[float] = []
     present_sub = 0
@@ -962,7 +1441,6 @@ def plot_benchmark_breakdown(
         else:
             mean_v = 0.0
             p95_v = 0.0
-        stage_labels.append(_STAGE_DISPLAY_LABELS[stage_key])
         means.append(mean_v)
         p95s.append(p95_v)
 
@@ -970,19 +1448,55 @@ def plot_benchmark_breakdown(
         raise ValueError("bench_data.stages 未包含任何已知流水线子阶段")
 
     total_sum = sum(means)
-    fps_val = payload.get("end_to_end_fps")
-    model_load_val = payload.get("model_load_ms")
     frames_val = payload.get("frames_profiled")
+    frame_fps_val = payload.get("frame_processing_fps", payload.get("end_to_end_fps"))
+    wall_fps_val = payload.get("wall_fps")
+    wall_ms_val = payload.get("wall_elapsed_ms")
+    if (
+        wall_fps_val is None
+        and type(frames_val) is int
+        and frames_val > 0
+        and wall_ms_val is not None
+        and not isinstance(wall_ms_val, (bool, np.bool_))
+        and isinstance(wall_ms_val, (int, float, np.integer, np.floating))
+        and float(wall_ms_val) > 0.0
+    ):
+        wall_fps_val = frames_val / (float(wall_ms_val) / 1000.0)
+    steady_obj = payload.get("steady_state")
+    steady_fps_val: Optional[float] = None
+    if (
+        isinstance(steady_obj, Mapping)
+        and isinstance(steady_obj.get("warmup_frames_excluded"), (int, np.integer))
+        and not isinstance(steady_obj.get("warmup_frames_excluded"), (bool, np.bool_))
+        and int(steady_obj["warmup_frames_excluded"]) > 0
+        and steady_obj.get("steady_state_fps") is not None
+        and not isinstance(steady_obj.get("steady_state_fps"), (bool, np.bool_))
+    ):
+        steady_fps_val = float(steady_obj["steady_state_fps"])
+    model_load_val = payload.get("model_load_ms")
 
-    with _chart_rc_context():
+    with _chart_rc_context() as use_cjk:
+        stage_labels = [_display_stage(stage_key, use_cjk=use_cjk) for stage_key in SUBSTAGE_NAMES]
         fig, (ax_bar, ax_pie) = plt.subplots(
             1, 2, figsize=(12.4, 5.2), gridspec_kw={"width_ratios": [1.35, 1.0]}
         )
         try:
             x = np.arange(len(stage_labels))
             width = 0.35
-            b_mean = ax_bar.bar(x - width / 2, means, width, label="均值耗时 (ms)", color="#2b6cb0")
-            b_p95 = ax_bar.bar(x + width / 2, p95s, width, label="P95 耗时 (ms)", color="#63b3ed")
+            b_mean = ax_bar.bar(
+                x - width / 2,
+                means,
+                width,
+                label=("均值耗时 (ms)" if use_cjk else "Mean Latency (ms)"),
+                color="#2b6cb0",
+            )
+            b_p95 = ax_bar.bar(
+                x + width / 2,
+                p95s,
+                width,
+                label=("P95 耗时 (ms)" if use_cjk else "P95 Latency (ms)"),
+                color="#63b3ed",
+            )
             max_lat = max([0.1, *means, *p95s])
             for bar in list(b_mean) + list(b_p95):
                 h = bar.get_height()
@@ -995,14 +1509,26 @@ def plot_benchmark_breakdown(
                     fontsize=8.5,
                 )
             ax_bar.set_xticks(x)
-            ax_bar.set_xticklabels(stage_labels, rotation=0, ha="center", fontsize=9.5)
-            ax_bar.set_ylabel("单帧耗时 (ms)", fontsize=10)
-            ax_bar.set_title("流水线各阶段单帧耗时分布 (均值 vs P95)", fontsize=11.5, pad=10)
+            ax_bar.set_xticklabels(
+                stage_labels,
+                rotation=(0 if use_cjk else 15),
+                ha=("center" if use_cjk else "right"),
+                fontsize=(9.5 if use_cjk else 8.8),
+            )
+            ax_bar.set_ylabel("单帧耗时 (ms)" if use_cjk else "Per-Frame Latency (ms)", fontsize=10)
+            ax_bar.set_title(
+                "流水线各阶段单帧耗时分布 (均值 vs P95)"
+                if use_cjk
+                else "Pipeline Stage Latency Distribution (Mean vs P95)",
+                fontsize=11.5,
+                pad=10,
+            )
             ax_bar.set_ylim(0.0, max_lat * 1.30)
             ax_bar.grid(axis="y", linestyle="--", alpha=0.35)
             ax_bar.legend(loc="upper right", fontsize=9, **_LEGEND_STYLE)
 
             colors = ["#2b6cb0", "#c53030", "#2f855a", "#dd6b20", "#805ad5"]
+            pie_title = "各阶段平均耗时占比 (%)" if use_cjk else "Stage Mean Latency Share (%)"
             if total_sum > 0.0:
                 # 仅对正值切片绘制饼图，防止全零数组触发 divide-by-zero RuntimeWarning
                 nz_idx = [i for i, v in enumerate(means) if v > 0.0]
@@ -1024,29 +1550,51 @@ def plot_benchmark_breakdown(
                     fontsize=9,
                     frameon=False,
                 )
-                ax_pie.set_title("各阶段平均耗时占比 (%)", fontsize=11.5, pad=10)
+                ax_pie.set_title(pie_title, fontsize=11.5, pad=10)
             else:
                 ax_pie.axis("off")
                 ax_pie.text(
                     0.5,
                     0.5,
-                    "未记录到正值阶段耗时",
+                    "未记录到正值阶段耗时" if use_cjk else "No positive stage latency recorded",
                     ha="center",
                     va="center",
                     fontsize=10.5,
                     color="#4a5568",
                 )
-                ax_pie.set_title("各阶段平均耗时占比 (%)", fontsize=11.5, pad=10)
+                ax_pie.set_title(pie_title, fontsize=11.5, pad=10)
 
             subtitle_parts = []
             if frames_val is not None and type(frames_val) is int:
-                subtitle_parts.append(f"评测帧数：{frames_val} 帧")
-            if fps_val is not None and not isinstance(fps_val, (bool, np.bool_)):
-                subtitle_parts.append(f"端到端吞吐：{float(fps_val):.2f} FPS")
+                subtitle_parts.append(
+                    f"评测帧数：{frames_val} 帧" if use_cjk else f"Frames: {frames_val}"
+                )
+            if frame_fps_val is not None and not isinstance(frame_fps_val, (bool, np.bool_)):
+                subtitle_parts.append(
+                    f"帧内吞吐：{float(frame_fps_val):.2f} FPS"
+                    if use_cjk
+                    else f"Frame FPS: {float(frame_fps_val):.2f}"
+                )
+            if steady_fps_val is not None:
+                subtitle_parts.append(
+                    f"稳态吞吐：{steady_fps_val:.2f} FPS"
+                    if use_cjk
+                    else f"Steady FPS: {steady_fps_val:.2f}"
+                )
+            if wall_fps_val is not None and not isinstance(wall_fps_val, (bool, np.bool_)):
+                subtitle_parts.append(
+                    f"墙钟吞吐：{float(wall_fps_val):.2f} FPS"
+                    if use_cjk
+                    else f"Wall FPS: {float(wall_fps_val):.2f}"
+                )
             if model_load_val is not None and not isinstance(model_load_val, (bool, np.bool_)):
-                subtitle_parts.append(f"模型冷启动加载：{float(model_load_val):.1f} ms")
+                subtitle_parts.append(
+                    f"模型加载：{float(model_load_val):.1f} ms"
+                    if use_cjk
+                    else f"Model Load: {float(model_load_val):.1f} ms"
+                )
             if subtitle_parts:
-                fig.suptitle("  |  ".join(subtitle_parts), fontsize=10.5, y=0.985)
+                fig.suptitle("  |  ".join(subtitle_parts), fontsize=10.0, y=0.985)
                 fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.93), pad=1.5, w_pad=2.0)
             else:
                 fig.tight_layout(pad=1.5, w_pad=2.0)

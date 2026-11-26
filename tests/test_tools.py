@@ -417,6 +417,42 @@ class AnalysisToolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_ground_truth(bad_gt)
 
+    def test_evaluate_run_merges_risk_aliases_and_formats_none_gt_markdown(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run`quoted"
+            root.mkdir()
+            (root / "summary.json").write_text(json.dumps({"frames_processed": 5}), encoding="utf-8")
+            (root / "conflicts.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"frame_index": 0, "assessment": {"risk_level": 1}}),
+                    json.dumps({"frame_index": 1, "assessment": {"risk_level": "1"}}),
+                    json.dumps({"frame_index": 2, "assessment": {"risk_level": "LEVEL_1_SPEEDING"}}),
+                    json.dumps({"frame_index": 3, "assessment": {"risk_level": 0}}),
+                    json.dumps({"frame_index": 4, "assessment": {"risk_level": "0"}}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            (root / "events.jsonl").write_text("", encoding="utf-8")
+            (root / "speeds.csv").write_text("timestamp_s,track_id,speed_kmh,is_reliable,is_stationary\n", encoding="utf-8")
+
+            gt = {
+                "schema_version": 1,
+                "tolerance_s": 0.5,
+                "speed_references": [{"track_id": 99, "reference_speed_kmh": 25.0, "only_reliable": True}],
+                "expected_events": [],
+            }
+            res = evaluate_run(root, ground_truth=gt)
+            self.assertEqual(res["risk_counts"], {"LEVEL_0_SAFE": 2, "LEVEL_1": 3})
+
+            md = to_markdown(res)
+            self.assertIn(f"``{res['run_dir']}``", md)
+            self.assertIn("| L0 正常 | 2 |", md)
+            self.assertIn("| L1 超速 | 3 |", md)
+            self.assertEqual(md.count("| L1 超速 |"), 1)
+            self.assertNotIn("None", md)
+            self.assertIn("MAE=无", md)
+            self.assertIn("Precision=无", md)
+
 
 if __name__ == "__main__":
     unittest.main()

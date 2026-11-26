@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -189,6 +190,70 @@ def evaluate(
     return loss_meter.avg, 100.0 * correct / max(1, total)
 
 
+def _sync_cosine_scheduler_lr(
+    scheduler: torch.optim.lr_scheduler.CosineAnnealingLR,
+    optimizer: torch.optim.Optimizer,
+) -> list[float]:
+    """按解析余弦退火公式同步优化器与调度器学习率，防止扩展 T_max 后曲线偏移或反弹。"""
+    t_max = max(1, int(scheduler.T_max))
+    eff_epoch = min(max(0, int(scheduler.last_epoch)), t_max)
+    eta_min = float(scheduler.eta_min)
+    cos_factor = 0.5 * (1.0 + math.cos(math.pi * eff_epoch / t_max))
+    synced_lrs: list[float] = []
+    for base_lr, group in zip(scheduler.base_lrs, optimizer.param_groups):
+        lr = eta_min + (float(base_lr) - eta_min) * cos_factor
+        group["lr"] = lr
+        synced_lrs.append(lr)
+    scheduler._last_lr = list(synced_lrs)
+    return synced_lrs
+
+
+def _restore_scheduler_on_resume(
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
+    optimizer: torch.optim.Optimizer,
+    ckpt: dict,
+    target_epochs: int,
+) -> None:
+    """续训恢复调度器状态：保留新目标 T_max，确保 last_epoch 单调且余弦衰减连续。"""
+    if scheduler is None:
+        return
+    completed_epoch = max(0, int(ckpt.get("epoch", 0)))
+    target_t_max = max(1, int(target_epochs))
+    sched_state = ckpt.get("scheduler_state")
+    if sched_state is not None:
+        scheduler.load_state_dict(sched_state)
+        if isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
+            old_t_max = int(scheduler.T_max)
+            needs_sync = False
+            if scheduler.last_epoch < completed_epoch:
+                scheduler.last_epoch = completed_epoch
+                needs_sync = True
+            if target_t_max != old_t_max:
+                scheduler.T_max = target_t_max
+                needs_sync = True
+            elif scheduler.last_epoch > old_t_max:
+                needs_sync = True
+            if needs_sync:
+                _sync_cosine_scheduler_lr(scheduler, optimizer)
+    elif isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
+        scheduler.T_max = target_t_max
+        scheduler.last_epoch = completed_epoch
+        _sync_cosine_scheduler_lr(scheduler, optimizer)
+
+
+def _resolve_history_epochs(data: dict) -> list[int]:
+    """解析训练历史对应的绝对 epoch 序号（兼容断点续训与旧版 history.json）。"""
+    h = data.get("history", {})
+    n = len(h.get("train_loss", []))
+    raw_epochs = h.get("epoch") or h.get("epochs")
+    if isinstance(raw_epochs, list) and len(raw_epochs) == n:
+        return [int(e) for e in raw_epochs]
+    raw_start = data.get("start_epoch")
+    if isinstance(raw_start, int) and not isinstance(raw_start, bool) and raw_start >= 1:
+        return list(range(raw_start, raw_start + n))
+    return list(range(1, n + 1))
+
+
 # ============================================================
 # 三、主训练流程
 # ============================================================
@@ -269,7 +334,7 @@ def main() -> None:
     if config.USE_SCHEDULER:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=args.epochs,   # 一个完整余弦周期的长度
+            T_max=max(1, args.epochs),   # 一个完整余弦周期的长度
         )
 
     # ---------- 恢复训练（可选） ----------
@@ -286,8 +351,7 @@ def main() -> None:
             ckpt = torch.load(resume_path, map_location=device, weights_only=False)
             model.load_state_dict(ckpt["model_state"])
             optimizer.load_state_dict(ckpt["optimizer_state"])
-            if scheduler is not None and ckpt.get("scheduler_state") is not None:
-                scheduler.load_state_dict(ckpt["scheduler_state"])
+            _restore_scheduler_on_resume(scheduler, optimizer, ckpt, args.epochs)
             start_epoch = ckpt.get("epoch", 0) + 1
             epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
             if config.BEST_MODEL_PATH.exists():
@@ -315,6 +379,7 @@ def main() -> None:
     banner("开始训练")
 
     history: dict[str, list] = {
+        "epoch": [],
         "train_loss": [], "train_acc": [],
         "val_loss": [], "val_acc": [],
         "lr": [],
@@ -340,6 +405,7 @@ def main() -> None:
             scheduler.step()   # ★ 注意顺序：一般在 epoch 结束后调用
 
         # ---- 记录历史（后面画曲线用）----
+        history["epoch"].append(epoch)
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
         history["val_loss"].append(val_loss)
@@ -456,6 +522,7 @@ def main() -> None:
         json.dump(
             {
                 "history": history,
+                "start_epoch": start_epoch,
                 "best_epoch": best_epoch,
                 "best_val_acc": best_val_acc,
                 "test_acc": test_acc,
@@ -494,7 +561,7 @@ def plot_curves(history_path: Path) -> None:
         data = json.load(f)
 
     h = data["history"]
-    epochs = range(1, len(h["train_loss"]) + 1)
+    epochs = _resolve_history_epochs(data)
     best_epoch = data.get("best_epoch", 0)
 
     # 中文字体设置，否则中文会显示成方块
@@ -502,36 +569,37 @@ def plot_curves(history_path: Path) -> None:
     plt.rcParams["axes.unicode_minus"] = False   # 负号正常显示
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    try:
+        # 左图：损失曲线
+        ax1.plot(epochs, h["train_loss"], "o-", label="训练损失", markersize=3)
+        ax1.plot(epochs, h["val_loss"], "s-", label="验证损失", markersize=3)
+        if best_epoch:
+            # 标出最佳模型的位置
+            ax1.axvline(x=best_epoch, color="red", linestyle="--", alpha=0.5,
+                        label=f"最佳模型 (第{best_epoch}轮)")
+        ax1.set_xlabel("Epoch（训练轮数）")
+        ax1.set_ylabel("Loss（损失）")
+        ax1.set_title("损失曲线 —— 验证损失开始上升就是过拟合的信号")
+        ax1.legend()
+        ax1.grid(alpha=0.3)
 
-    # 左图：损失曲线
-    ax1.plot(epochs, h["train_loss"], "o-", label="训练损失", markersize=3)
-    ax1.plot(epochs, h["val_loss"], "s-", label="验证损失", markersize=3)
-    if best_epoch:
-        # 标出最佳模型的位置
-        ax1.axvline(x=best_epoch, color="red", linestyle="--", alpha=0.5,
-                    label=f"最佳模型 (第{best_epoch}轮)")
-    ax1.set_xlabel("Epoch（训练轮数）")
-    ax1.set_ylabel("Loss（损失）")
-    ax1.set_title("损失曲线 —— 验证损失开始上升就是过拟合的信号")
-    ax1.legend()
-    ax1.grid(alpha=0.3)
+        # 右图：准确率曲线
+        ax2.plot(epochs, h["train_acc"], "o-", label="训练准确率", markersize=3)
+        ax2.plot(epochs, h["val_acc"], "s-", label="验证准确率", markersize=3)
+        if best_epoch:
+            ax2.axvline(x=best_epoch, color="red", linestyle="--", alpha=0.5,
+                        label=f"最佳模型 (第{best_epoch}轮)")
+        ax2.set_xlabel("Epoch（训练轮数）")
+        ax2.set_ylabel("Accuracy (%)")
+        ax2.set_title("准确率曲线 —— 两条线差距越大，过拟合越严重")
+        ax2.legend()
+        ax2.grid(alpha=0.3)
 
-    # 右图：准确率曲线
-    ax2.plot(epochs, h["train_acc"], "o-", label="训练准确率", markersize=3)
-    ax2.plot(epochs, h["val_acc"], "s-", label="验证准确率", markersize=3)
-    if best_epoch:
-        ax2.axvline(x=best_epoch, color="red", linestyle="--", alpha=0.5,
-                    label=f"最佳模型 (第{best_epoch}轮)")
-    ax2.set_xlabel("Epoch（训练轮数）")
-    ax2.set_ylabel("Accuracy (%)")
-    ax2.set_title("准确率曲线 —— 两条线差距越大，过拟合越严重")
-    ax2.legend()
-    ax2.grid(alpha=0.3)
-
-    plt.tight_layout()
-    out_path = history_path.parent / "training_curves.png"
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close()
+        plt.tight_layout()
+        out_path = history_path.parent / "training_curves.png"
+        plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    finally:
+        plt.close(fig)
 
     print(f"训练曲线已保存: {out_path}  ← 打开看看，这是写报告的好素材")
 

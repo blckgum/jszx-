@@ -134,13 +134,66 @@ class EnhancedConflictVisualizer:
             return None
         return (u, v)
 
+    def _resolve_ground_zone_polygon(self) -> Optional[np.ndarray]:
+        """解析待渲染标定区域像素多边形。
+
+        - 4 点标定保持原始 `image_points`；
+        - 多点对应（>4 点，如 RANSAC 或含内部参考点）优先投射 `_zone_bounds` 四个角点，
+          若任一角点不可见或缺少 `_zone_bounds` 则回退至内点凸包，避免外点畸变或内部点挖空。
+        """
+        raw_pts = getattr(self.calibrator, "image_points", None)
+        if not raw_pts:
+            return None
+        if len(raw_pts) <= 4:
+            pts = np.array(raw_pts, dtype=np.int32)
+            return pts if len(pts) >= 3 else None
+
+        zone_bounds = getattr(self.calibrator, "_zone_bounds", None)
+        if (
+            isinstance(zone_bounds, (list, tuple))
+            and len(zone_bounds) == 4
+            and all(_is_finite_real(v) for v in zone_bounds)
+        ):
+            min_x, max_x, min_y, max_y = (float(v) for v in zone_bounds)
+            corners = (
+                (min_x, min_y),
+                (max_x, min_y),
+                (max_x, max_y),
+                (min_x, max_y),
+            )
+            projected = [self._project_ground_point(gx, gy) for gx, gy in corners]
+            if all(pt is not None for pt in projected):
+                return np.array(projected, dtype=np.int32)
+
+        inlier_indices = getattr(self.calibrator, "_inlier_indices", None)
+        if inlier_indices:
+            inlier_pts = [
+                raw_pts[int(idx)]
+                for idx in inlier_indices
+                if isinstance(idx, (int, np.integer))
+                and not isinstance(idx, bool)
+                and 0 <= int(idx) < len(raw_pts)
+            ]
+        else:
+            inlier_pts = list(raw_pts)
+        if len(inlier_pts) < 3:
+            inlier_pts = list(raw_pts)
+        if len(inlier_pts) < 3:
+            return None
+        hull_src = np.array(inlier_pts, dtype=np.float32).reshape(-1, 1, 2)
+        hull = cv2.convexHull(hull_src)
+        if hull is None or len(hull) < 3:
+            return None
+        return np.round(hull.reshape(-1, 2)).astype(np.int32)
+
     def draw_calibrated_ground_zone(self, frame: np.ndarray, alpha: float = 0.25):
         """在路面上半透明叠加渲染受控标定多边形区域与路侧停车区"""
-        pts = np.array(self.calibrator.image_points, dtype=np.int32)
-        overlay = frame.copy()
-        cv2.fillPoly(overlay, [pts], (240, 180, 0))
-        cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
-        cv2.polylines(frame, [pts], isClosed=True, color=(0, 220, 255), thickness=2)
+        pts = self._resolve_ground_zone_polygon()
+        if pts is not None and len(pts) >= 3:
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [pts], (240, 180, 0))
+            cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+            cv2.polylines(frame, [pts], isClosed=True, color=(0, 220, 255), thickness=2)
 
         for zone in getattr(self.calibrator, "parking_zones", ()):
             # 只要停车区在相机前方且未近地平线溢出就照常绘制（允许局部越过左/上画幅边界）；

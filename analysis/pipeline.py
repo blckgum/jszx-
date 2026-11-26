@@ -655,26 +655,6 @@ class ConflictPerceptionPipeline:
 
         for t, u_foot, v_foot, x_m, y_m in valid_tracks:
             eff_id = id_map.get(t.track_id, t.track_id) if self.enable_stitching else t.track_id
-            x_meas, y_meas = x_m, y_m
-            # 开启 2D 锚点偏置补偿时，沿视线方向把车辆底边接触点推进至车体几何中心再送入测速滤波器。
-            if callable(comp_fn) and t.category == "vehicle":
-                pol = object_policy(t.class_name, t.category, self.object_policies)
-                if pol.kind != "pedestrian":
-                    heading_hint = None
-                    prev_tracker = self.speed_estimator.tracks.get(eff_id)
-                    if prev_tracker is not None and prev_tracker.has_valid_velocity:
-                        vx_prev, vy_prev = prev_tracker.smoothed_vx, prev_tracker.smoothed_vy
-                        if (
-                            math.isfinite(vx_prev)
-                            and math.isfinite(vy_prev)
-                            and math.hypot(vx_prev, vy_prev) > 0.3
-                        ):
-                            heading_hint = (math.degrees(math.atan2(vy_prev, vx_prev)) + 360.0) % 360.0
-                    x_comp, y_comp = comp_fn(
-                        x_m, y_m, pol.length_m, pol.width_m, heading_deg=heading_hint
-                    )
-                    if math.isfinite(x_comp) and math.isfinite(y_comp):
-                        x_meas, y_meas = float(x_comp), float(y_comp)
 
             if self.speed_model in ("kalman", "ctrv") and callable(cov_fn):
                 obs_cov_m2 = cov_fn(u_foot, v_foot)
@@ -682,8 +662,8 @@ class ConflictPerceptionPipeline:
                     track_id=eff_id,
                     category=t.category,
                     timestamp_s=timestamp_s,
-                    x_m=x_meas,
-                    y_m=y_meas,
+                    x_m=x_m,
+                    y_m=y_m,
                     object_kind=t.class_name,
                     obs_cov_m2=obs_cov_m2,
                 )
@@ -692,17 +672,41 @@ class ConflictPerceptionPipeline:
                     track_id=eff_id,
                     category=t.category,
                     timestamp_s=timestamp_s,
-                    x_m=x_meas,
-                    y_m=y_meas,
+                    x_m=x_m,
+                    y_m=y_m,
                     object_kind=t.class_name,
                 )
-            reading.in_parking_zone = self.calibrator.is_in_parking_zone(reading.x_m, reading.y_m)
+
+            # 在测速滤波器完成连续底边接触点估计后再同步缝合器运动学（保持原始地面坐标一致），
+            # 随后再把车辆输出位置沿视线推进至车体几何中心，避免 heading_hint 切换把 0.5*(L-W)
+            # 阶跃偏移反馈进滤波器引发伪速度尖峰与连续马氏门控重置。
             if self.enable_stitching and self.stitcher is not None:
                 self.stitcher.update_kinematics(eff_id, reading, timestamp_s)
+
+            if callable(comp_fn) and reading.category == "vehicle":
+                pol = object_policy(reading.object_kind, reading.category, self.object_policies)
+                if pol.kind != "pedestrian":
+                    heading_hint = None
+                    if (
+                        math.isfinite(reading.vx_ms)
+                        and math.isfinite(reading.vy_ms)
+                        and math.hypot(reading.vx_ms, reading.vy_ms) > 0.3
+                    ):
+                        heading_hint = (
+                            math.degrees(math.atan2(reading.vy_ms, reading.vx_ms)) + 360.0
+                        ) % 360.0
+                    x_comp, y_comp = comp_fn(
+                        reading.x_m, reading.y_m, pol.length_m, pol.width_m, heading_deg=heading_hint
+                    )
+                    if math.isfinite(x_comp) and math.isfinite(y_comp):
+                        reading.x_m = float(x_comp)
+                        reading.y_m = float(y_comp)
+
+            reading.in_parking_zone = self.calibrator.is_in_parking_zone(reading.x_m, reading.y_m)
             reading_map[eff_id] = reading
             speed_readings.append(reading)
 
-            if reading.speed_kmh > frame_max_speed:
+            if reading.is_reliable and reading.speed_kmh > frame_max_speed:
                 frame_max_speed = reading.speed_kmh
 
         # 根据存活池剔除已移出跟踪器或越出标定区的目标，防止速度状态字典长期残留。
@@ -857,7 +861,7 @@ class ConflictPerceptionPipeline:
         for r in speed_readings:
             c = conflict_map.get(r.track_id) or ped_conflict_map.get(r.track_id)
             r_lvl = int(c.risk_level) if c is not None else (
-                int(RiskLevel.LEVEL_1_SPEEDING) if r.is_speeding else 0
+                int(RiskLevel.LEVEL_1_SPEEDING) if (r.is_speeding and r.is_reliable) else 0
             )
             if r_lvl > max_risk_lvl:
                 max_risk_lvl = r_lvl

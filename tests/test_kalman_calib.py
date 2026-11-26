@@ -567,13 +567,72 @@ class TestConstantAccelerationKalman2D(unittest.TestCase):
         self.assertEqual(kf.consecutive_rejects, 0)
 
         # 连续 3 帧大位移突变（真实急变道/重定位）：前两帧拒收，第 3 帧自动重置接管，防止锁死
+        self.assertFalse(kf.was_reset)
+        self.assertEqual(kf.reset_count, 0)
         self.assertFalse(kf.update(0.8, 20.0, 10.0))
+        self.assertFalse(kf.was_reset)
         self.assertFalse(kf.update(0.9, 20.5, 10.0))
         self.assertEqual(kf.consecutive_rejects, 2)
+        self.assertFalse(kf.was_reset)
         self.assertTrue(kf.update(1.0, 21.0, 10.0))
+        self.assertTrue(kf.was_reset)
+        self.assertEqual(kf.reset_count, 1)
         self.assertEqual(kf.consecutive_rejects, 0)
         self.assertAlmostEqual(kf.position_xy[0], 21.0, delta=0.05)
         self.assertAlmostEqual(kf.velocity_xy[0], 5.0, delta=0.2)
+
+        # clone() 保留 reset_count / was_reset，后续正常帧重置 was_reset 为 False
+        cloned = kf.clone()
+        self.assertTrue(cloned.was_reset)
+        self.assertEqual(cloned.reset_count, 1)
+        self.assertTrue(kf.update(1.1, 21.5, 10.0))
+        self.assertFalse(kf.was_reset)
+        self.assertEqual(kf.reset_count, 1)
+
+    def test_ca_kalman_reset_guards_inconsistent_jump_and_resets_tracker_reliability(self):
+        from analysis.conflict import ConflictAnalyzer, RiskLevel
+
+        # 1. 不一致剧烈跳变触发 CA 卡尔曼重置时，速度应归零重收敛而非注入单帧异常尖峰
+        est = SpeedEstimator(
+            speed_limit_kmh=30.0,
+            stationary_min_frames=4,
+            reliable_min_span_s=0.2,
+            estimator_mode="kalman",
+        )
+        analyzer = ConflictAnalyzer(speed_limit_kmh=30.0, conflict_model="obb_ssm")
+        cov = np.diag([0.1 ** 2, 0.2 ** 2])
+        dt = 1.0 / 30.0
+
+        for idx in range(10):
+            r_init = est.update(1, "vehicle", idx * dt, 3.0, 2.0, object_kind="car", obs_cov_m2=cov)
+        self.assertTrue(r_init.is_reliable)
+        self.assertTrue(r_init.is_stationary)
+
+        # 连续 3 帧大跳变，后两步隐含加速度远超物理极限
+        est.update(1, "vehicle", 10 * dt, 6.0, 5.0, object_kind="car", obs_cov_m2=cov)
+        est.update(1, "vehicle", 11 * dt, 6.0, 5.2, object_kind="car", obs_cov_m2=cov)
+        r_rst = est.update(1, "vehicle", 12 * dt, 6.0, 5.65, object_kind="car", obs_cov_m2=cov)
+
+        kf = est.tracks[1]._kalman
+        self.assertTrue(kf.was_reset)
+        self.assertEqual(kf.reset_count, 1)
+        self.assertFalse(r_rst.is_reliable)
+        self.assertFalse(r_rst.is_stationary)
+        self.assertFalse(r_rst.is_speeding)
+        self.assertAlmostEqual(r_rst.speed_ms, 0.0, delta=1e-6)
+        self.assertEqual(
+            analyzer.analyze_frame([r_rst], timestamp_s=12 * dt)[0].risk_level,
+            RiskLevel.LEVEL_0_SAFE,
+        )
+
+        # 需在重置后重新累积 >= 0.2s 干净观测才恢复 is_reliable
+        post = [
+            est.update(1, "vehicle", (12 + k) * dt, 6.0, 5.65 + 4.0 * (k * dt), object_kind="car", obs_cov_m2=cov)
+            for k in range(1, 9)
+        ]
+        self.assertFalse(post[4].is_reliable)  # 5*dt = 0.167s < 0.2s
+        self.assertTrue(post[6].is_reliable)   # 7*dt = 0.233s >= 0.2s
+        self.assertAlmostEqual(post[-1].speed_ms, 4.0, delta=0.6)
 
     def test_physical_clamping_and_validation(self):
         kf = ConstantAccelerationKalman2D(

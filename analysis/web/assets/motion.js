@@ -3430,7 +3430,11 @@
             ctx.fillStyle = pal.accent;
             ctx.textAlign = "right";
             ctx.textBaseline = "bottom";
-            ctx.fillText(this._speedLimitKmh.toFixed(0) + " km/h", padL + plotW, limitY - 3);
+            var limitText = Number.isFinite(this._speedLimitKmh)
+                ? this._speedLimitKmh.toFixed(6).replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "")
+                : "0";
+            if (limitText === "-0" || !limitText) limitText = "0";
+            ctx.fillText(limitText + " km/h", padL + plotW, limitY - 3);
         }
 
         // Band divider hairline

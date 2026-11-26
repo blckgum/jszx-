@@ -225,6 +225,7 @@ class _TrackletState:
     is_reliable: bool = False
     frames_seen: int = 1
     _has_external_kinematics: bool = False
+    _resolved_ts: Optional[float] = None
     appearance_hist: Optional[np.ndarray] = None
 
 
@@ -442,6 +443,7 @@ class TrackletStitcher:
         tr.x_m = obs.x_m
         tr.y_m = obs.y_m
         tr.last_seen_s = timestamp_s
+        tr._resolved_ts = timestamp_s
         tr.frames_seen += 1
         # 若当前观测携带有效外观直方图，在活跃帧中按 EMA 平滑并维持 L1 归一化
         if obs.appearance_hist is not None:
@@ -587,6 +589,7 @@ class TrackletStitcher:
                     x_m=obs.x_m,
                     y_m=obs.y_m,
                     last_seen_s=ts,
+                    _resolved_ts=ts,
                     appearance_hist=(
                         obs.appearance_hist.copy()
                         if obs.appearance_hist is not None
@@ -706,6 +709,7 @@ class TrackletStitcher:
                 x_m=obs.x_m,
                 y_m=obs.y_m,
                 last_seen_s=ts,
+                _resolved_ts=ts,
                 appearance_hist=(
                     obs.appearance_hist.copy()
                     if obs.appearance_hist is not None
@@ -761,8 +765,12 @@ class TrackletStitcher:
         raw_kind = getattr(reading, "object_kind", "")
         kind_str = raw_kind.strip() if isinstance(raw_kind, str) else ""
 
+        preserve_resolved_pos = False
         if cid_key in self._active_tracks:
             tr = self._active_tracks[cid_key]
+            # 若本帧已由 resolve_frame 以原始地面坐标刷新该活跃轨迹，保留原始坐标，
+            # 仅吸收滤波速度/加速度/协方差，避免锚点偏置补偿后的 reading.(x_m, y_m) 破坏缝合坐标系。
+            preserve_resolved_pos = tr._resolved_ts == ts
         elif cid_key in self._lost_tracks:
             tr = self._lost_tracks.pop(cid_key)
             self._active_tracks[cid_key] = tr
@@ -781,8 +789,9 @@ class TrackletStitcher:
             )
             self._active_tracks[cid_key] = tr
 
-        tr.x_m = float(x_m)
-        tr.y_m = float(y_m)
+        if not preserve_resolved_pos:
+            tr.x_m = float(x_m)
+            tr.y_m = float(y_m)
         tr.vx_ms = float(vx_ms)
         tr.vy_ms = float(vy_ms)
         tr.ax_ms2 = ax_val

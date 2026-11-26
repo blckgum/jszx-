@@ -278,6 +278,57 @@ class TestEnhancedVisualizationUpgrades(unittest.TestCase):
         self.assertIn("P:82%", texts_ssm[1][0])
         self.assertIn("[VRU]", texts_ssm[2][0])
 
+    def test_draw_calibrated_ground_zone_multipoint_ransac_and_interior_points(self):
+        # 基准 4 点标定构造精确多点对应
+        base_img = [(400.0, 300.0), (880.0, 300.0), (1150.0, 680.0), (130.0, 680.0)]
+        base_gd = [(0.0, 0.0), (6.0, 0.0), (6.0, 15.0), (0.0, 15.0)]
+        ref_cal = RoadCalibrator(base_img, width_m=6.0, length_m=15.0, name="ref4")
+        mid_px = ref_cal.ground_to_pixel_checked(3.0, 7.5)
+        self.assertIsNotNone(mid_px)
+        assert mid_px is not None
+
+        # 1) 6 点 RANSAC 含被拒外点 (50, 50)：渲染区不得被拉扯到外点位置，但路面内部正常着色
+        cal_ransac = RoadCalibrator.from_correspondences(
+            image_points=base_img + [tuple(float(v) for v in mid_px), (50.0, 50.0)],
+            ground_points=base_gd + [(3.0, 7.5), (3.0, 7.5)],
+            use_ransac=True,
+            ransac_reproj_threshold_m=0.5,
+            name="ransac6",
+        )
+        self.assertEqual(cal_ransac.inlier_count, 5)
+        frame_ransac = np.zeros((720, 1280, 3), dtype=np.uint8)
+        EnhancedConflictVisualizer(cal_ransac).draw_calibrated_ground_zone(frame_ransac)
+        self.assertTrue(np.array_equal(frame_ransac[50, 50], np.array([0, 0, 0], dtype=np.uint8)))
+        self.assertGreater(int(frame_ransac[mid_px[1], mid_px[0]].sum()), 0)
+
+        # 2) 5 纯内点（4 角点 + 中心内点）：不得在标定路面内部挖出凹陷空洞
+        cal_five = RoadCalibrator.from_correspondences(
+            image_points=base_img + [tuple(float(v) for v in mid_px)],
+            ground_points=base_gd + [(3.0, 7.5)],
+            use_ransac=False,
+            name="five_inliers",
+        )
+        frame_five = np.zeros((720, 1280, 3), dtype=np.uint8)
+        EnhancedConflictVisualizer(cal_five).draw_calibrated_ground_zone(frame_five)
+        check_pt = cal_five.ground_to_pixel_checked(1.5, 7.5)
+        self.assertIsNotNone(check_pt)
+        assert check_pt is not None
+        self.assertTrue(cal_five.is_in_zone(1.5, 7.5, margin_m=0.0))
+        self.assertGreater(int(frame_five[check_pt[1], check_pt[0]].sum()), 0)
+
+        # 3) _zone_bounds 任一角点投射为 None 时，回退内点凸包且仍排除外点与内部凹洞
+        fallback_cal = SimpleNamespace(
+            image_points=base_img + [tuple(float(v) for v in mid_px), (50.0, 50.0)],
+            _zone_bounds=(0.0, 6.0, 0.0, 15.0),
+            _inlier_indices=[0, 1, 2, 3, 4],
+            ground_to_pixel_checked=lambda x, y: None,
+            parking_zones=(),
+        )
+        frame_fb = np.zeros((720, 1280, 3), dtype=np.uint8)
+        EnhancedConflictVisualizer(fallback_cal).draw_calibrated_ground_zone(frame_fb)
+        self.assertTrue(np.array_equal(frame_fb[50, 50], np.array([0, 0, 0], dtype=np.uint8)))
+        self.assertGreater(int(frame_fb[check_pt[1], check_pt[0]].sum()), 0)
+
 
 class TestPipelineObbAndRtspReconnect(unittest.TestCase):
     def test_pipeline_param_validation_and_configuration_snapshot(self):

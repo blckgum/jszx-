@@ -130,6 +130,27 @@ class TrackingExportTests(unittest.TestCase):
             finally:
                 export.close()
 
+    def test_run_exports_accepts_str_path_and_rejects_blank(self):
+        for bad in ("", "   ", Path("   ")):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                RunExports(bad)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            export = RunExports(str(temporary))
+            try:
+                target = TargetRecord(3, 2, "car", "vehicle", 0.88, (10, 20, 50, 70), (30, 70))
+                export.write(FrameRecord("s-str", "v.mp4", 0, 0.0, "video_pts", 128, 96, [target]), {3})
+                export.finish("eof")
+            finally:
+                export.close()
+
+            root = Path(temporary)
+            self.assertTrue((root / "tracks.jsonl").is_file())
+            self.assertTrue((root / "observations.csv").is_file())
+            tracklets = read_lines(root / "tracklets.jsonl")
+            self.assertEqual(len(tracklets), 1)
+            self.assertEqual(tracklets[0]["track_id"], 3)
+
 
 class TrackingInputTests(unittest.TestCase):
     def test_early_input_failure_writes_summary(self):

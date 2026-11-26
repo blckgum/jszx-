@@ -369,6 +369,32 @@ class TestTrackletStitcher(unittest.TestCase):
         self.assertEqual(st.stitched_track_count, 0)
         self.assertEqual(st.resolve_frame([(1, "vehicle", "car", 1.0, 1.0)], 0.0)[0], {1: 1})
 
+    def test_update_kinematics_preserves_raw_position_resolved_in_same_frame(self):
+        # 当 resolve_frame 在同时间戳写入原始地面坐标后，update_kinematics 传入带锚点偏置补偿的坐标
+        # 仅更新速度/加速度/协方差，不得覆写缝合器内部的原始地面位置。
+        st = TrackletStitcher(max_gap_s=1.5, max_distance_m=3.5, max_mahalanobis=3.5)
+        st.resolve_frame([(1, "vehicle", "bus", 3.0, 10.0)], 0.0)
+        st.update_kinematics(
+            1,
+            SimpleNamespace(
+                x_m=3.0, y_m=5.0, vx_ms=0.0, vy_ms=-6.0,
+                ax_ms2=0.0, ay_ms2=0.0, is_reliable=True,
+                category="vehicle", object_kind="bus",
+                pos_cov_m2=(0.04, 0.0, 0.0, 0.16),
+            ),
+            0.0,
+        )
+        self.assertAlmostEqual(st._active_tracks[1].x_m, 3.0, places=6)
+        self.assertAlmostEqual(st._active_tracks[1].y_m, 10.0, places=6)
+        self.assertAlmostEqual(st._active_tracks[1].vy_ms, -6.0, places=6)
+
+        # 遮挡 0.32s 后在原始地面坐标 y = 10.0 - 6.0 * 0.32 = 8.08 处重现，必须成功缝合回 canonical_id=1
+        st.resolve_frame([], 0.16)
+        id_map, pairs = st.resolve_frame([(2, "vehicle", "bus", 3.0, 8.08)], 0.32)
+        self.assertEqual(id_map, {2: 1})
+        self.assertEqual(pairs, [(2, 1)])
+        self.assertEqual(st.stitched_track_count, 1)
+
 
 class TestEndToEndKalmanOBBStitchingReplay(unittest.TestCase):
     def _write_synthetic_tracks_with_occlusion(self, tracks_path: Path, calib: RoadCalibrator):
@@ -623,6 +649,73 @@ class TestEndToEndKalmanOBBStitchingReplay(unittest.TestCase):
             self.assertEqual(len(veh_badges), 3)
             for box in veh_badges:
                 self.assertNotEqual(tuple(round(x, 3) for x in box), tuple(round(x, 3) for x in out_box_expect))
+
+    def test_anchor_bias_compensation_preserves_occlusion_stitching_across_vehicle_types(self):
+        # 验证同时开启 enable_stitching 与 compensate_anchor_bias 时，
+        # car/truck/bus x away/toward x kalman/ctrv 全部 12 组短时遮挡场景均 100% 稳定缝合。
+        calib = RoadCalibrator(
+            image_points=[(400.0, 300.0), (880.0, 300.0), (1150.0, 680.0), (130.0, 680.0)],
+            width_m=6.0,
+            length_m=15.0,
+            name="stitch_anchor_bias_road",
+        )
+        fps = 25.0
+        dt = 1.0 / fps
+        total_frames = 45
+        occ_start, occ_end = 18, 26  # 8 帧 = 0.32s 遮挡
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for vehicle_cls in ("car", "truck", "bus"):
+                for direction in ("away", "toward"):
+                    tracks_path = root / f"tracks_{vehicle_cls}_{direction}.jsonl"
+                    rows = []
+                    for idx in range(total_frames):
+                        ts = round(idx * dt, 6)
+                        targets = []
+                        if not (occ_start <= idx < occ_end):
+                            raw_id = 1 if idx < occ_start else 2
+                            y_m = (13.0 - 6.0 * ts) if direction == "away" else (2.0 + 6.0 * ts)
+                            u_v, v_v = _project_ground_to_pixel(calib, 3.0, y_m)
+                            targets.append(
+                                _make_track_target(raw_id, u_v, v_v, class_name=vehicle_cls, category="vehicle")
+                            )
+                        rows.append({
+                            "schema_version": 1,
+                            "session_id": f"sess-{vehicle_cls}-{direction}",
+                            "source": "synthetic.mp4",
+                            "frame_index": idx,
+                            "timestamp_s": ts,
+                            "timestamp_source": "video_pts",
+                            "width": 1280,
+                            "height": 720,
+                            "tracks": targets,
+                        })
+                    tracks_path.write_text(
+                        "\n".join(json.dumps(r, ensure_ascii=False, allow_nan=False) for r in rows) + "\n",
+                        encoding="utf-8",
+                    )
+
+                    for speed_model in ("kalman", "ctrv"):
+                        out_dir = root / f"out_{vehicle_cls}_{direction}_{speed_model}"
+                        with self.subTest(cls=vehicle_cls, direction=direction, speed_model=speed_model):
+                            pipe = ConflictPerceptionPipeline(
+                                calibrator=calib,
+                                speed_model=speed_model,
+                                conflict_model="obb_ssm",
+                                enable_stitching=True,
+                                compensate_anchor_bias=True,
+                            )
+                            summary = pipe.process_tracks(tracks_path, out_dir)
+                            self.assertEqual(summary["status"], "ok")
+                            self.assertGreaterEqual(summary["stitched_track_count"], 1)
+                            with (out_dir / "speeds.csv").open(encoding="utf-8", newline="") as f:
+                                veh_ids = {
+                                    int(row["track_id"])
+                                    for row in csv.DictReader(f)
+                                    if row["category"] == "vehicle"
+                                }
+                            self.assertEqual(veh_ids, {1})
 
     def test_invalid_pipeline_and_cli_model_options_rejected(self):
         calib = _perspective_calibrator()

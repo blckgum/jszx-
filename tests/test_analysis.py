@@ -487,6 +487,35 @@ class TestSpeedEstimator(unittest.TestCase):
         self.assertTrue(final.is_reliable)
         self.assertTrue(final.is_speeding)
 
+    def test_unreliable_readings_never_trigger_speeding_or_level1(self):
+        # 无论 EMA、Kalman 还是 CTRV 模式，速度估计未收敛 (is_reliable=False) 期间
+        # 均不得置位 is_speeding，ConflictAnalyzer 亦不得产出 LEVEL_1_SPEEDING。
+        for mode in ("ema", "kalman", "ctrv"):
+            with self.subTest(mode=mode):
+                est = SpeedEstimator(
+                    speed_limit_kmh=30.0,
+                    reliable_min_span_s=0.2,
+                    estimator_mode=mode,
+                )
+                analyzer = ConflictAnalyzer(speed_limit_kmh=30.0)
+                # 25fps 高速 (12 m/s = 43.2 km/h)：前 5 帧跨度 <= 0.16s < 0.2s，全部未收敛
+                for idx in range(5):
+                    t = idx * 0.04
+                    r = est.update(1, "vehicle", t, 3.0, 12.0 * t, object_kind="car")
+                    self.assertFalse(r.is_reliable)
+                    self.assertFalse(r.is_speeding)
+                    res = analyzer.analyze_frame([r])
+                    self.assertEqual(res[0].risk_level, RiskLevel.LEVEL_0_SAFE)
+
+                # 第 6 帧跨度 0.20s >= 0.2s 收敛后恢复正常超速研判
+                r_rel = est.update(1, "vehicle", 5 * 0.04, 3.0, 12.0 * (5 * 0.04), object_kind="car")
+                self.assertTrue(r_rel.is_reliable)
+                self.assertTrue(r_rel.is_speeding)
+                self.assertEqual(
+                    analyzer.analyze_frame([r_rel])[0].risk_level,
+                    RiskLevel.LEVEL_1_SPEEDING,
+                )
+
 
 class TestConflictAnalyzer(unittest.TestCase):
     def setUp(self):
@@ -1631,13 +1660,14 @@ class TestPipelineIO(unittest.TestCase):
 
     def test_open_event_survives_inference_exception(self):
         # 推理中途抛异常：存续事件不得丢失，按 exception 语义落盘
+        # （25fps 下 0.2s 可靠度门于第 5 帧收敛，confirm_frames=2 在第 6 帧确认事件，故于第 7 帧触发异常）
         import json as jsonlib
 
         with tempfile.TemporaryDirectory() as d:
             vpath = Path(d) / "v.mp4"
             self._write_video(vpath, 15)
             try:
-                self._run_mocked_pipeline(Path(d) / "out", vpath, fail_at=6)
+                self._run_mocked_pipeline(Path(d) / "out", vpath, fail_at=7)
                 self.fail("process_video 应传播推理异常")
             except RuntimeError:
                 pass
@@ -1655,7 +1685,7 @@ class TestPipelineIO(unittest.TestCase):
             )
             self.assertEqual(summary["status"], "failed")
             self.assertEqual(summary["stop_reason"], "exception")
-            self.assertEqual(summary["frames_processed"], 6)
+            self.assertEqual(summary["frames_processed"], 7)
             self.assertIn("RuntimeError", summary["error"])
 
     def test_open_event_survives_keyboard_interrupt(self):
@@ -1666,7 +1696,7 @@ class TestPipelineIO(unittest.TestCase):
             self._write_video(vpath, 15)
             with self.assertRaises(KeyboardInterrupt):
                 self._run_mocked_pipeline(
-                    Path(d) / "out", vpath, fail_at=6, exc=KeyboardInterrupt()
+                    Path(d) / "out", vpath, fail_at=7, exc=KeyboardInterrupt()
                 )
             events = [
                 jsonlib.loads(l)
@@ -1687,9 +1717,9 @@ class TestPipelineIO(unittest.TestCase):
             vpath = Path(d) / "v.mp4"
             self._write_video(vpath, 15)
             summary, events = self._run_mocked_pipeline(
-                Path(d) / "out", vpath, max_frames=6
+                Path(d) / "out", vpath, max_frames=7
             )
-            self.assertEqual(summary["frames_processed"], 6)
+            self.assertEqual(summary["frames_processed"], 7)
             self.assertEqual(len(events), 1)
             self.assertEqual(events[0]["end_reason"], "max_frames")
 

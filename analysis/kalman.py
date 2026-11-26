@@ -184,6 +184,53 @@ def _safe_diff_velocity(
     return (0.0, 0.0) if clamped_v is None else clamped_v
 
 
+def _estimate_reset_velocity(
+    rejected_obs: list[Tuple[float, float, float]],
+    ts: float,
+    zx: float,
+    zy: float,
+    max_speed_ms: float,
+    max_accel_ms2: float,
+) -> Tuple[float, float, bool]:
+    """根据连续被拒观测序列估计重置初速度；若跳变速率或加速度违背物理一致性则归零重收敛。"""
+    if not rejected_obs:
+        return 0.0, 0.0, False
+    points = [*rejected_obs, (ts, zx, zy)]
+    t_first, x_first, y_first = points[0]
+    dt_span = ts - t_first
+    if not math.isfinite(dt_span) or dt_span <= 1e-4:
+        return 0.0, 0.0, False
+
+    seg_vels: list[Tuple[float, float, float]] = []
+    with np.errstate(over="ignore", invalid="ignore"):
+        for (t0, x0, y0), (t1, x1, y1) in zip(points, points[1:]):
+            dt_seg = t1 - t0
+            if not math.isfinite(dt_seg) or dt_seg <= 1e-4:
+                return 0.0, 0.0, False
+            vx_seg = (x1 - x0) / dt_seg
+            vy_seg = (y1 - y0) / dt_seg
+            if not (math.isfinite(vx_seg) and math.isfinite(vy_seg)):
+                return 0.0, 0.0, False
+            seg_speed = math.hypot(vx_seg, vy_seg)
+            if not math.isfinite(seg_speed) or seg_speed > max_speed_ms:
+                return 0.0, 0.0, False
+            seg_vels.append((0.5 * (t0 + t1), vx_seg, vy_seg))
+
+        max_reset_accel = 2.0 * max_accel_ms2
+        for (tm0, vx0, vy0), (tm1, vx1, vy1) in zip(seg_vels, seg_vels[1:]):
+            dt_mid = tm1 - tm0
+            if not math.isfinite(dt_mid) or dt_mid <= 1e-4:
+                return 0.0, 0.0, False
+            dv = math.hypot(vx1 - vx0, vy1 - vy0)
+            if not math.isfinite(dv) or (dv / dt_mid) > max_reset_accel:
+                return 0.0, 0.0, False
+
+    vx_span, vy_span = _safe_diff_velocity(
+        x_first, y_first, zx, zy, dt_span, max_speed_ms
+    )
+    return vx_span, vy_span, True
+
+
 def _resolve_obs_cov_2x2(obs_cov_m2: Optional[np.ndarray], default_r: np.ndarray) -> np.ndarray:
     """校验 2x2 观测协方差是否有限、对称且正定；否则回退各向同性默认协方差。"""
     if obs_cov_m2 is None:
@@ -339,7 +386,10 @@ class ConstantAccelerationKalman2D:
         self._last_timestamp_s: Optional[float] = None
         self._update_count: int = 0
         self._consecutive_rejects: int = 0
+        self._rejected_obs: list[Tuple[float, float, float]] = []
         self._last_rejected_obs: Optional[Tuple[float, float, float]] = None
+        self._reset_count: int = 0
+        self._was_reset: bool = False
         self.last_d2: Optional[float] = None
         self.last_accepted: bool = False
 
@@ -377,6 +427,8 @@ class ConstantAccelerationKalman2D:
         zx: float,
         zy: float,
         r_mat: np.ndarray,
+        *,
+        count_reset: bool = False,
     ) -> bool:
         """将滤波器安全重置为以当前有限观测为中心的初始状态与协方差。"""
         self._x[:] = (zx, zy, 0.0, 0.0, 0.0, 0.0)
@@ -384,7 +436,11 @@ class ConstantAccelerationKalman2D:
         self._last_timestamp_s = ts
         self._update_count = 1
         self._consecutive_rejects = 0
+        self._rejected_obs.clear()
         self._last_rejected_obs = None
+        if count_reset:
+            self._reset_count += 1
+            self._was_reset = True
         self.last_d2 = 0.0
         self.last_accepted = True
         return True
@@ -427,9 +483,10 @@ class ConstantAccelerationKalman2D:
             raise ValueError("timestamp_s 必须逐帧严格递增")
 
         r_mat = self._resolve_obs_cov(obs_cov_m2)
+        self._was_reset = False
 
         if self._update_count == 0 or self._last_timestamp_s is None:
-            return self._reset_to_observation(ts, zx, zy, r_mat)
+            return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=False)
 
         dt_s = ts - self._last_timestamp_s
         with np.errstate(over="ignore", invalid="ignore"):
@@ -442,7 +499,7 @@ class ConstantAccelerationKalman2D:
 
         # 极端 dt（如 1e80）导致预测状态或协方差溢出时，先验失效，安全重置到当前有限观测
         if not (np.isfinite(x_pred).all() and np.isfinite(p_pred).all()):
-            return self._reset_to_observation(ts, zx, zy, r_mat)
+            return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
 
         y_res, s_mat, d2 = _compute_innovation_and_d2(zx, zy, x_pred, p_pred, r_mat)
         self.last_d2 = d2
@@ -455,7 +512,8 @@ class ConstantAccelerationKalman2D:
             if self._consecutive_rejects < self.max_consecutive_rejects:
                 x_cand = self._clamp_physical_kinematics(x_pred.copy())
                 if x_cand is None or not (np.isfinite(x_cand).all() and np.isfinite(p_pred).all()):
-                    return self._reset_to_observation(ts, zx, zy, r_mat)
+                    return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
+                self._rejected_obs.append((ts, zx, zy))
                 self._last_rejected_obs = (ts, zx, zy)
                 self._x = x_cand
                 self._P = p_pred
@@ -463,39 +521,41 @@ class ConstantAccelerationKalman2D:
                 self.last_accepted = False
                 return False
 
-            # 连续剧烈偏移超过容忍帧数：重置位置并利用最近两次被拒观测初始化速度
-            vx0, vy0 = 0.0, 0.0
-            has_vel_init = False
-            if self._last_rejected_obs is not None:
-                prev_ts, prev_x, prev_y = self._last_rejected_obs
-                dt_rej = ts - prev_ts
-                if dt_rej > 1e-4:
-                    vx0, vy0 = _safe_diff_velocity(
-                        prev_x, prev_y, zx, zy, dt_rej, self.max_speed_ms
-                    )
-                    has_vel_init = True
+            # 连续剧烈偏移超过容忍帧数：仅在连续被拒轨迹运动学一致时用跨度差分初始化速度，否则归零重收敛
+            vx0, vy0, has_vel_init = _estimate_reset_velocity(
+                self._rejected_obs,
+                ts,
+                zx,
+                zy,
+                self.max_speed_ms,
+                self.max_accel_ms2,
+            )
             x_cand = np.array([zx, zy, vx0, vy0, 0.0, 0.0], dtype=np.float64)
             x_cand = self._clamp_physical_kinematics(x_cand)
             p_cand = self._build_reset_cov(r_mat)
             if x_cand is None or not (np.isfinite(x_cand).all() and np.isfinite(p_cand).all()):
-                return self._reset_to_observation(ts, zx, zy, r_mat)
+                return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
             self._x = x_cand
             self._P = p_cand
             self._last_timestamp_s = ts
             self._consecutive_rejects = 0
+            self._rejected_obs.clear()
             self._last_rejected_obs = None
             self._update_count = 2 if has_vel_init else 1
+            self._reset_count += 1
+            self._was_reset = True
             self.last_accepted = True
             return True
 
         self._consecutive_rejects = 0
+        self._rejected_obs.clear()
         self._last_rejected_obs = None
 
         if not (np.isfinite(y_res).all() and np.isfinite(s_mat).all()):
             # 极值坐标导致残差或新息矩阵溢出时安全保留有限预测状态，不污染滤波器
             x_cand = self._clamp_physical_kinematics(x_pred.copy())
             if x_cand is None or not np.isfinite(s_mat).all():
-                return self._reset_to_observation(ts, zx, zy, r_mat)
+                return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
             self._x = x_cand
             self._P = p_pred
             self._last_timestamp_s = ts
@@ -510,11 +570,11 @@ class ConstantAccelerationKalman2D:
         x_cand = self._clamp_physical_kinematics(x_upd)
         # 提交前校验有限性：极端观测导致状态上溢则退回有限预测，协方差上溢则安全重置
         if not np.isfinite(p_upd).all():
-            return self._reset_to_observation(ts, zx, zy, r_mat)
+            return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
         if x_cand is None or not np.isfinite(x_cand).all():
             x_fallback = self._clamp_physical_kinematics(x_pred.copy())
             if x_fallback is None or not np.isfinite(x_fallback).all():
-                return self._reset_to_observation(ts, zx, zy, r_mat)
+                return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
             self._x = x_fallback
             self._P = p_pred
             self._last_timestamp_s = ts
@@ -582,6 +642,16 @@ class ConstantAccelerationKalman2D:
     def consecutive_rejects(self) -> int:
         return self._consecutive_rejects
 
+    @property
+    def was_reset(self) -> bool:
+        """最近一次 update 是否触发了滤波器状态重置（不含首帧初始化）。"""
+        return self._was_reset
+
+    @property
+    def reset_count(self) -> int:
+        """累计触发滤波器状态重置的次数（不含首帧初始化）。"""
+        return self._reset_count
+
     def clone(self) -> "ConstantAccelerationKalman2D":
         """返回与当前滤波器状态完全独立的深拷贝实例。"""
         copy_obj = ConstantAccelerationKalman2D(
@@ -601,7 +671,10 @@ class ConstantAccelerationKalman2D:
         copy_obj._last_timestamp_s = self._last_timestamp_s
         copy_obj._update_count = self._update_count
         copy_obj._consecutive_rejects = self._consecutive_rejects
+        copy_obj._rejected_obs = list(self._rejected_obs)
         copy_obj._last_rejected_obs = self._last_rejected_obs
+        copy_obj._reset_count = self._reset_count
+        copy_obj._was_reset = self._was_reset
         copy_obj.last_d2 = self.last_d2
         copy_obj.last_accepted = self.last_accepted
         return copy_obj
@@ -782,7 +855,10 @@ class ConstantTurnRateKalman2D:
         self._last_timestamp_s: Optional[float] = None
         self._update_count: int = 0
         self._consecutive_rejects: int = 0
+        self._rejected_obs: list[Tuple[float, float, float]] = []
         self._last_rejected_obs: Optional[Tuple[float, float, float]] = None
+        self._reset_count: int = 0
+        self._was_reset: bool = False
         self.last_d2: Optional[float] = None
         self.last_accepted: bool = False
 
@@ -826,6 +902,8 @@ class ConstantTurnRateKalman2D:
         zx: float,
         zy: float,
         r_mat: np.ndarray,
+        *,
+        count_reset: bool = False,
     ) -> bool:
         """将 CTRV 滤波器安全重置为以当前有限观测为中心的初始状态。"""
         self._x[:] = (zx, zy, 0.0, 0.0, 0.0)
@@ -833,7 +911,11 @@ class ConstantTurnRateKalman2D:
         self._last_timestamp_s = ts
         self._update_count = 1
         self._consecutive_rejects = 0
+        self._rejected_obs.clear()
         self._last_rejected_obs = None
+        if count_reset:
+            self._reset_count += 1
+            self._was_reset = True
         self.last_d2 = 0.0
         self.last_accepted = True
         return True
@@ -888,14 +970,16 @@ class ConstantTurnRateKalman2D:
             raise ValueError("timestamp_s 必须逐帧严格递增")
 
         r_mat = self._resolve_obs_cov(obs_cov_m2)
+        self._was_reset = False
 
         if self._update_count == 0 or self._last_timestamp_s is None:
-            return self._reset_to_observation(ts, zx, zy, r_mat)
+            return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=False)
 
         dt_s = ts - self._last_timestamp_s
 
         # 第 2 帧观测到达时：若速度仍未建立，通过两点差分引导初始航向与速率，打破 v=0 时 psi 不可观奇异
         if self._update_count == 1:
+            gate_reset = False
             if self._update_count >= self.min_updates_for_gate:
                 with np.errstate(over="ignore", invalid="ignore"):
                     iso_var = (self.init_vel_std_ms * dt_s) ** 2
@@ -907,12 +991,44 @@ class ConstantTurnRateKalman2D:
                 if not math.isfinite(d2_init) or d2_init > self.gate_chi2:
                     self._consecutive_rejects += 1
                     if self._consecutive_rejects < self.max_consecutive_rejects:
+                        self._rejected_obs.append((ts, zx, zy))
                         self._last_rejected_obs = (ts, zx, zy)
                         self._last_timestamp_s = ts
                         self.last_accepted = False
                         return False
-                    self._consecutive_rejects = 0
-                    self._last_rejected_obs = None
+                    gate_reset = True
+            if gate_reset:
+                vx0, vy0, has_vel_init = _estimate_reset_velocity(
+                    self._rejected_obs,
+                    ts,
+                    zx,
+                    zy,
+                    self.max_speed_ms,
+                    _default_max_accel_for_category(self.category),
+                )
+                v0, psi0 = (
+                    self._velocity_psi_from_vec(vx0, vy0) if has_vel_init else (0.0, 0.0)
+                )
+                x_cand = self._clamp_ctrv_state(
+                    np.array([zx, zy, v0, psi0, 0.0], dtype=np.float64)
+                )
+                p_cand = self._build_reset_cov(
+                    r_mat, vel_initialized=(has_vel_init and v0 > 1e-6)
+                )
+                if x_cand is None or not (np.isfinite(x_cand).all() and np.isfinite(p_cand).all()):
+                    return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
+                self._x = x_cand
+                self._P = p_cand
+                self._last_timestamp_s = ts
+                # 统一置为 2 使下一帧走带观测协方差 R_k 阻尼的 EKF 更新，避免 _update_count==1 退化为无滤波单帧两点差分
+                self._update_count = 2
+                self._consecutive_rejects = 0
+                self._rejected_obs.clear()
+                self._last_rejected_obs = None
+                self._reset_count += 1
+                self._was_reset = True
+                self.last_accepted = True
+                return True
             vx0, vy0 = _safe_diff_velocity(
                 float(self._x[0]), float(self._x[1]), zx, zy, dt_s, self.max_speed_ms
             )
@@ -920,12 +1036,13 @@ class ConstantTurnRateKalman2D:
             x_cand = self._clamp_ctrv_state(np.array([zx, zy, v0, psi0, 0.0], dtype=np.float64))
             p_cand = self._build_reset_cov(r_mat, vel_initialized=(v0 > 1e-6))
             if x_cand is None or not (np.isfinite(x_cand).all() and np.isfinite(p_cand).all()):
-                return self._reset_to_observation(ts, zx, zy, r_mat)
+                return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
             self._x = x_cand
             self._P = p_cand
             self._last_timestamp_s = ts
             self._update_count = 2
             self._consecutive_rejects = 0
+            self._rejected_obs.clear()
             self._last_rejected_obs = None
             self.last_d2 = 0.0
             self.last_accepted = True
@@ -946,14 +1063,14 @@ class ConstantTurnRateKalman2D:
             dt_s, float(x_work[3]), self.accel_std_ms2, self.yaw_accel_std_rad_s2
         )
         if step_res is None or q_mat is None:
-            return self._reset_to_observation(ts, zx, zy, r_mat)
+            return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
         x_pred, f_mat = step_res
         with np.errstate(over="ignore", invalid="ignore"):
             p_pred = f_mat @ self._P @ f_mat.T + q_mat
             p_pred = 0.5 * (p_pred + p_pred.T)
 
         if not (np.isfinite(x_pred).all() and np.isfinite(p_pred).all()):
-            return self._reset_to_observation(ts, zx, zy, r_mat)
+            return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
 
         y_res, s_mat, d2 = _compute_innovation_and_d2(zx, zy, x_pred, p_pred, r_mat)
         self.last_d2 = d2
@@ -966,7 +1083,8 @@ class ConstantTurnRateKalman2D:
             if self._consecutive_rejects < self.max_consecutive_rejects:
                 x_cand = self._clamp_ctrv_state(x_pred.copy())
                 if x_cand is None or not (np.isfinite(x_cand).all() and np.isfinite(p_pred).all()):
-                    return self._reset_to_observation(ts, zx, zy, r_mat)
+                    return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
+                self._rejected_obs.append((ts, zx, zy))
                 self._last_rejected_obs = (ts, zx, zy)
                 self._x = x_cand
                 self._P = p_pred
@@ -974,39 +1092,46 @@ class ConstantTurnRateKalman2D:
                 self.last_accepted = False
                 return False
 
-            v0, psi0 = 0.0, 0.0
-            has_vel_init = False
-            if self._last_rejected_obs is not None:
-                prev_ts, prev_x, prev_y = self._last_rejected_obs
-                dt_rej = ts - prev_ts
-                if dt_rej > 1e-4:
-                    vx0, vy0 = _safe_diff_velocity(
-                        prev_x, prev_y, zx, zy, dt_rej, self.max_speed_ms
-                    )
-                    v0, psi0 = self._velocity_psi_from_vec(vx0, vy0)
-                    has_vel_init = True
+            vx0, vy0, has_vel_init = _estimate_reset_velocity(
+                self._rejected_obs,
+                ts,
+                zx,
+                zy,
+                self.max_speed_ms,
+                _default_max_accel_for_category(self.category),
+            )
+            v0, psi0 = (
+                self._velocity_psi_from_vec(vx0, vy0) if has_vel_init else (0.0, 0.0)
+            )
             x_cand = self._clamp_ctrv_state(
                 np.array([zx, zy, v0, psi0, 0.0], dtype=np.float64)
             )
-            p_cand = self._build_reset_cov(r_mat, vel_initialized=has_vel_init)
+            p_cand = self._build_reset_cov(
+                r_mat, vel_initialized=(has_vel_init and v0 > 1e-6)
+            )
             if x_cand is None or not (np.isfinite(x_cand).all() and np.isfinite(p_cand).all()):
-                return self._reset_to_observation(ts, zx, zy, r_mat)
+                return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
             self._x = x_cand
             self._P = p_cand
             self._last_timestamp_s = ts
             self._consecutive_rejects = 0
+            self._rejected_obs.clear()
             self._last_rejected_obs = None
-            self._update_count = 2 if has_vel_init else 1
+            # 统一置为 2 使重置后首帧即通过 R_k 加权 Joseph EKF 平滑收敛，避免单帧两点差分放大跳变尖峰
+            self._update_count = 2
+            self._reset_count += 1
+            self._was_reset = True
             self.last_accepted = True
             return True
 
         self._consecutive_rejects = 0
+        self._rejected_obs.clear()
         self._last_rejected_obs = None
 
         if not (np.isfinite(y_res).all() and np.isfinite(s_mat).all()):
             x_cand = self._clamp_ctrv_state(x_pred.copy())
             if x_cand is None or not np.isfinite(s_mat).all():
-                return self._reset_to_observation(ts, zx, zy, r_mat)
+                return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
             self._x = x_cand
             self._P = p_pred
             self._last_timestamp_s = ts
@@ -1018,11 +1143,11 @@ class ConstantTurnRateKalman2D:
         )
         x_cand = self._clamp_ctrv_state(x_upd)
         if not np.isfinite(p_upd).all():
-            return self._reset_to_observation(ts, zx, zy, r_mat)
+            return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
         if x_cand is None or not np.isfinite(x_cand).all():
             x_fallback = self._clamp_ctrv_state(x_pred.copy())
             if x_fallback is None or not np.isfinite(x_fallback).all():
-                return self._reset_to_observation(ts, zx, zy, r_mat)
+                return self._reset_to_observation(ts, zx, zy, r_mat, count_reset=True)
             self._x = x_fallback
             self._P = p_pred
             self._last_timestamp_s = ts
@@ -1116,6 +1241,16 @@ class ConstantTurnRateKalman2D:
     def consecutive_rejects(self) -> int:
         return self._consecutive_rejects
 
+    @property
+    def was_reset(self) -> bool:
+        """最近一次 update 是否触发了滤波器状态重置（不含首帧初始化）。"""
+        return self._was_reset
+
+    @property
+    def reset_count(self) -> int:
+        """累计触发滤波器状态重置的次数（不含首帧初始化）。"""
+        return self._reset_count
+
     def clone(self) -> "ConstantTurnRateKalman2D":
         """返回与当前 CTRV 滤波器状态完全独立的深拷贝实例。"""
         copy_obj = ConstantTurnRateKalman2D(
@@ -1137,7 +1272,10 @@ class ConstantTurnRateKalman2D:
         copy_obj._last_timestamp_s = self._last_timestamp_s
         copy_obj._update_count = self._update_count
         copy_obj._consecutive_rejects = self._consecutive_rejects
+        copy_obj._rejected_obs = list(self._rejected_obs)
         copy_obj._last_rejected_obs = self._last_rejected_obs
+        copy_obj._reset_count = self._reset_count
+        copy_obj._was_reset = self._was_reset
         copy_obj.last_d2 = self.last_d2
         copy_obj.last_accepted = self.last_accepted
         return copy_obj

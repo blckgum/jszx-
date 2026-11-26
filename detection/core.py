@@ -114,6 +114,36 @@ def write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
 
 
+def _imread_unicode(path: Path):
+    """兼容 Windows 中文/非 ASCII 路径的图像读取（np.fromfile + cv2.imdecode）。"""
+    import cv2
+    import numpy as np
+
+    try:
+        raw = np.fromfile(str(path), dtype=np.uint8)
+        image = cv2.imdecode(raw, cv2.IMREAD_COLOR) if raw.size > 0 else None
+    except Exception:
+        image = None
+    if image is None:
+        image = cv2.imread(str(path))
+    return image
+
+
+def _imwrite_unicode(path: Path, image) -> bool:
+    """兼容 Windows 中文/非 ASCII 路径的图像写入（cv2.imencode + tofile）。"""
+    import cv2
+
+    ext = path.suffix or ".jpg"
+    try:
+        ok, encoded = cv2.imencode(ext, image)
+        if not ok:
+            return False
+        encoded.tofile(str(path))
+        return path.is_file()
+    except Exception:
+        return False
+
+
 def detect(args) -> Path:
     import cv2
 
@@ -269,14 +299,14 @@ def detect(args) -> Path:
                 for path in images:
                     if args.max_frames is not None and count >= args.max_frames:
                         break
-                    frame = cv2.imread(str(path))
+                    frame = _imread_unicode(path)
                     if frame is None:
                         raise ValueError(f"无法读取图片：{path}")
                     # 独立图片各自从 frame_index=0 开始，不推测它们之间的时间关系。
                     process(frame, path, 0, None, None, stream)
                     # 文件名包含原扩展名，避免同目录的 a.jpg 与 a.png 输出时互相覆盖。
                     filename = f"{path.stem}_{path.suffix[1:].lower()}_det.jpg"
-                    if not cv2.imwrite(str(output / filename), frame):
+                    if not _imwrite_unicode(output / filename, frame):
                         raise RuntimeError(f"保存图片失败：{filename}")
         if count == 0:
             raise ValueError("输入没有可解码的视频帧。")

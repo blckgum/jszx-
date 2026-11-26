@@ -281,7 +281,7 @@
               <div class="pipeline-toggles" role="group" aria-label="仿真管线开关">
                 <select id="sim-speed-model" class="select-compact select-inline" aria-label="仿真速度运动学模型">
                   <option value="ctrv" selected>CTRV 弯道</option>
-                  <option value="kalman">Kalman 恒速</option>
+                  <option value="kalman">Kalman 匀加速</option>
                   <option value="ema">EMA 平滑</option>
                 </select>
                 <select id="sim-conflict-model" class="select-compact select-inline" aria-label="仿真冲突评估模型">
@@ -900,7 +900,7 @@
           <label class="field-label" for="job-speed-model">速度运动学模型</label>
           <select id="job-speed-model" name="speed_model" class="form-control">
             <option value="ctrv" selected>CTRV (弯道恒转弯率卡尔曼)</option>
-            <option value="kalman">Kalman (恒速二维线性滤波)</option>
+            <option value="kalman">Kalman (2D CA 匀加速线性滤波)</option>
             <option value="ema">EMA (滑动窗口指数平滑)</option>
           </select>
         </div>

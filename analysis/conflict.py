@@ -437,9 +437,10 @@ class ConflictAnalyzer:
         )
         drac = compute_drac(dx, dy, dvx, dvy, critical_dist_obb)
 
-        # 若等速外推未撞击且存在相对加速度，在 [0, horizon_s] 内精确求解二阶轨迹进入圆角扩展 OBB 的最早时刻。
+        # 只要存在相对加速度，均在 [0, horizon_s] 内针对同一圆角扩展 OBB 精确求解二阶侵入时刻，
+        # 避免等速扫掠命中后跳过二阶包络核验而仅凭一维未加裕度 MTTC 误触发安全制动降级。
         accel_entry_t: Optional[float] = None
-        if not obb.collides and (dax * dax + day * day) > 1e-6:
+        if (dax * dax + day * day) > 1e-6:
             alx = cos_h * dax + sin_h * day
             aly = -sin_h * dax + cos_h * day
             accel_entry_t = compute_obb_accel_entry_time(
@@ -455,15 +456,19 @@ class ConflictAnalyzer:
         if not obb.collides and not accel_enters_obb:
             return None
 
-        # 安全制动降级：已明显减速且刹停距离足够（mttc=None 且二阶未侵入 OBB）同时所需减速度低于注意阈值。
+        # 二阶轨迹在注意阈值内仍会侵入圆角扩展安全包络时，禁止触发安全制动降级。
+        accel_blocks_braking_downgrade = (
+            accel_entry_t is not None and accel_entry_t <= self.ttc_caution_s
+        )
+        # 安全制动降级：已明显减速且刹停距离足够（mttc=None 且二阶在注意阈值内未侵入圆角扩展 OBB）同时所需减速度低于注意阈值。
         is_safe_braking = (
             mttc is None
-            and not accel_enters_obb
+            and not accel_blocks_braking_downgrade
             and a_c < -0.5
             and drac is not None
             and drac < self.drac_caution_ms2
         )
-        min_dist_out = 0.0 if accel_enters_obb else obb.min_clearance_m
+        min_dist_out = obb.min_clearance_m if obb.collides else 0.0
         if is_safe_braking:
             if obb.collides and obb.t_enter is not None and obb.t_enter <= self.ttc_critical_s:
                 level = RiskLevel.LEVEL_2_CAUTION
@@ -478,7 +483,17 @@ class ConflictAnalyzer:
         else:
             if obb.collides:
                 assert obb.t_enter is not None
-                t_eff = mttc if (mttc is not None and mttc < obb.t_enter) else obb.t_enter
+                if (
+                    mttc is None
+                    and accel_entry_t is not None
+                    and a_c < -0.5
+                    and drac is not None
+                    and drac < self.drac_caution_ms2
+                ):
+                    # 一维未加裕度 MTTC 已刹停但二阶轨迹仍会进入扩展圆角安全包络：按真实二阶侵入时刻分级。
+                    t_eff = accel_entry_t
+                else:
+                    t_eff = mttc if (mttc is not None and mttc < obb.t_enter) else obb.t_enter
             else:
                 assert accel_entry_t is not None
                 t_eff = accel_entry_t
@@ -512,7 +527,7 @@ class ConflictAnalyzer:
                     f"DRAC={drac_txt}m/s^2, 净距={min_dist_out:.2f}m)"
                 )
 
-        if accel_enters_obb:
+        if not obb.collides and accel_enters_obb:
             assert accel_entry_t is not None
             # 二阶加速侵入场景至少推进到侵入时刻，避免 1D MTTC 提前在 OBB 外部评估碰撞概率。
             t_eval = mttc if (mttc is not None and mttc >= accel_entry_t) else accel_entry_t
@@ -692,6 +707,7 @@ class ConflictAnalyzer:
                 assessments.append(highest_conflict)
             elif (
                 (veh.category == "vehicle" or veh.category in VRU_CYCLIST_KINDS)
+                and bool(veh.is_reliable)
                 and _is_finite_number(veh.speed_kmh)
                 and veh.speed_kmh > self.speed_limit_kmh
             ):

@@ -81,23 +81,64 @@ def _percentile(sorted_vals: list[float], pct: float) -> float:
     return float(sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac)
 
 
+def _compute_stages_and_fps(
+    per_stage: Mapping[str, Sequence[float]],
+    n_frames: int,
+) -> tuple[float, dict[str, dict[str, float]]]:
+    """针对给定帧切片计算各阶段均值/分位数/占比与帧内吞吐 FPS。"""
+    if n_frames <= 0:
+        empty_stages = {
+            name: {
+                "mean_ms": 0.0,
+                "p50_ms": 0.0,
+                "p95_ms": 0.0,
+                "max_ms": 0.0,
+                "share_pct": 0.0,
+            }
+            for name in STAGE_NAMES
+        }
+        return 0.0, empty_stages
+
+    total_vals = per_stage["total_frame"]
+    total_sum_ms = sum(total_vals)
+    total_mean_ms = total_sum_ms / n_frames
+    fps = (1000.0 * n_frames / total_sum_ms) if total_sum_ms > 0.0 else 0.0
+
+    stages_summary: dict[str, dict[str, float]] = {}
+    for name in STAGE_NAMES:
+        vals = sorted(per_stage[name])
+        mean_val = sum(vals) / n_frames
+        if name == "total_frame":
+            share_pct = 100.0 if total_mean_ms > 0.0 else 0.0
+        else:
+            share_pct = (100.0 * mean_val / total_mean_ms) if total_mean_ms > 0.0 else 0.0
+        stages_summary[name] = {
+            "mean_ms": round(mean_val, 3),
+            "p50_ms": round(_percentile(vals, 50.0), 3),
+            "p95_ms": round(_percentile(vals, 95.0), 3),
+            "max_ms": round(vals[-1], 3),
+            "share_pct": round(share_pct, 2),
+        }
+
+    return round(fps, 3), stages_summary
+
+
 def _empty_timing_summary() -> dict:
     """返回 0 帧基准的零值统计结构，避免空样本触发除零或 RuntimeWarning。"""
-    stages = {
-        name: {
-            "mean_ms": 0.0,
-            "p50_ms": 0.0,
-            "p95_ms": 0.0,
-            "max_ms": 0.0,
-            "share_pct": 0.0,
-        }
-        for name in STAGE_NAMES
-    }
+    zero_fps, stages = _compute_stages_and_fps({}, 0)
+    _, steady_stages = _compute_stages_and_fps({}, 0)
     return {
         "schema_version": 1,
         "frames_profiled": 0,
-        "end_to_end_fps": 0.0,
+        "end_to_end_fps": zero_fps,
+        "frame_processing_fps": zero_fps,
         "stages": stages,
+        "steady_state": {
+            "warmup_frames_excluded": 0,
+            "frames_evaluated": 0,
+            "steady_state_fps": zero_fps,
+            "stages": steady_stages,
+        },
     }
 
 
@@ -165,32 +206,32 @@ def summarize_stage_timings(stage_samples: Sequence[Mapping[str, Any]] | Mapping
     else:
         raise ValueError("stage_samples 必须是逐帧样本列表或阶段耗时序列映射")
 
-    total_vals = per_stage["total_frame"]
-    total_sum_ms = sum(total_vals)
-    total_mean_ms = total_sum_ms / n_frames
-    end_to_end_fps = (1000.0 * n_frames / total_sum_ms) if total_sum_ms > 0.0 else 0.0
+    frame_processing_fps, stages_summary = _compute_stages_and_fps(per_stage, n_frames)
 
-    stages_summary: dict[str, dict[str, float]] = {}
-    for name in STAGE_NAMES:
-        vals = sorted(per_stage[name])
-        mean_val = sum(vals) / n_frames
-        if name == "total_frame":
-            share_pct = 100.0 if total_mean_ms > 0.0 else 0.0
-        else:
-            share_pct = (100.0 * mean_val / total_mean_ms) if total_mean_ms > 0.0 else 0.0
-        stages_summary[name] = {
-            "mean_ms": round(mean_val, 3),
-            "p50_ms": round(_percentile(vals, 50.0), 3),
-            "p95_ms": round(_percentile(vals, 95.0), 3),
-            "max_ms": round(vals[-1], 3),
-            "share_pct": round(share_pct, 2),
+    if n_frames > 1:
+        steady_slice = {name: per_stage[name][1:] for name in STAGE_NAMES}
+        steady_fps, steady_stages = _compute_stages_and_fps(steady_slice, n_frames - 1)
+        steady_state = {
+            "warmup_frames_excluded": 1,
+            "frames_evaluated": n_frames - 1,
+            "steady_state_fps": steady_fps,
+            "stages": steady_stages,
+        }
+    else:
+        steady_state = {
+            "warmup_frames_excluded": 0,
+            "frames_evaluated": n_frames,
+            "steady_state_fps": frame_processing_fps,
+            "stages": {name: dict(stats) for name, stats in stages_summary.items()},
         }
 
     return {
         "schema_version": 1,
         "frames_profiled": n_frames,
-        "end_to_end_fps": round(end_to_end_fps, 3),
+        "end_to_end_fps": frame_processing_fps,
+        "frame_processing_fps": frame_processing_fps,
         "stages": stages_summary,
+        "steady_state": steady_state,
     }
 
 
@@ -528,6 +569,12 @@ def profile_pipeline_stages(
 
     wall_elapsed_ms = max(0.0, (time.perf_counter() - wall_start) * 1000.0)
     timing_summary = summarize_stage_timings(stage_samples)
+    frames_profiled = timing_summary["frames_profiled"]
+    wall_fps = (
+        frames_profiled / (wall_elapsed_ms / 1000.0)
+        if (frames_profiled > 0 and wall_elapsed_ms > 0.0)
+        else 0.0
+    )
 
     report = {
         "schema_version": 1,
@@ -545,11 +592,14 @@ def profile_pipeline_stages(
         "fps_used": float(fps_used),
         "resolution": [width, height],
         "max_frames": max_frames,
-        "frames_profiled": timing_summary["frames_profiled"],
+        "frames_profiled": frames_profiled,
         "model_load_ms": round(model_load_ms, 3),
         "wall_elapsed_ms": round(wall_elapsed_ms, 3),
         "end_to_end_fps": timing_summary["end_to_end_fps"],
+        "frame_processing_fps": timing_summary["frame_processing_fps"],
+        "wall_fps": round(wall_fps, 3),
         "stages": timing_summary["stages"],
+        "steady_state": timing_summary["steady_state"],
     }
     _reject_non_finite_tree(report, "benchmark_report")
     return report
@@ -561,6 +611,23 @@ def benchmark_to_markdown(report: Mapping[str, Any]) -> str:
         raise ValueError("report 必须是包含 stages 的基准报告字典")
     _reject_non_finite_tree(dict(report), "report")
 
+    frames_profiled = report.get("frames_profiled", 0)
+    frame_fps = float(report.get("frame_processing_fps", report.get("end_to_end_fps", 0.0)))
+    raw_wall_fps = report.get("wall_fps")
+    wall_ms = report.get("wall_elapsed_ms")
+    if raw_wall_fps is not None and not isinstance(raw_wall_fps, (bool, np.bool_)):
+        wall_fps_opt: Optional[float] = float(raw_wall_fps)
+    elif (
+        type(frames_profiled) is int
+        and frames_profiled > 0
+        and wall_ms is not None
+        and not isinstance(wall_ms, (bool, np.bool_))
+        and float(wall_ms) > 0.0
+    ):
+        wall_fps_opt = frames_profiled / (float(wall_ms) / 1000.0)
+    else:
+        wall_fps_opt = None
+
     lines = [
         "# Pipeline Stage Benchmark Report",
         "",
@@ -570,13 +637,25 @@ def benchmark_to_markdown(report: Mapping[str, Any]) -> str:
             f"conflict=`{report.get('conflict_model', 'cvm_circle')}`, "
             f"stitching=`{bool(report.get('enable_stitching', False))}`"
         ),
-        f"- Frames profiled: {report.get('frames_profiled', 0)}",
+        f"- Frames profiled: {frames_profiled}",
         f"- Model load time: {float(report.get('model_load_ms', 0.0)):.3f} ms",
-        f"- End-to-end throughput: {float(report.get('end_to_end_fps', 0.0)):.3f} FPS",
+        f"- Frame processing throughput (excl. model load): {frame_fps:.3f} FPS",
+    ]
+    if wall_fps_opt is not None:
+        lines.append(f"- Wall-clock throughput (incl. model load): {wall_fps_opt:.3f} FPS")
+    steady = report.get("steady_state")
+    if isinstance(steady, Mapping) and "steady_state_fps" in steady:
+        warmup_excl = int(steady.get("warmup_frames_excluded", 0))
+        frames_eval = int(steady.get("frames_evaluated", 0))
+        lines.append(
+            f"- Steady-state throughput (warmup excluded={warmup_excl}, frames={frames_eval}): "
+            f"{float(steady['steady_state_fps']):.3f} FPS"
+        )
+    lines.extend([
         "",
         "| Stage | Mean (ms) | P50 (ms) | P95 (ms) | Max (ms) | Share (%) |",
         "|---|---:|---:|---:|---:|---:|",
-    ]
+    ])
     stages = report["stages"]
     for stage in STAGE_NAMES:
         if stage not in stages:

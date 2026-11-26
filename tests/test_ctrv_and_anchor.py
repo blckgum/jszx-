@@ -339,12 +339,107 @@ class TestConstantTurnRateKalman2D(unittest.TestCase):
         self.assertEqual(kf.consecutive_rejects, 0)
 
         # 连续 3 帧大位移突变自动触发重置
+        self.assertFalse(kf.was_reset)
+        self.assertEqual(kf.reset_count, 0)
         self.assertFalse(kf.update(0.60, 25.0, 10.0))
+        self.assertFalse(kf.was_reset)
         self.assertFalse(kf.update(0.70, 25.5, 10.0))
+        self.assertFalse(kf.was_reset)
         self.assertTrue(kf.update(0.80, 26.0, 10.0))
+        self.assertTrue(kf.was_reset)
+        self.assertEqual(kf.reset_count, 1)
         self.assertEqual(kf.consecutive_rejects, 0)
         self.assertAlmostEqual(kf.position_xy[0], 26.0, delta=0.05)
         self.assertAlmostEqual(kf.speed_ms, 5.0, delta=0.2)
+
+        # 重置后的下一次正常更新应将 was_reset 复原为 False，reset_count 保持累计值
+        self.assertTrue(kf.update(0.90, 26.5, 10.0))
+        self.assertFalse(kf.was_reset)
+        self.assertEqual(kf.reset_count, 1)
+
+    def test_ctrv_mahalanobis_reset_clears_reliability_and_suppresses_transient_speeding(self):
+        from analysis.conflict import ConflictAnalyzer, RiskLevel
+
+        # 1. 构造高帧率 (30fps) 已收敛 CTRV 目标，随后注入与 Sherbrooke ID 5 同构的 3 帧异常跳变
+        est = SpeedEstimator(
+            speed_limit_kmh=30.0,
+            reliable_min_span_s=0.2,
+            estimator_mode="ctrv",
+        )
+        analyzer = ConflictAnalyzer(speed_limit_kmh=30.0, conflict_model="obb_ssm")
+        cov = np.diag([0.095 ** 2, 0.24 ** 2])
+        dt = 1.0 / 30.0
+
+        # 前 10 帧以约 5 km/h 缓慢移动并达到 is_reliable=True
+        last_r = None
+        for idx in range(10):
+            t = idx * dt
+            last_r = est.update(
+                5, "vehicle", t, 5.7 + 0.03 * idx, -0.5 + 0.025 * idx,
+                object_kind="car", obs_cov_m2=cov,
+            )
+        self.assertIsNotNone(last_r)
+        self.assertTrue(last_r.is_reliable)
+        kf = est.tracks[5]._kalman
+        self.assertEqual(kf.reset_count, 0)
+
+        # 帧 10-12: 连续 3 帧马氏门控异常跳变（后两帧步差 0.34m/0.033s = 36.9 km/h，加速度违背物理一致性）
+        r10 = est.update(5, "vehicle", 10 * dt, 5.856, 1.350, object_kind="car", obs_cov_m2=cov)
+        self.assertFalse(kf.last_accepted)
+        self.assertFalse(kf.was_reset)
+        r11 = est.update(5, "vehicle", 11 * dt, 5.837, 1.560, object_kind="car", obs_cov_m2=cov)
+        self.assertFalse(kf.last_accepted)
+        self.assertFalse(kf.was_reset)
+        r12 = est.update(5, "vehicle", 12 * dt, 5.802, 1.900, object_kind="car", obs_cov_m2=cov)
+
+        # 第 3 次拒收触发重置：was_reset=True, reset_count=1，可靠性窗口清空，不得报可信超速
+        self.assertTrue(kf.was_reset)
+        self.assertEqual(kf.reset_count, 1)
+        self.assertFalse(r12.is_reliable)
+        self.assertFalse(r12.is_speeding)
+        self.assertLess(r12.speed_kmh, 30.0)
+        res12 = analyzer.analyze_frame([r12], timestamp_s=12 * dt)
+        self.assertEqual(len(res12), 1)
+        self.assertEqual(res12[0].risk_level, RiskLevel.LEVEL_0_SAFE)
+
+        # 重置后 5 帧内（跨度 < 0.2s）必须保持 is_reliable=False 且不触发瞬时超速；
+        # 超过 0.2s 干净后验跨度后恢复 is_reliable=True 且速度收敛到真实 ~16.2 km/h (4.5 m/s)
+        post_readings = []
+        for k in range(1, 10):
+            t = (12 + k) * dt
+            r_post = est.update(
+                5, "vehicle", t, 5.802, 1.900 + 4.5 * (k * dt),
+                object_kind="car", obs_cov_m2=cov,
+            )
+            post_readings.append(r_post)
+            self.assertFalse(kf.was_reset)
+            if not r_post.is_reliable:
+                self.assertFalse(r_post.is_speeding)
+                a_post = analyzer.analyze_frame([r_post], timestamp_s=t)
+                self.assertEqual(a_post[0].risk_level, RiskLevel.LEVEL_0_SAFE)
+
+        self.assertFalse(post_readings[4].is_reliable)  # 5*dt = 0.167s < 0.2s
+        self.assertTrue(post_readings[6].is_reliable)   # 7*dt = 0.233s >= 0.2s
+        self.assertAlmostEqual(post_readings[-1].speed_ms, 4.5, delta=0.4)
+
+        # 2. 即使 3 帧连续被拒观测构成一致高速重定位，重置后也必须先清零可靠性再重新累积跨度
+        est_fast = SpeedEstimator(
+            speed_limit_kmh=30.0,
+            reliable_min_span_s=0.2,
+            estimator_mode="ctrv",
+        )
+        for i in range(8):
+            est_fast.update(9, "vehicle", i * 0.1, 0.0, 0.5 * i, object_kind="car")
+        est_fast.update(9, "vehicle", 0.8, 25.0, 10.0, object_kind="car")
+        est_fast.update(9, "vehicle", 0.9, 26.2, 10.0, object_kind="car")
+        r_reloc = est_fast.update(9, "vehicle", 1.0, 27.4, 10.0, object_kind="car")
+        self.assertTrue(est_fast.tracks[9]._kalman.was_reset)
+        self.assertFalse(r_reloc.is_reliable)
+        self.assertFalse(r_reloc.is_speeding)
+        self.assertEqual(
+            analyzer.analyze_frame([r_reloc], timestamp_s=1.0)[0].risk_level,
+            RiskLevel.LEVEL_0_SAFE,
+        )
 
     def test_extreme_values_1e308_dt_1e80_and_bool_safety(self):
         # 参数校验拒绝 bool / 非正

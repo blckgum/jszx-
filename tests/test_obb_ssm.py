@@ -444,6 +444,76 @@ class TestOBBSSMConflictAnalyzer(unittest.TestCase):
         self.assertEqual(self.obb.evaluate_pair(car_const, ped_far).risk_level, RiskLevel.LEVEL_2_CAUTION)
         self.assertIsNone(self.obb.evaluate_pair(car_braking, ped_far))
 
+    def test_braking_downgrade_blocked_when_second_order_enters_padded_rounded_obb(self):
+        # 精确回归用例：v=2.5 m/s、制动 a=-1.488095 m/s^2、前方 5.0m 静止行人。
+        # 未加裕度一维 MTTC 返回 None（刹停距 2.10m < 裸车净距 2.35m），且 DRAC=1.33 < 2.0，
+        # 但二阶轨迹在 t=1.231001s <= ttc_critical_s(1.8s) 进入圆角扩展安全包络，禁止降级为 CAUTION。
+        car = _mk_reading(
+            1, "vehicle", 0.0, 0.0, 2.5, 0.0,
+            object_kind="car", heading_deg=0.0, ax_ms2=-1.488095, ay_ms2=0.0,
+        )
+        ped = _mk_reading(2, "pedestrian", 5.0, 0.0, 0.0, 0.0, object_kind="pedestrian")
+        obb_sweep = compute_obb_swept_ttc(
+            (0.0, 0.0), (2.5, 0.0), 0.0, 4.5, 1.9, (5.0, 0.0), (0.0, 0.0), 0.4, 3.5
+        )
+        t_entry_expected = compute_obb_accel_entry_time(
+            obb_sweep.local_pos_xy,
+            obb_sweep.local_vel_xy,
+            (1.488095, 0.0),
+            obb_sweep.expanded_half_extents_xy,
+            3.5,
+            corner_radius_m=0.4,
+        )
+        self.assertIsNotNone(t_entry_expected)
+        self.assertAlmostEqual(t_entry_expected, 1.231001, places=5)
+
+        res = self.obb.evaluate_pair(car, ped)
+        self.assertIsNotNone(res)
+        self.assertIsNone(res.mttc_seconds)
+        self.assertEqual(res.risk_level, RiskLevel.LEVEL_3_CRITICAL)
+        self.assertAlmostEqual(res.ttc_seconds, t_entry_expected, places=6)
+        self.assertNotIn("MTTC安全", res.risk_desc)
+
+        # 边界验证 1：ttc_critical_s < accel_entry_t <= ttc_caution_s，且等速 t_enter > ttc_critical_s。
+        # v=3.0 m/s, d=9.05m (扩展净距 6.0m -> t_enter=2.0s > 1.8s, 裸车净距 6.4m), a=-0.72 m/s^2：
+        # 刹停距 6.25m 介于 (6.0, 6.4) -> MTTC=None, DRAC=0.703 < 2.0, accel_entry_t=3.005s <= 3.5s -> 保留 CAUTION。
+        car_caut = _mk_reading(
+            1, "vehicle", 0.0, 0.0, 3.0, 0.0,
+            object_kind="car", heading_deg=0.0, ax_ms2=-0.72, ay_ms2=0.0,
+        )
+        ped_caut = _mk_reading(2, "pedestrian", 9.05, 0.0, 0.0, 0.0, object_kind="pedestrian")
+        res_caut = self.obb.evaluate_pair(car_caut, ped_caut)
+        self.assertIsNotNone(res_caut)
+        self.assertIsNone(res_caut.mttc_seconds)
+        self.assertEqual(res_caut.risk_level, RiskLevel.LEVEL_2_CAUTION)
+        self.assertGreater(res_caut.ttc_seconds, self.obb.ttc_critical_s)
+        self.assertLessEqual(res_caut.ttc_seconds, self.obb.ttc_caution_s)
+
+        # 边界验证 2：horizon_s(5.0) > ttc_caution_s(3.0) 且等速 t_enter <= 1.8s，
+        # 若二阶进入扩展包络发生在 ttc_caution_s 之后 (如 t=3.37s)，风险等级保持单调为 CAUTION 而非回退安全。
+        obb_long = ConflictAnalyzer(
+            conflict_model="obb_ssm",
+            ttc_critical_s=1.8,
+            ttc_caution_s=3.0,
+            horizon_s=5.0,
+        )
+        # v=5.0 m/s, d=11.95m (扩展净距 8.9m -> t_enter=1.78s <= 1.8s, 裸车净距 9.3m), a=-1.40 m/s^2:
+        # 刹停距 8.929m 介于 (8.9, 9.3) -> MTTC=None, DRAC=1.344 < 2.0, accel_entry_t ≈ 3.368s 落在 (3.0, 5.0]。
+        car_horizon = _mk_reading(
+            1, "vehicle", 0.0, 0.0, 5.0, 0.0,
+            object_kind="car", heading_deg=0.0, ax_ms2=-1.40, ay_ms2=0.0,
+        )
+        ped_horizon = _mk_reading(2, "pedestrian", 11.95, 0.0, 0.0, 0.0, object_kind="pedestrian")
+        t_horizon = compute_obb_accel_entry_time(
+            (11.95, 0.0), (-5.0, 0.0), (1.40, 0.0), (3.05, 1.65), 5.0, corner_radius_m=0.4
+        )
+        self.assertIsNotNone(t_horizon)
+        self.assertGreater(t_horizon, 3.0)
+        self.assertLessEqual(t_horizon, 5.0)
+        res_horizon = obb_long.evaluate_pair(car_horizon, ped_horizon)
+        self.assertIsNotNone(res_horizon)
+        self.assertEqual(res_horizon.risk_level, RiskLevel.LEVEL_2_CAUTION)
+
     def test_acceleration_surge_shortens_mttc_and_raises_risk(self):
         # 慢速行驶 (2.0 m/s) 距离 9.0m (d_eff=6.35m)：等速 TTC = 2.975s (CAUTION)，
         # 急加速 ay=+4.0 m/s^2 后 MTTC 缩短至 ~1.35s -> 升级为 LEVEL_3_CRITICAL

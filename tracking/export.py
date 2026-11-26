@@ -8,6 +8,7 @@ import os
 from collections import Counter
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .records import FrameRecord, TargetRecord
 
@@ -55,6 +56,7 @@ class RunExports:
             and not os.fspath(output).strip()
         ):
             raise ValueError("输出目录不能为空")
+        output = Path(output)
         self.resources = ExitStack()
         try:
             self.frames = self.resources.enter_context((output / "tracks.jsonl").open("w", encoding="utf-8"))

@@ -80,7 +80,7 @@
     if (stage === "motion") {
       var sm = String(cfg.speedModel || "ctrv").toLowerCase();
       if (sm === "kalman") {
-        return "单应 / Kalman: 地面逆透视映射、车辆锚点偏置补偿与二维恒速卡尔曼滤波";
+        return "单应 / Kalman: 地面逆透视映射、车辆锚点偏置补偿与 2D 匀加速 (CA) 卡尔曼滤波";
       }
       if (sm === "ema") {
         return "单应 / EMA: 地面逆透视映射、车辆锚点偏置补偿与滑动窗口指数平滑";
@@ -1286,7 +1286,7 @@
       minY = 0;
       maxY = 15.0;
     } else {
-      minY = Math.max(0, Math.floor((minY - 1.8) * 2) / 2);
+      minY = Math.floor((minY - 1.8) * 2) / 2;
       maxY = Math.ceil((maxY + 2.0) * 2) / 2;
     }
 
@@ -1306,8 +1306,13 @@
     if (dtSamples.length > 0) {
       dtSamples.sort(function (a, b) { return a - b; });
       nominalFrameMs = dtSamples[Math.floor(dtSamples.length / 2)] * 1000;
-    } else if (summary && summary.configuration && typeof summary.configuration.fps === "number" && summary.configuration.fps > 0) {
-      nominalFrameMs = 1000 / summary.configuration.fps;
+    } else if (summary && summary.configuration) {
+      var cfgFps = summary.configuration.fps_used !== undefined && summary.configuration.fps_used !== null
+        ? summary.configuration.fps_used
+        : summary.configuration.fps;
+      if (typeof cfgFps === "number" && Number.isFinite(cfgFps) && cfgFps > 0) {
+        nominalFrameMs = 1000 / cfgFps;
+      }
     }
     nominalFrameMs = Math.max(5, Math.min(500, nominalFrameMs));
 
@@ -1641,7 +1646,7 @@
             dataset.bounds.xMax = Math.max(dataset.bounds.xMax, Math.ceil((rx + 1.2) * 2) / 2);
           }
           if (Number.isFinite(ry)) {
-            dataset.bounds.yMin = Math.max(0, Math.min(dataset.bounds.yMin, Math.floor((ry - 1.8) * 2) / 2));
+            dataset.bounds.yMin = Math.min(dataset.bounds.yMin, Math.floor((ry - 1.8) * 2) / 2);
             dataset.bounds.yMax = Math.max(dataset.bounds.yMax, Math.ceil((ry + 2.0) * 2) / 2);
           }
         });

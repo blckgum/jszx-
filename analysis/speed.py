@@ -170,6 +170,7 @@ class TrackMotionTracker:
         self._last_valid_xy: Optional[Tuple[float, float]] = None
         self._last_timestamp_s: Optional[float] = None
         self._stationary_streak = 0
+        self._last_kalman_reset_count = 0
 
         # 类别滞回状态：新类别需连续多帧确认才生效
         self._pending_category: Optional[str] = None
@@ -256,14 +257,14 @@ class TrackMotionTracker:
             heading = float(self._kalman.heading_deg)
         else:
             heading = (math.degrees(math.atan2(vy_ms, vx_ms)) + 360.0) % 360.0
-        is_speeding = (
-            len(self.history) >= 3
-            and (self.category == "vehicle")
-            and (speed_kmh > self.speed_limit_kmh)
-        )
         min_samples = min(4, self.window_size)
         is_reliable = (
             len(self.history) >= min_samples and dt_span_s >= self.reliable_min_span_s
+        )
+        is_speeding = (
+            is_reliable
+            and (self.category == "vehicle")
+            and (speed_kmh > self.speed_limit_kmh)
         )
         return SpeedReading(
             track_id=self.track_id,
@@ -333,8 +334,17 @@ class TrackMotionTracker:
         if self.estimator_mode in ("kalman", "ctrv"):
             assert self._kalman is not None
             self._last_timestamp_s = ts
-            self.history.append((ts, xm, ym))
-            self._kalman.update(ts, xm, ym, obs_cov_m2=obs_cov_m2)
+            accepted = self._kalman.update(ts, xm, ym, obs_cov_m2=obs_cov_m2)
+            reset_count = self._kalman.reset_count
+            if self._kalman.was_reset or reset_count != self._last_kalman_reset_count:
+                # 滤波器触发连续拒收或数值溢出重置后，清空旧历史窗口与静止计数，
+                # 要求重置后重新累积足够跨度的干净观测才恢复 is_reliable。
+                self._last_kalman_reset_count = reset_count
+                self.history.clear()
+                self.history.append((ts, xm, ym))
+                self._stationary_streak = 0
+            elif accepted:
+                self.history.append((ts, xm, ym))
 
             kf_x, kf_y = self._kalman.position_xy
             kf_vx, kf_vy = self._kalman.velocity_xy
@@ -343,7 +353,11 @@ class TrackMotionTracker:
             self.smoothed_vx = kf_vx
             self.smoothed_vy = kf_vy
             self.has_valid_velocity = len(self.history) >= 2
-            dt_span = self.history[-1][0] - self.history[0][0]
+            dt_span = (
+                self.history[-1][0] - self.history[0][0]
+                if len(self.history) >= 2
+                else 0.0
+            )
             return self._finalize_kinematics_reading(
                 x_m=kf_x,
                 y_m=kf_y,

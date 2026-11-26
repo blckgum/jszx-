@@ -214,6 +214,60 @@ class DetectionContractTests(unittest.TestCase):
             ]
             self.assertEqual(len(written_rows), 1)
 
+    def test_detect_supports_chinese_unicode_image_paths(self):
+        import types
+        from unittest import mock
+        import cv2
+        import numpy as np
+        from detection import core as det_core
+
+        with tempfile.TemporaryDirectory(prefix="det_中文_") as tmp:
+            root = Path(tmp)
+            img_dir = root / "校园道路图片"
+            img_dir.mkdir(parents=True, exist_ok=True)
+            img_path = img_dir / "测试帧_路口.png"
+            out_dir = root / "输出目录_中文"
+
+            sample = np.full((48, 64, 3), (40, 120, 200), dtype=np.uint8)
+            ok, encoded = cv2.imencode(".png", sample)
+            self.assertTrue(ok)
+            encoded.tofile(str(img_path))
+            self.assertTrue(img_path.is_file())
+
+            class _EmptyBoxes:
+                def __len__(self):
+                    return 0
+
+                def __iter__(self):
+                    return iter(())
+
+            fake_model = mock.Mock()
+            fake_model.names = {0: "person", 2: "car"}
+            fake_model.predict.return_value = [types.SimpleNamespace(boxes=_EmptyBoxes())]
+
+            args = types.SimpleNamespace(
+                source=str(img_path), weights="unused.pt",
+                output=str(out_dir), classes=["person", "car"], conf=0.25, iou=0.7,
+                imgsz=640, device=None, max_frames=None, fps=None, show=False,
+            )
+            with mock.patch("detection.core.load_model", return_value=fake_model):
+                returned = det_core.detect(args)
+
+            self.assertEqual(returned, out_dir.resolve())
+            saved_img = out_dir / "测试帧_路口_png_det.jpg"
+            self.assertTrue(saved_img.is_file())
+            decoded = det_core._imread_unicode(saved_img)
+            self.assertIsNotNone(decoded)
+            self.assertEqual(decoded.shape, (48, 64, 3))
+            lines = [
+                det_core.json.loads(line)
+                for line in (out_dir / "detections.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0]["width"], 64)
+            self.assertEqual(lines[0]["height"], 48)
+
 
 if __name__ == "__main__":
     unittest.main()
